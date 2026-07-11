@@ -296,6 +296,198 @@ suite("playouts: deterministic, legal, lines replay", () => {
     });
 });
 
+// --- 4b: warm starts and root-locked passes ------------------------------------
+
+suite("warm start: lines and proofs transfer across positions", () => {
+    const rnd = mulberry32(31337);
+
+    for (let iter = 0; iter < 8; iter++) {
+        const position = randomPosition(rnd);
+        setIOBoard(position);
+        eng.setBoard();
+        for (const width of [8, 32, 128]) {
+            eng.beamBegin(width, 0);
+            while (eng.beamStep(100000) === 0) { /* run */ }
+        }
+        const best = collectResults().roots.reduce((a, b) => (a.best <= b.best ? a : b));
+        if (best.line.length < 2) continue;
+
+        // play the best move in JS, then seed the line suffix into the child
+        const child = clonePosition(position);
+        removeGroup(child, extractGroup(child, fieldOf(best.line[0])));
+        setIOBoard(child);
+        eng.setBoard();
+        const suffix = best.line.slice(1);
+        mem().set(Uint8Array.from(suffix), IO);
+        const final = eng.seedLine(suffix.length);
+        check(final === best.best, "seeded suffix does not reproduce the score", { iter, final, best: best.best });
+
+        const seeded = collectResults().roots;
+        check(Math.min(...seeded.map((r) => r.best)) <= best.best,
+            "seeding failed to carry the line", { iter, best: best.best });
+        for (const r of seeded) {
+            check(replayLine(child, r.line) === r.best, "seeded root line broken", { iter, rep: r.rep });
+        }
+
+        // a seed starting on an empty cell must be rejected
+        const emptyCell = child.flatMap((col, i) => col.map((v, j) => [v, i * 12 + j]))
+            .find(([v]) => v === 0)?.[1];
+        if (emptyCell !== undefined) {
+            mem().set(Uint8Array.from([emptyCell]), IO);
+            check(eng.seedLine(1) === -1, "empty-cell seed accepted", { iter, emptyCell });
+        }
+    }
+
+    // proof flags survive re-analysis of the same position
+    const board = Array.from({ length: 12 }, () => Array(12).fill(0));
+    const brnd = mulberry32(999);
+    for (let i = 0; i < 5; i++) for (let j = 0; j < 4; j++) board[i][j] = 1 + Math.floor(brnd() * 3);
+    setIOBoard(board);
+    eng.setBoard();
+    eng.exactBeginChild(0, 2_000_000);
+    let r = -1;
+    while (r === -1) r = eng.exactStep(200_000);
+    if (r >= 0) {
+        eng.exactMergeChild(0);
+        const proven = collectResults().roots[0];
+        check(proven.exact && proven.best === r, "child proof did not merge", { r, proven });
+
+        setIOBoard(board);
+        eng.setBoard(); // fresh analysis: flags gone
+        check(!collectResults().roots[0].exact, "exact flag survived setBoard");
+
+        mem().set(Uint8Array.from(proven.line), IO);
+        check(eng.seedLine(proven.line.length) === proven.best, "proof line seed failed");
+        check(eng.seedExactByCell(proven.rep, proven.best) === 1, "seedExactByCell rejected");
+        const restored = collectResults().roots[0];
+        check(restored.exact && restored.best === proven.best, "proof not restored", { restored });
+    }
+});
+
+suite("value solver: exact per-move values from one shared enumeration", () => {
+    const rnd = mulberry32(60451);
+
+    function bruteForce(position, memo = new Map()) {
+        const key = position.flat().join("");
+        const seen = memo.get(key);
+        if (seen !== undefined) return seen;
+        const groups = enumerateGroups(position);
+        if (groups.length === 0) {
+            const r = remainingOf(position);
+            memo.set(key, r);
+            return r;
+        }
+        let best = Infinity;
+        for (const group of groups) {
+            const pos = clonePosition(position);
+            removeGroup(pos, extractGroup(pos, group.rep));
+            best = Math.min(best, bruteForce(pos, memo));
+        }
+        memo.set(key, best);
+        return best;
+    }
+
+    const runValue = (k, budget) => {
+        let r = eng.vsBegin(k, budget);
+        while (r === -1) r = eng.vsStep(200_000);
+        return r;
+    };
+
+    for (let iter = 0; iter < 10; iter++) {
+        // small dense boards, brute-force verifiable
+        const cols = 4 + Math.floor(rnd() * 2), rows = 3 + Math.floor(rnd() * 2);
+        const position = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+        for (let i = 0; i < cols; i++) {
+            for (let j = 0; j < rows; j++) position[i][j] = 1 + Math.floor(rnd() * 3);
+        }
+        if (enumerateGroups(position).length === 0) continue;
+
+        setIOBoard(position);
+        eng.setBoard();
+        const roots = collectResults().roots;
+
+        // ladder flow for every move: value -> flag or line-seek -> merge
+        for (let k = 0; k < roots.length; k++) {
+            const childPos = clonePosition(position);
+            removeGroup(childPos, extractGroup(childPos, fieldOf(roots[k].rep)));
+            const expected = enumerateGroups(childPos).length === 0
+                ? remainingOf(childPos) : bruteForce(childPos);
+
+            const value = runValue(k, 20_000_000);
+            check(value === expected, "value solver wrong", { iter, k, value, expected });
+            if (value !== expected) continue;
+
+            if (eng.seedExactByCell(roots[k].rep, value) !== 1) {
+                eng.exactChildSeek(k, 20_000_000, value);
+                let r = -1;
+                while (r === -1) r = eng.exactStep(200_000);
+                check(r === value, "line seek missed the proven value", { iter, k, r, value });
+                if (r === value) eng.exactMergeChild(k);
+            }
+        }
+
+        const proven = collectResults().roots;
+        for (const r of proven) {
+            check(r.exact, "move left unproven", { iter, rep: r.rep });
+            check(replayLine(position, r.line) === r.best, "proven line does not replay", { iter, rep: r.rep });
+        }
+    }
+
+    // wasm-vs-wasm consistency on a bigger board: the minimum over per-move
+    // values must equal the root optimum of the branch & bound solver
+    const big = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    const brnd = mulberry32(777);
+    for (let i = 0; i < 8; i++) for (let j = 0; j < 4; j++) big[i][j] = 1 + Math.floor(brnd() * 3);
+    setIOBoard(big);
+    eng.setBoard();
+    const rootsBig = collectResults().roots;
+    let minValue = Infinity;
+    for (let k = 0; k < rootsBig.length; k++) {
+        const v = runValue(k, 50_000_000);
+        check(v >= 0, "big-board value solve did not finish", { k, v });
+        minValue = Math.min(minValue, v);
+    }
+    eng.exactBegin(50_000_000);
+    let r = -1;
+    while (r === -1) r = eng.exactStep(400_000);
+    if (r >= 0) check(r === minValue, "value solver disagrees with B&B optimum", { r, minValue });
+});
+
+suite("max-width pass (w=16384) stays sound", () => {
+    const rnd = mulberry32(46368);
+    const position = randomlyPlayed(randomPosition(rnd), rnd, 25); // mid-sized board
+    setIOBoard(position);
+    eng.setBoard();
+
+    eng.beamBegin(16384, 7);
+    while (eng.beamStep(400000) === 0) { /* run */ }
+
+    const { roots, stats } = collectResults();
+    check(stats.width === 16384, "width not accepted", { width: stats.width });
+    for (const r of roots) {
+        check(replayLine(position, r.line) === r.best, "wide-pass line broken", { rep: r.rep, best: r.best });
+    }
+});
+
+suite("root-locked passes improve only their move", () => {
+    const position = randomPosition(mulberry32(2718));
+    setIOBoard(position);
+    eng.setBoard();
+    const before = collectResults().roots.map((r) => r.best);
+
+    eng.beamBeginRoot(0, 64, 0);
+    while (eng.beamStep(100000) === 0) { /* run */ }
+
+    const after = collectResults().roots;
+    check(after[0].best <= before[0], "locked root regressed", { before: before[0], after: after[0].best });
+    for (let k = 1; k < after.length; k++) {
+        check(after[k].best === before[k], "non-locked root changed", { k });
+    }
+    for (const r of after) {
+        check(replayLine(position, r.line) === r.best, "line broken after locked pass", { rep: r.rep });
+    }
+});
+
 // --- 5: exact solver vs brute force -------------------------------------------
 
 suite("exact solver agrees with brute force on small boards", () => {

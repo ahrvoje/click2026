@@ -65,7 +65,7 @@ function bestFinal(board, widths) {
 }
 
 function evaluate(dead, single, frag, widths) {
-    eng.setWeights(dead, single, frag, 1.2);
+    eng.setWeights(dead, single, frag, 0.5, 1.2);
     let clears = 0, total = 0;
     for (const board of BOARDS) {
         const final = bestFinal(board, widths);
@@ -98,7 +98,7 @@ for (const g of grid.slice(0, 5)) {
 
 console.log("\nvalidation of top 2 with the full live schedule [8..512 + stochastic]:");
 for (const g of grid.slice(0, 2)) {
-    eng.setWeights(g.dead, g.single, g.frag, 1.2);
+    eng.setWeights(g.dead, g.single, g.frag, 0.5, 1.2);
     let clears = 0, total = 0;
     for (const board of BOARDS) {
         mem().set(board, IO);

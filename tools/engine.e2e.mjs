@@ -130,11 +130,39 @@ try {
     });
     check(overlayPixels.white > 20, "rank-1 outline painted on board", overlayPixels);
 
+    // clicking a suggestion row plays that move; the warm-start cache must
+    // carry the known line over, so the new best is never worse than the
+    // clicked move's score — even on the very first posted result
+    await page.waitForFunction(() => document.querySelectorAll("#engineList .engineRow").length >= 1, { timeout: 20000 });
+    const beforeClick = await page.evaluate(() => ({
+        move: document.getElementById("moveValue").textContent,
+        score: parseInt(document.querySelector("#engineList .engineScore").textContent, 10),
+    }));
+    // atomic in-page click: the list may re-render between resolving a handle
+    // and puppeteer's multi-step click sequence
+    await page.evaluate(() =>
+        document.querySelector("#engineList .engineRow")
+            .dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    await new Promise((r) => setTimeout(r, 400));
+    const afterClick = await page.evaluate(() => ({
+        move: document.getElementById("moveValue").textContent,
+        score: parseInt(document.querySelector("#engineList .engineScore")?.textContent ?? "9999", 10),
+    }));
+    check(afterClick.move !== beforeClick.move, "row click plays the move", { beforeClick, afterClick });
+    check(afterClick.score <= beforeClick.score, "warm start keeps the known line", { beforeClick, afterClick });
+
+    // telemetry line: five fixed columns on a single line
+    const statusShape = await page.$eval("#engineStatus", (s) => ({
+        columns: s.querySelectorAll("span").length,
+        height: s.clientHeight,
+    }));
+    check(statusShape.columns === 5 && statusShape.height < 26, "status line fixed and unwrapped", statusShape);
+
     // continuous analysis: on a full board (no proofs possible) the engine
     // must keep working indefinitely — nodes strictly increasing, no idle-out
-    const nodesOf = async () => page.$eval("#engineStatus", (s) => {
-        const m = s.textContent.match(/([\d.]+)([Mk]) n /);
-        return m ? parseFloat(m[1]) * (m[2] === "M" ? 1e6 : 1e3) : -1;
+    const nodesOf = async () => page.$eval("#engineStatus .engineStNodes", (s) => {
+        const m = s.textContent.match(/([\d.]+)([Mk]?)/);
+        return m ? parseFloat(m[1]) * (m[2] === "M" ? 1e6 : m[2] === "k" ? 1e3 : 1) : -1;
     });
     await new Promise((r) => setTimeout(r, 6000));
     const nodesA = await nodesOf();
@@ -148,8 +176,9 @@ try {
     await page.click("#engineButton");
     check(await page.$eval("#engineSection", (s) => s.hidden), "engine panel hides on toggle-off");
 
-    // endgame proving: rewind a recorded game to 8 moves before its end
-    // (25 cells) — the proof ladder must prove every move and report complete
+    // endgame proving: rewind a recorded game to 10 moves before its end —
+    // 32 remaining cells, the size class that used to cycle under the old
+    // 32-cell gate; the value solver must prove every move and report complete
     const example = "?position=544341454153245551352111315534254113553554342242333515335513533415541542" +
         "111541422113121311534345113215252332331311244443442542241513343551454125" +
         "&moves=65,54,21,43,31,42,30,29,17,15,13,13,37,24,25,24,14,13,14,26,26,38,38,54,66,78,89,88,88," +
@@ -160,13 +189,13 @@ try {
     await page.click("#forwardButton");
     await page.evaluate(() => {
         const canvas = document.getElementById("gameCanvas");
-        for (let i = 0; i < 8; i++) {
+        for (let i = 0; i < 10; i++) {
             canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
         }
     });
     await page.click("#engineButton");
     await page.waitForFunction(
-        () => /complete — all moves proven/.test(document.getElementById("engineStatus").textContent),
+        () => /proven ✓/.test(document.getElementById("engineStatus").textContent),
         { timeout: 90000 });
     const proven = await page.$$eval("#engineList .engineExact", (els) => els.map((e) => e.textContent));
     check(proven.length > 0 && proven.every((t) => t === "✓"), "endgame rows all proven", { proven });

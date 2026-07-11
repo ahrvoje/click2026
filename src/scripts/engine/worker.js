@@ -14,14 +14,26 @@
  *   1. greedy baselines            — instant score for every root move
  *   2. CPU playout round           — tabu-color random playouts per root
  *   3. widening beam passes        — deterministic, widths 8..2048
- *   4. continuous investigation    — endless diversified beam passes (widths
- *      cycling 256..4096) plus playout rounds biased to the current top
- *      moves (GPU-accelerated when WebGPU is available), interleaved with an
+ *   4. continuous investigation    — alternating global beam passes (widths
+ *      cycling 512..4096) and root-locked passes that deepen one displayed
+ *      move at a time, plus playout rounds biased to the current top moves
+ *      (GPU-accelerated when WebGPU is available), interleaved with an
  *      exact-proof ladder that solves each root move's child position once
  *      the board is small enough
  *
- * Analysis never idles out: it ends only when EVERY move's score is proven
- * optimal (the board is then fully understood) or a new position arrives.
+ * Analysis ends in exactly three ways: a new position arrives, EVERY move is
+ * proven optimal ("proven"), or nothing has improved for SETTLE_PASSES
+ * passes even at the top of the width ladder on a board too large to
+ * enumerate ("settled") — never by an arbitrary timer. Stagnation first
+ * escalates width (deeper, provably fresh exploration), then stops honestly.
+ * Bigger-group hopefuls — moves with larger groups than the current best
+ * that might match its score — get first claim on locked passes, playouts
+ * and proofs, because equal outcomes with bigger groups are faster to play.
+ *
+ * Knowledge survives moves: every posted result is cached by board key, and
+ * a new analysis is seeded with the cached lines of its own position plus
+ * the line suffixes of the previous position (replay-validated in WASM), so
+ * playing a suggested move never makes the engine forget the line it showed.
  *
  * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
@@ -35,12 +47,16 @@ import { createGpu, dominantColor } from "./gpu.js";
 const SIZE = 12;
 const CHUNK = 16000;            // beam expansions per slice, ~10 ms
 const EXACT_CHUNK = 60000;      // exact solver expansions per slice
-const EXACT_REMAINING = 32;     // exact proving starts at or below this many cells
-const EXACT_BUDGET = 2000000;   // first proof attempt per move; escalates ×4
-const EXACT_MAX_BUDGET = 32000000;
+const EXACT_REMAINING = 56;     // full-speed exact proving at or below this many cells
+const EXACT_TRY_REMAINING = 88; // above 56 up to here: proving trickles at 1 chunk/cycle
+const EXACT_BUDGET = 8000000;   // first proof attempt per move; escalates ×4, uncapped
+const LINE_BUDGET = 64000000;   // line seek is bound-directed, rarely needs much
 const WIDEN_WIDTHS = [8, 32, 128, 512, 2048];
-const DEEP_WIDTHS = [2048, 256, 512, 1024];   // continuous-phase cycle
-const DEEP_FULL_EVERY = 8;      // every n-th continuous pass runs at full width 4096
+const WIDTH_TIERS = [512, 1024, 2048, 4096, 8192, 16384]; // stagnation climbs this ladder
+const LOCKED_WIDTH = 2048;      // width of root-locked passes deepening one top move
+const TOP_RANKS = 5;            // moves shown in the UI — get the focused compute
+const SETTLE_PASSES = 24;       // fruitless passes at max width before a settled stop
+const CACHE_MAX = 64;           // remembered positions for warm starts
 const POST_INTERVAL_MS = 150;
 
 let eng = null;
@@ -51,6 +67,11 @@ let gpuState = "off";           // "off" | "on" | "failed"
 let job = null;
 let jobVersion = 0;
 let kickWaiter = null;
+
+// warm-start memory: boardKey -> last posted move list (lines, scores, proofs);
+// insertion order doubles as LRU order
+const resultCache = new Map();
+let prevAnalysis = null; // { key, moves } of the most recently analyzed position
 
 // fast macrotask yield — setTimeout(0) clamps, a MessageChannel does not
 const tickChannel = new MessageChannel();
@@ -127,12 +148,23 @@ function collectResults() {
 async function analyze(myJob, isStale) {
     const t0 = performance.now();
     let lastPost = 0;
+    const key = myJob.board.join(",");
 
     mem().set(myJob.board, IO);
     eng.setBoard();
+    seedFromMemory(key);
 
     const post = (settled) => {
         const { moves, nodes, depth, width, remaining } = collectResults();
+
+        // remember this position for warm starts (LRU refresh on re-insert)
+        resultCache.delete(key);
+        resultCache.set(key, moves);
+        if (resultCache.size > CACHE_MAX) {
+            resultCache.delete(resultCache.keys().next().value);
+        }
+        prevAnalysis = { key, moves };
+
         self.postMessage({
             type: "result",
             id: myJob.id,
@@ -146,6 +178,10 @@ async function analyze(myJob, isStale) {
                 nps: nodes / Math.max(1, performance.now() - t0) * 1000,
                 gpu: gpuState,
                 settled: settled === true,
+                // "proven": every move optimal; "settled": stagnant at max
+                // width on a board too large to enumerate
+                state: settled !== true ? "analyzing"
+                    : moves.length > 0 && moves.every((m) => m.exact) ? "proven" : "settled",
             },
         });
         lastPost = performance.now();
@@ -194,28 +230,41 @@ async function analyze(myJob, isStale) {
         }
     }
 
-    // 4. continuous investigation — runs until the position changes or every
-    // move's score is PROVEN optimal; scores can only improve over time
+    // 4. continuous investigation — runs until the position changes, every
+    // move is PROVEN optimal, or nothing new has been found despite climbing
+    // the whole width ladder (settled stop); scores only improve over time
     const ladder = createExactLadder(isStale);
+    let lastSig = "";
+    let fruitless = 0;
     for (let s = 1; ; s++) {
         if (isStale()) return;
 
         if (moves.length > 0 && moves.every((m) => m.exact)) {
-            post(true); // the position is fully understood — nothing left to compute
+            post(true); // proven: the position is fully understood
             return;
         }
 
-        // exact-proof ladder: one bounded slice per cycle, best-ranked first
+        // exact-proof ladder: one bounded slice per cycle, hopefuls first
         if (await ladder.advance(moves)) {
             moves = post(false);
             continue; // re-rank before spending beam time
         }
         if (isStale()) return;
 
-        // diversified beam pass; the noise seed makes every pass explore a
-        // different corridor, the width cycle periodically goes full depth
-        const width = s % DEEP_FULL_EVERY === 0 ? 4096 : DEEP_WIDTHS[s % DEEP_WIDTHS.length];
-        eng.beamBegin(width, s);
+        // stagnation climbs the width ladder: the longer nothing improves,
+        // the wider (deeper) the global passes get before giving up
+        const tier = Math.min(WIDTH_TIERS.length - 1, Math.floor(fruitless / 4));
+
+        // odd passes lock the whole beam onto one candidate: bigger-group
+        // hopefuls first (can a larger group match the best score?), then the
+        // unproven displayed moves; even passes search globally, and the noise
+        // seed makes every pass explore a different corridor
+        const locked = s % 2 === 1 ? lockCandidates(moves) : [];
+        if (locked.length > 0) {
+            eng.beamBeginRoot(locked[(s >> 1) % locked.length].k, LOCKED_WIDTH, s);
+        } else {
+            eng.beamBegin(WIDTH_TIERS[tier], s);
+        }
         for (;;) {
             if (isStale()) return;
             if (eng.beamStep(CHUNK) === 1) break;
@@ -235,14 +284,86 @@ async function analyze(myJob, isStale) {
             if (isStale()) return;
             moves = post(false);
         }
+
+        // full-signature progress detector: any score or proof change counts
+        const sig = moves.map((m) => `${m.cell}:${m.score}:${m.exact ? 1 : 0}`).join("|");
+        if (sig !== lastSig) {
+            lastSig = sig;
+            fruitless = 0;
+        } else {
+            fruitless++;
+        }
+
+        // settled stop: nothing new despite max-width diversified passes, and
+        // the board is too large to enumerate — below the proving gate the
+        // engine never stops early, proofs always land eventually
+        if (fruitless >= SETTLE_PASSES && tier === WIDTH_TIERS.length - 1 &&
+            eng.getRemaining() > EXACT_REMAINING) {
+            post(true);
+            return;
+        }
     }
 }
 
-// CPU playout round with rank bias: the displayed top moves get most samples
+// moves worth extra attention because the player would rather click a bigger
+// group: larger than the best-scoring move's group, score not yet matching
+function biggerHopefuls(moves) {
+    if (moves.length === 0) return [];
+    const best = moves[0].score;
+    const bestSize = Math.max(...moves.filter((m) => m.score === best).map((m) => m.size));
+    return moves
+        .filter((m) => !m.exact && m.score > best && m.size > bestSize)
+        .sort((a, b) => b.size - a.size || a.score - b.score)
+        .slice(0, 8);
+}
+
+// root-locked pass targets: bigger-group hopefuls first, then unproven top 5
+function lockCandidates(moves) {
+    const hopefuls = biggerHopefuls(moves);
+    const seen = new Set(hopefuls.map((m) => m.cell));
+    const top = moves.slice(0, TOP_RANKS).filter((m) => !m.exact && !seen.has(m.cell));
+    return [...hopefuls, ...top];
+}
+
+// warm start: replay every remembered line that could apply to this position —
+// lines cached for this exact board (with their proof flags), plus the
+// suffixes of the previous position's lines (after the played move, the rest
+// of such a line is a line of THIS position). seedLine() replay-validates
+// every candidate inside WASM, so wrong guesses are rejected, never trusted.
+// This is what lets a played "0 ★" suggestion keep its clearing line instantly.
+function seedFromMemory(key) {
+    const seeds = [];
+
+    const cached = resultCache.get(key);
+    if (cached) {
+        for (const m of cached) {
+            if (m.line.length > 0) seeds.push({ line: m.line, exact: m.exact, score: m.score });
+        }
+    }
+
+    if (prevAnalysis && prevAnalysis.key !== key) {
+        for (const m of prevAnalysis.moves) {
+            if (m.line.length > 1) seeds.push({ line: m.line.slice(1) });
+        }
+    }
+
+    for (const seed of seeds) {
+        if (seed.line.length > 80) continue;
+        mem().set(Uint8Array.from(seed.line), IO);
+        const final = eng.seedLine(seed.line.length);
+        if (seed.exact && final === seed.score) {
+            eng.seedExactByCell(seed.line[0], seed.score);
+        }
+    }
+}
+
+// CPU playout round with rank bias: the displayed top moves and bigger-group
+// hopefuls get most samples
 async function cpuPlayoutRound(moves, seedBase, isStale) {
+    const priority = new Set(biggerHopefuls(moves).map((m) => m.cell));
     for (let rank = 0; rank < moves.length; rank++) {
         if (isStale()) return seedBase;
-        const n = rank < 8 ? 48 : 8;
+        const n = rank < 8 || priority.has(moves[rank].cell) ? 48 : 8;
         eng.playoutRoot(moves[rank].k, n, seedBase);
         seedBase += n;
         if (rank % 6 === 5) await nextTick();
@@ -250,45 +371,86 @@ async function cpuPlayoutRound(moves, seedBase, isStale) {
     return seedBase;
 }
 
-// exact-proof ladder: once the board is small enough, solve each root move's
-// child position to optimality, best-ranked moves first, with escalating
-// budgets; a proof both hardens the score (✓ in the UI) and often improves it
+// exact-proof ladder: once the board is small enough, prove each root move,
+// best-ranked first. Values come from the memoized value solver (vsBegin /
+// vsStep) — a full enumeration whose memo is SHARED across the moves of one
+// position and across budget retries, so sibling proofs cost little more
+// than the first one and no board state is ever analysed twice. When a
+// proven value beats the known line, a bound-directed seek recovers the
+// optimal line (keeping every displayed score replayable).
 function createExactLadder(isStale) {
-    const exhausted = new Map(); // cell -> largest budget already tried
-    let active = null;           // { k, cell, budget }
+    const exhausted = new Map(); // cell -> last value-solve budget tried
+    let active = null;           // { k, cell, mode: "value" | "line", budget, target }
 
     return {
         // runs a bounded slice; true if a proof finished (rankings may change)
         async advance(moves) {
-            if (moves.length === 0 || eng.getRemaining() > EXACT_REMAINING) return false;
+            const remaining = eng.getRemaining();
+            if (moves.length === 0 || remaining > EXACT_TRY_REMAINING) return false;
+
+            // full speed below the gate, a background trickle above it —
+            // the memo keeps every explored state either way
+            const slices = remaining <= EXACT_REMAINING ? 8 : 1;
 
             if (!active) {
-                const next = moves.find((m) => !m.exact &&
-                    (exhausted.get(m.cell) ?? 0) < EXACT_MAX_BUDGET);
-                if (!next) return false; // everything proven or out of budget
+                // hopefuls first: proving a bigger group's value directly
+                // answers "can I click the big one instead?"
+                const next = biggerHopefuls(moves)[0] ?? moves.find((m) => !m.exact);
+                if (!next) return false; // everything proven
 
-                const budget = Math.min(EXACT_MAX_BUDGET, (exhausted.get(next.cell) ?? EXACT_BUDGET / 4) * 4);
-                eng.exactBeginChild(next.k, budget);
-                active = { k: next.k, cell: next.cell, budget };
+                // budgets escalate ×4 without a cap: the space is finite, the
+                // search preemptible, and the memo keeps all completed work,
+                // so a retry resumes instead of starting over
+                const budget = (exhausted.get(next.cell) ?? EXACT_BUDGET / 4) * 4;
+                active = { k: next.k, cell: next.cell, mode: "value", budget, target: -1 };
+
+                const immediate = eng.vsBegin(next.k, budget);
+                if (immediate === -3) { active = null; return false; }
+                if (immediate >= 0) return this.finishValue(immediate);
             }
 
-            // up to ~8 chunks per cycle, then hand control back to the beams
-            for (let c = 0; c < 8; c++) {
+            // a bounded number of chunks per cycle, then back to the beams
+            for (let c = 0; c < slices; c++) {
                 if (isStale()) return false;
-                const result = eng.exactStep(EXACT_CHUNK);
-                if (result === -1) {
+                const r = active.mode === "value" ? eng.vsStep(EXACT_CHUNK) : eng.exactStep(EXACT_CHUNK);
+                if (r === -1) {
                     await nextTick();
                     continue;
                 }
-                if (result === -2) {
-                    exhausted.set(active.cell, active.budget); // retry later, ×4 budget
-                } else {
-                    eng.exactMergeChild(active.k);
+
+                if (active.mode === "value") {
+                    if (r === -2) { // budget out — memo kept, retry escalates
+                        exhausted.set(active.cell, active.budget);
+                        active = null;
+                        return false;
+                    }
+                    return this.finishValue(r);
                 }
+
+                // line seek finished: exactly `target` means the line is in
+                if (r === active.target) {
+                    eng.exactMergeChild(active.k);
+                    active = null;
+                    return true;
+                }
+                exhausted.set(active.cell, active.budget); // seek trouble — retry later
                 active = null;
-                return result !== -2;
+                return false;
             }
-            return false; // proof still running — resume next cycle
+            return false; // still running — resume next cycle
+        },
+
+        // a proven value arrived: flag it directly when the known line already
+        // achieves it, otherwise seek the improving line
+        finishValue(value) {
+            if (eng.seedExactByCell(active.cell, value) === 1) {
+                active = null;
+                return true;
+            }
+            eng.exactChildSeek(active.k, LINE_BUDGET, value);
+            active.mode = "line";
+            active.target = value;
+            return false;
         },
     };
 }

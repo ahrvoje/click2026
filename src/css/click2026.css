@@ -354,6 +354,7 @@ body {
     gap: 8px;
     line-height: 23px;
     padding-left: 3px;
+    cursor: pointer; /* a click plays the suggested move */
 
     &:hover {
         background-color: rgb(19 121 202 / 0.15);
@@ -392,11 +393,26 @@ body {
     font-weight: bold;
 }
 
+/* telemetry line: fixed-width columns, one line, never wraps */
 #engineStatus {
+    display: flex;
     min-height: 15px;
     padding: 4px 0 0 3px;
     font-size: 11px;
     opacity: 0.55;
+    white-space: nowrap;
+    overflow: hidden;
+
+    .engineStState { width: 62px; }
+    .engineStDepth { width: 70px; }
+    .engineStNodes { width: 58px; }
+    .engineStNps { width: 62px; }
+
+    .engineStBackend {
+        flex: 1;
+        text-align: right;
+        padding-right: 3px;
+    }
 }
 
 /* tests dialog — a flex column: title bar, progress, report, Stop pinned to the bottom */

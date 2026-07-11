@@ -28,14 +28,14 @@ const CELLS: i32 = 144;
 const COLORS: i32 = 5;
 
 // search limits
-const MAX_WIDTH: i32 = 4096;        // beam arena capacity
+const MAX_WIDTH: i32 = 16384;       // beam arena capacity (stagnation escalates up to this)
 const MAX_ROOTS: i32 = 80;          // legal first moves never exceed 72 (each removes >= 2 cells)
 const LINE_MAX: i32 = 80;           // longest possible move line, with headroom
 const EDGE_MAX: i32 = MAX_WIDTH * (LINE_MAX + 4);
-const HASH_CAP: i32 = 1 << 15;      // per-layer dedup table (power of two)
+const HASH_CAP: i32 = 1 << 17;      // per-layer dedup table (power of two)
 const HASH_MASK: i32 = HASH_CAP - 1;
 const HASH_PROBES: i32 = 32;        // linear probing give-up bound
-const TT_CAP: i32 = 1 << 17;        // exact solver transposition table
+const TT_CAP: i32 = 1 << 20;        // exact solver transposition table
 const TT_MASK: i32 = TT_CAP - 1;
 const EXACT_STACK: i32 = 80;        // exact solver DFS depth bound
 
@@ -48,6 +48,7 @@ const NO_SCORE: i32 = 0x7FFFFFFF;
 let W_DEAD: f32 = 6.0;              // cells of a color with exactly one cell left — stuck forever
 let W_SINGLE: f32 = 2.0;            // size-1 components of otherwise pairable colors
 let W_FRAG: f32 = 0.6;              // extra components per color beyond the first
+let W_FROZEN: f32 = 0.5;            // cells of a "frozen" color: >= 2 cells but no playable pair
 let NOISE_SCALE: f32 = 1.2;         // eval jitter amplitude of stochastic diversification passes
 
 // ---------------------------------------------------------------------------
@@ -295,6 +296,7 @@ let evalHasMoves: bool = false;
 
 const colorTotal = new StaticArray<i32>(COLORS + 1);
 const colorComps = new StaticArray<i32>(COLORS + 1);
+const colorHasPair = new StaticArray<i32>(COLORS + 1);
 
 // heuristic value of a board, lower is better; fills evalRemaining, evalHash
 // and evalHasMoves as side products of the same scan
@@ -303,6 +305,7 @@ function evalBoard(bd: usize, noiseSeed: u32): f32 {
     for (let c = 0; c <= COLORS; c++) {
         unchecked(colorTotal[c] = 0);
         unchecked(colorComps[c] = 0);
+        unchecked(colorHasPair[c] = 0);
     }
 
     let remaining = 0;
@@ -342,8 +345,12 @@ function evalBoard(bd: usize, noiseSeed: u32): f32 {
         const ci = <i32>color;
         unchecked(colorTotal[ci] = unchecked(colorTotal[ci]) + size);
         unchecked(colorComps[ci] = unchecked(colorComps[ci]) + 1);
-        if (size == 1) singles++;
-        else hasMoves = true;
+        if (size == 1) {
+            singles++;
+        } else {
+            hasMoves = true;
+            unchecked(colorHasPair[ci] = 1);
+        }
     }
 
     evalRemaining = remaining;
@@ -352,8 +359,12 @@ function evalBoard(bd: usize, noiseSeed: u32): f32 {
 
     let dead = 0;   // colors reduced to a single cell — that cell is stuck forever
     let frag = 0;   // components beyond the first, per color
+    let frozen = 0; // cells of colors with >= 2 cells but no playable pair anywhere:
+                    // only a gravity merge can save them, most end up as leftovers
     for (let c = 1; c <= COLORS; c++) {
-        if (unchecked(colorTotal[c]) == 1) dead++;
+        const total = unchecked(colorTotal[c]);
+        if (total == 1) dead++;
+        else if (total > 1 && !unchecked(colorHasPair[c])) frozen += total;
         const comps = unchecked(colorComps[c]);
         if (comps > 1) frag += comps - 1;
     }
@@ -361,7 +372,8 @@ function evalBoard(bd: usize, noiseSeed: u32): f32 {
     let value = <f32>remaining
         + W_DEAD * <f32>dead
         + W_SINGLE * <f32>(singles - dead)
-        + W_FRAG * <f32>frag;
+        + W_FRAG * <f32>frag
+        + W_FROZEN * <f32>frozen;
 
     if (noiseSeed != 0) {
         // deterministic per-board jitter diversifies repeated stochastic passes
@@ -545,10 +557,11 @@ export function getRemaining(): i32 {
     return rootRemaining;
 }
 
-export function setWeights(dead: f32, single: f32, frag: f32, noise: f32): void {
+export function setWeights(dead: f32, single: f32, frag: f32, frozen: f32, noise: f32): void {
     W_DEAD = dead;
     W_SINGLE = single;
     W_FRAG = frag;
+    W_FROZEN = frozen;
     NOISE_SCALE = noise;
 }
 
@@ -603,8 +616,8 @@ function dedupInsert(hash: u64): bool {
     return true; // table region saturated — allow potential duplicate
 }
 
-// starts an anytime pass; noiseSeed 0 = deterministic, else stochastic variant
-export function beamBegin(width: i32, noiseSeed: u32): void {
+// pass setup shared by beamBegin/beamBeginRoot; onlyRoot -1 = all root moves
+function beamInit(width: i32, noiseSeed: u32, onlyRoot: i32): void {
     if (width > MAX_WIDTH) width = MAX_WIDTH;
     passWidth = width;
     passNoise = noiseSeed;
@@ -612,12 +625,13 @@ export function beamBegin(width: i32, noiseSeed: u32): void {
     layerDepth = 1;
     dedupStamp++;
 
-    // layer 1: every root child is kept, regardless of width
+    // layer 1: every selected root child is kept, regardless of width
     curArena = 0;
     curCount = 0;
     curCursor = 0;
 
     for (let k = 0; k < rootCount; k++) {
+        if (onlyRoot >= 0 && k != onlyRoot) continue;
         const bd = curBoards() + <usize>(curCount * CELLS);
         memory.copy(bd, pu8(ROOT_BOARD), CELLS);
         applyMove(bd, <i32>unchecked(ROOT_REP[k]));
@@ -639,6 +653,17 @@ export function beamBegin(width: i32, noiseSeed: u32): void {
 
     heapSize = 0;
     passActive = curCount > 0;
+}
+
+// starts an anytime pass; noiseSeed 0 = deterministic, else stochastic variant
+export function beamBegin(width: i32, noiseSeed: u32): void {
+    beamInit(width, noiseSeed, -1);
+}
+
+// root-locked pass: the whole beam explores only the subtree of root move k,
+// deepening the most promising candidates instead of re-searching everything
+export function beamBeginRoot(k: i32, width: i32, noiseSeed: u32): void {
+    beamInit(width, noiseSeed, k >= 0 && k < rootCount ? k : -1);
 }
 
 // expands up to `budget` child evaluations; returns 1 when the pass is finished
@@ -855,6 +880,59 @@ export function playoutVerify(k: i32, seed: u32, claimed: i32): i32 {
     return 1;
 }
 
+// warm start: replays a move line (len cells in IO) on the analysis board and
+// merges it into its root move's result if it improves it — used to carry
+// knowledge across positions (cache hits, suffixes of previously found lines).
+// The line is fully replay-validated, so bogus seeds are rejected, never
+// trusted. Returns the line's final remaining, or -1 when it does not apply.
+export function seedLine(len: i32): i32 {
+    if (len < 1 || len > LINE_MAX) return -1;
+
+    memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
+
+    // the root move is the group containing the line's first cell; its rep is
+    // the group's smallest cell index (board.js scan order)
+    const size = floodFill(pu8(PLAYOUT_BOARD), <i32>load<u8>(pu8(IO)));
+    if (size < 2) return -1;
+    let rep = CELLS;
+    for (let i = 0; i < size; i++) {
+        const c = <i32>unchecked(GROUP_CELLS[i]);
+        if (c < rep) rep = c;
+    }
+    let root = -1;
+    for (let k = 0; k < rootCount; k++) {
+        if (<i32>unchecked(ROOT_REP[k]) == rep) { root = k; break; }
+    }
+    if (root < 0) return -1;
+
+    for (let i = 0; i < len; i++) {
+        if (applyMove(pu8(PLAYOUT_BOARD), <i32>load<u8>(pu8(IO) + <usize>i)) == 0) return -1;
+    }
+
+    const final = boardRemaining(pu8(PLAYOUT_BOARD));
+    if (final < unchecked(ROOT_BEST[root])) {
+        unchecked(ROOT_BEST[root] = final);
+        unchecked(ROOT_LINE_LEN[root] = <u8>len);
+        memory.copy(pu8(ROOT_LINES) + <usize>(root * LINE_MAX), pu8(IO), len);
+    }
+    return final;
+}
+
+// warm start: restores a proof flag from a cached analysis of this very board;
+// only applies when the root's current best equals the remembered proven score
+export function seedExactByCell(cell: i32, score: i32): i32 {
+    for (let k = 0; k < rootCount; k++) {
+        if (<i32>unchecked(ROOT_REP[k]) == cell) {
+            if (unchecked(ROOT_BEST[k]) == score) {
+                unchecked(ROOT_EXACT[k] = 1);
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
 // writes the child board after root move k into IO (for the GPU pipeline)
 export function childToIO(k: i32): i32 {
     if (k < 0 || k >= rootCount) return 0;
@@ -1032,6 +1110,28 @@ export function exactMergeChild(k: i32): i32 {
     return exBest;
 }
 
+// line seek: like exactBeginChild, but with a known target value — everything
+// that cannot reach `target` is pruned, so recovering the optimal line after
+// the value solver is cheap. exactStep completing with `target` means the
+// line was found and recorded (merge with exactMergeChild)
+export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
+    if (k < 0 || k >= rootCount) return 0;
+
+    exActive = true;
+    exComplete = false;
+    exBest = target + 1;
+    exBestLen = 0;
+    exNodes = 0;
+    exBudget = budget;
+    exDepth = 0;
+    ttStamp++;
+
+    memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
+    applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
+    exPush(pu8(PLAYOUT_BOARD));
+    return 1;
+}
+
 // merges a completed exact result into the root table: roots whose best equals
 // the proven optimum are flagged exact; returns the optimum (or NO_SCORE)
 export function exactMerge(): i32 {
@@ -1059,6 +1159,151 @@ export function exactMerge(): i32 {
     }
 
     return exBest;
+}
+
+// ---------------------------------------------------------------------------
+// value solver — full enumeration with a persistent value memo
+//
+// Computes the EXACT optimal remaining after one root move by enumerating the
+// whole reachable subspace, memoizing every board's value (no alpha pruning,
+// so memo entries are context-free and reusable). The memo persists across
+// root moves of the same position AND across budget escalations: sibling
+// subtrees overlap massively, so proving all moves costs little more than
+// proving one — and no position is ever analysed twice. This is the record
+// that stops the engine from cycling over the same small-board states.
+// ---------------------------------------------------------------------------
+
+const VTT_CAP: i32 = 1 << 21;       // value memo (direct-mapped)
+const VTT_MASK: i32 = VTT_CAP - 1;
+const VTT_KEY = new StaticArray<u64>(VTT_CAP);
+const VTT_VAL = new StaticArray<u8>(VTT_CAP);
+const VTT_STAMP = new StaticArray<u32>(VTT_CAP);
+const EX_MIN = new StaticArray<i32>(EXACT_STACK);
+const EX_HASH = new StaticArray<u64>(EXACT_STACK);
+
+let vsActive: bool = false;
+let vsDepth: i32 = 0;
+let vsNodes: i32 = 0;
+let vsBudget: i32 = 0;
+let vttStamp: u32 = 0;
+let vsRootHash: u64 = 0;
+
+function vttLookup(hash: u64): i32 {
+    const at = <i32>(hash & <u64>VTT_MASK);
+    if (unchecked(VTT_STAMP[at]) == vttStamp && unchecked(VTT_KEY[at]) == hash) {
+        return <i32>unchecked(VTT_VAL[at]);
+    }
+    return -1;
+}
+
+function vttStore(hash: u64, value: i32): void {
+    const at = <i32>(hash & <u64>VTT_MASK);
+    unchecked(VTT_STAMP[at] = vttStamp);
+    unchecked(VTT_KEY[at] = hash);
+    unchecked(VTT_VAL[at] = <u8>value);
+}
+
+// pushes a board, or resolves it immediately; returns -1 when pushed,
+// the board's exact value on a memo hit or terminal
+function vsPush(bd: usize): i32 {
+    const hash = boardHash(bd);
+    const memo = vttLookup(hash);
+    if (memo >= 0) return memo;
+
+    const frame = vsDepth;
+    memory.copy(pu8(EX_BOARDS) + <usize>(frame * CELLS), bd, CELLS);
+    const n = enumerateGroups(pu8(EX_BOARDS) + <usize>(frame * CELLS));
+
+    if (n == 0) {
+        const value = boardRemaining(bd);
+        vttStore(hash, value);
+        return value;
+    }
+
+    memory.copy(pu8(EX_REPS) + <usize>(frame * MAX_ROOTS), pu8(REPS), n);
+    unchecked(EX_COUNT[frame] = n);
+    unchecked(EX_CURSOR[frame] = 0);
+    unchecked(EX_MIN[frame] = NO_SCORE);
+    unchecked(EX_HASH[frame] = hash);
+    vsDepth++;
+    return -1;
+}
+
+// starts a value solve of the child after root move k; the memo is kept when
+// the analysis position is unchanged, so successive moves and retries reuse
+// all earlier work. Returns -3 on a bad k, -1 when running (drive with
+// vsStep), or the immediate value
+export function vsBegin(k: i32, budget: i32): i32 {
+    if (k < 0 || k >= rootCount) return -3;
+
+    const rootHash = boardHash(pu8(ROOT_BOARD));
+    if (rootHash != vsRootHash || vttStamp == 0) {
+        vttStamp++;
+        vsRootHash = rootHash;
+    }
+
+    vsNodes = 0;
+    vsBudget = budget;
+    vsDepth = 0;
+
+    memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
+    applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
+
+    const immediate = vsPush(pu8(PLAYOUT_BOARD));
+    vsActive = immediate < 0;
+    return immediate;
+}
+
+// runs up to `chunk` expansions; -1 still running, -2 budget exhausted
+// (memoized work is kept for the retry), else the proven exact value
+export function vsStep(chunk: i32): i32 {
+    if (!vsActive) return -2;
+
+    let spent = 0;
+    while (spent < chunk) {
+        const frame = vsDepth - 1;
+        const n = unchecked(EX_COUNT[frame]);
+        const cursor = unchecked(EX_CURSOR[frame]);
+
+        if (cursor < n) {
+            unchecked(EX_CURSOR[frame] = cursor + 1);
+            memory.copy(pu8(SCRATCH), pu8(EX_BOARDS) + <usize>(frame * CELLS), CELLS);
+            applyMove(pu8(SCRATCH), <i32>unchecked(EX_REPS[frame * MAX_ROOTS + cursor]));
+            vsNodes++;
+            spent++;
+            nodesExpanded++;
+
+            if (vsNodes > vsBudget) {
+                vsActive = false;
+                return -2;
+            }
+
+            if (vsDepth >= EXACT_STACK) { // cannot happen: depth <= 73
+                vsActive = false;
+                return -2;
+            }
+
+            const value = vsPush(pu8(SCRATCH));
+            if (value >= 0 && value < unchecked(EX_MIN[frame])) {
+                unchecked(EX_MIN[frame] = value);
+            }
+        } else {
+            // frame fully enumerated — memoize and merge into the parent
+            const value = unchecked(EX_MIN[frame]);
+            vttStore(unchecked(EX_HASH[frame]), value);
+            vsDepth--;
+
+            if (vsDepth == 0) {
+                vsActive = false;
+                return value;
+            }
+            if (value < unchecked(EX_MIN[vsDepth - 1])) {
+                unchecked(EX_MIN[vsDepth - 1] = value);
+            }
+        }
+    }
+
+    return -1;
 }
 
 // ---------------------------------------------------------------------------

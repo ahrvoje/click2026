@@ -215,10 +215,8 @@ function getMousePos(event) {
     };
 }
 
-function processClick(event) {
-    const { x, y } = getMousePos(event);
-
-    if (game.playMove([x, y])) {
+function playField(field) {
+    if (game.playMove(field)) {
         drawAllFields();
         updateScore();
         updateMove();
@@ -231,6 +229,31 @@ function processClick(event) {
         // make sure timer shows the exact time of the last move played
         updateTimeText();
         showButtons();
+    }
+}
+
+function processClick(event) {
+    const { x, y } = getMousePos(event);
+    playField([x, y]);
+}
+
+// engine hook: clicking a suggested move plays it exactly like a board click,
+// including the first-click transition that starts a fresh game
+function playEngineMove(field) {
+    if (game.getStatus() === Game.Status.Ready) {
+        hideButtons();
+        game.startGame();
+        lastClickTime = game.getStartTime();
+
+        updateTimerInterval = setInterval(updateTimer, TIMER_INTERVAL_MS);
+        updateScore();
+        updateMove();
+        EngineUI.onPositionChanged();
+    }
+
+    if (game.getStatus() === Game.Status.Play) {
+        playField(field);
+        lastClickTime = Date.now();
     }
 }
 
@@ -398,6 +421,7 @@ export function init() {
         getBoardBytes: shownBoardBytes,
         redraw: drawAllFields,
         playColors: colors.playColors,
+        playMove: playEngineMove,
     });
 
     canvas.addEventListener("mousedown", onCanvasClick);

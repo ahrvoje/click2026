@@ -82,9 +82,12 @@ function renderStatus(text) {
     el("engineStatus").textContent = text;
 }
 
+let rowsSig = null; // content signature of the rendered rows, to skip no-op rebuilds
+
 function clearList() {
     el("engineList").replaceChildren();
     hoverIndex = null;
+    rowsSig = null;
 }
 
 function span(className, text) {
@@ -110,11 +113,20 @@ function renderResult() {
         return;
     }
 
+    // rebuild the rows only when their content changed — most posts only move
+    // the telemetry numbers, and keeping the nodes makes row clicks reliable
+    const sig = moves.map((m) => `${m.cell}:${m.score}:${m.size}:${m.exact ? 1 : 0}`).join("|");
+    if (sig === rowsSig) {
+        renderStats();
+        return;
+    }
+    rowsSig = sig;
+
     const rows = moves.map((move, index) => {
         const row = document.createElement("li");
         row.className = "engineRow";
-        row.title = `best line found leaves ${move.score} — group of ${move.size}` +
-            (move.exact ? " — proven optimal" : "");
+        row.title = `click to play — best line found leaves ${move.score}, group of ${move.size}` +
+            (move.exact ? ", proven optimal" : "");
 
         const rank = span("engineRank");
         rank.style.borderColor = RANK_COLORS[index];
@@ -132,15 +144,24 @@ function renderResult() {
 
         row.addEventListener("mouseenter", () => { hoverIndex = index; hooks.redraw(); });
         row.addEventListener("mouseleave", () => { hoverIndex = null; hooks.redraw(); });
+        row.addEventListener("click", () => hooks.playMove([move.x, move.y]));
         return row;
     });
 
     list.replaceChildren(...rows);
+    renderStats();
+}
 
+// fixed-width columns so the line never wraps or jiggles as numbers change
+function renderStats() {
     const s = result.stats;
-    renderStatus(`${s.settled ? "complete — all moves proven" : "analyzing…"} · w${s.width} d${s.depth}` +
-        ` · ${formatCount(s.nodes)} n · ${formatCount(s.nps)} n/s` +
-        ` · ${{ on: "CPU+GPU", off: "CPU", failed: "CPU (GPU failed)" }[s.gpu]}`);
+    el("engineStatus").replaceChildren(
+        span("engineStState", { proven: "proven ✓", settled: "settled" }[s.state] ?? "analyzing…"),
+        span("engineStDepth", `w${s.width} d${s.depth}`),
+        span("engineStNodes", `${formatCount(s.nodes)} n`),
+        span("engineStNps", `${formatCount(s.nps)} n/s`),
+        span("engineStBackend", { on: "CPU+GPU", off: "CPU", failed: "GPU off" }[s.gpu]),
+    );
 }
 
 // strokes the boundary of a group (cells as [x, y]) along the block gaps
