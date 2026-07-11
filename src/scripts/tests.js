@@ -12,9 +12,40 @@
 
 import { Game } from "./game.js";
 import { Serializer } from "./serial.js";
+import { clonePosition, extractGroup, removeGroup, enumerateGroups } from "./board.js";
 
 const DEFAULT_COUNT = 10000;
 const DEFAULT_GROUP_SIZE = 1;
+
+// random legal game with synthetic times, used by the v4 round-trip test
+function randomRecordedGame() {
+    const position = new Game().getStartPosition();
+
+    const moves = [];
+    const pos = clonePosition(position);
+    const targetMoves = Math.floor(Math.random() * 73);
+    while (moves.length < targetMoves) {
+        const groups = enumerateGroups(pos);
+        if (groups.length === 0) {
+            break;
+        }
+        const group = groups[Math.floor(Math.random() * groups.length)];
+        moves.push([...group.cells[Math.floor(Math.random() * group.cells.length)]]);
+        removeGroup(pos, group.cells);
+    }
+
+    const times = [];
+    if (moves.length > 0 && Math.random() > 0.1) {
+        times.push(0);
+        for (let i = 1; i < moves.length; i++) {
+            const r = Math.random();
+            const delta = r < 0.02 ? 0 : r < 0.04 ? Math.floor(Math.random() * 2 ** 31) : Math.floor(20 + 5000 * Math.random());
+            times.push(times[i - 1] + delta);
+        }
+    }
+
+    return { position, moves, times };
+}
 
 export function createTests() {
     let testIndex = 0;
@@ -40,6 +71,91 @@ export function createTests() {
 
     const tests = [
         {
+            name: "v4 game serialization",
+            count: 2000,
+            groupSize: 20,
+            prologText: "2,000 v4 game round-trip checks running...\n",
+            epilogText: "Test finished OK.\n",
+            blocking: true,
+            exec() {
+                const { position, moves, times } = randomRecordedGame();
+
+                const serialized = Serializer.serializeGame(4, position, moves, times);
+                const d = Serializer.deserializeGame("?" + serialized);
+
+                let ok = JSON.stringify(d.p) === JSON.stringify(position) && d.m.length === moves.length;
+
+                // decoded moves must replay to the same board states as the originals
+                const pos1 = clonePosition(position);
+                const pos2 = clonePosition(position);
+                for (let i = 0; ok && i < moves.length; i++) {
+                    const g1 = extractGroup(pos1, moves[i]);
+                    const g2 = extractGroup(pos2, d.m[i]);
+                    ok = g1.length >= 2 && g1.length === g2.length;
+                    removeGroup(pos1, g1);
+                    removeGroup(pos2, g2);
+                    ok = ok && JSON.stringify(pos1) === JSON.stringify(pos2);
+                }
+
+                if (ok && times.length > 0) {
+                    // total time exact, times monotone, every move time within the
+                    // quantization bound of the recorded one
+                    ok = d.t.length === times.length && d.t[d.t.length - 1] === times[times.length - 1];
+                    for (let i = 1; ok && i < times.length; i++) {
+                        const err = times[i] - d.t[i];
+                        ok = d.t[i] >= d.t[i - 1] &&
+                            (i === times.length - 1 || (err >= 0 && err <= Math.max(1, (times[i] - d.t[i - 1]) / 69 + 1)));
+                    }
+                } else if (ok) {
+                    ok = d.t.length === 0;
+                }
+
+                // decoded game must re-serialize to the identical string
+                ok = ok && Serializer.serializeGame(4, d.p, d.m, d.t) === serialized;
+
+                if (!ok) {
+                    logFailure("Test failed: v4 game round-trip", [
+                        ["position", position],
+                        ["moves", moves],
+                        ["times", times],
+                        ["serialized", serialized],
+                        ["deserialized", d],
+                    ]);
+                    return false;
+                }
+                return true;
+            },
+        }, {
+            name: "Legacy link compatibility",
+            count: 1,
+            groupSize: 1,
+            prologText: "v2/v3 legacy link decoding checks running...\n",
+            epilogText: "Test finished OK.\n",
+            blocking: true,
+            exec() {
+                // 2021-deployed v3 dialect (base-71 moves/times)
+                const wild = "?v=3&p=feNbne25-HeiPenCCk7MmBeesRyyeIDFCgdc1h_I4VbXl2CzWihjyOmI" +
+                    "&m=403tUpC1-(C9xC54lxWSe,909pFO4.*pUIfl+OqOR+Ym" +
+                    "&t=3_6,1ro*69rk4AA.6(nvuVCjNZuQMe_4!rYPFj5i1n8";
+                const wildGame = new Game(wild);
+
+                // v2 link
+                const v2 = "?v=2&p=cTwQyHpc746X!j0)+)lJ6SA2viItJh!I4p+OvWdyciYJh_S*x(oEF_dfy+pUi" +
+                    "&m=303FyOWwb!Ynvljq.u-(h,b179aWJaRW37KFhOq-5p83&t=47S,1H2yNsy+4xZmu*-YqD2oOdVdgAtA-V7S.ZUB$wIb";
+                const v2Game = new Game(v2);
+
+                if (wildGame.getMoves().length !== 49 || wildGame.getTimes()[48] !== 19673 ||
+                    v2Game.getMoves().length !== 45 || v2Game.getTimes().length !== 45) {
+                    logFailure("Test failed: legacy link decoding", [
+                        ["v3 moves", wildGame.getMoves().length],
+                        ["v3 total", wildGame.getTimes()[48]],
+                        ["v2 moves", v2Game.getMoves().length],
+                    ]);
+                    return false;
+                }
+                return true;
+            },
+        }, {
             name: "Game serialization",
             count: DEFAULT_COUNT,
             groupSize: DEFAULT_GROUP_SIZE,

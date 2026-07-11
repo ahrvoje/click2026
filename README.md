@@ -24,18 +24,25 @@ then open http://localhost:8000/.
 Game links
 ----------
 
-A finished game (position, moves and timings) serializes into a shareable URL — use the link button to export and the import button to load one. All three historical formats are still readable:
+A finished game (position, moves and timings) serializes into a shareable URL — use the link button to export and the import button to load one. All historical formats are still readable:
 
 * **v1** — plain decimal `?position=...&moves=...&times=...` (2014)
 * **v2** — base-71 packed, Huffman-coded deltas, lossy log-scale times (2015)
-* **v3** — like v2, packed with a URL-safe base-64 alphabet (2021, current)
+* **v3** — like v2, packed with a URL-safe base-64 alphabet (2021; both deployed dialects decode)
+* **v4** — single `?v=4&g=...` param: one rANS entropy-coded stream — moves stored as
+  the rank of the clicked group among the legal groups sorted by distance from the
+  previous click (the decoder replays the game to rebuild them), timings log-quantized
+  with error diffusion (2026, current)
 
-New links are always written as v3. Old Click2014 links keep working.
+New links are always written as v4: ~12% shorter than v3, per-move times ~4× more precise,
+the **total game time is exact to the millisecond**, decoded games re-serialize to the
+byte-identical link, and the entropy-coder end state doubles as an integrity check.
+Old Click2014 links keep working.
 
 Examples & self tests
 ---------------------
 
-Tick the discrete `examples & tests` checkbox in the bottom-left corner of the status bar to reveal the panel with three replayable example games and *Run tests...*, which runs 30,000+ serialization round-trip checks in a dialog.
+Tick the discrete `examples & tests` checkbox in the bottom-left corner of the status bar to reveal the panel with three replayable example games and *Run tests...*, which runs 32,000+ serialization round-trip checks in a dialog, including 2,000 full v4 game round-trips and legacy v2/v3 link decoding.
 
 License
 -------

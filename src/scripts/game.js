@@ -11,11 +11,7 @@
  */
 
 import { Serializer } from "./serial.js";
-
-const SIZE = 12;
-const COLORS = 5;
-
-const clonePosition = (position) => position.map((column) => [...column]);
+import { SIZE, COLORS, clonePosition, extractGroup, removeGroup } from "./board.js";
 
 export class Game {
     static Status = Object.freeze({ Initial: 0, Ready: 1, Play: 2, Over: 3, AutoPlay: 4 });
@@ -66,79 +62,6 @@ export class Game {
         this.#currentPosition = [];
         this.#currentMove = 0;
         return result;
-    }
-
-    // flood fill of the same-colored group containing the given field
-    #extractGroup([x, y]) {
-        const refColor = this.#currentPosition[x]?.[y];
-
-        if (refColor === undefined || refColor === 0) {
-            return [];
-        }
-
-        const visited = new Set([x * SIZE + y]);
-        const group = [];
-        const stack = [[x, y]];
-
-        while (stack.length > 0) {
-            const [i, j] = stack.pop();
-            group.push([i, j]);
-
-            for (const [ni, nj] of [[i - 1, j], [i + 1, j], [i, j - 1], [i, j + 1]]) {
-                if (ni >= 0 && ni < SIZE && nj >= 0 && nj < SIZE &&
-                    this.#currentPosition[ni][nj] === refColor && !visited.has(ni * SIZE + nj)) {
-                    visited.add(ni * SIZE + nj);
-                    stack.push([ni, nj]);
-                }
-            }
-        }
-
-        return group;
-    }
-
-    #collapseDown() {
-        for (let i = 0; i < SIZE; i++) {
-            let row = 0;
-            for (let j = 0; j < SIZE; j++) {
-                const fieldState = this.#currentPosition[i][j];
-                this.#currentPosition[i][j] = 0;
-
-                if (fieldState > 0 && fieldState <= COLORS) {
-                    this.#currentPosition[i][row++] = fieldState;
-                }
-            }
-        }
-    }
-
-    #collapseLeft() {
-        // scan all columns except the last
-        for (let i = 0; i < SIZE - 1; i++) {
-            if (this.#currentPosition[i][0] !== 0) {
-                continue;
-            }
-
-            // find first non-empty column to the right
-            let col = i + 1;
-            while (col < SIZE && this.#currentPosition[col][0] === 0) {
-                col++;
-            }
-
-            // no non-empty column left — the rest of the board is empty
-            if (col === SIZE) {
-                break;
-            }
-
-            // move it into the empty column
-            for (let j = 0; j < SIZE; j++) {
-                const fieldState = this.#currentPosition[col][j];
-                if (fieldState === 0) {
-                    break;
-                }
-
-                this.#currentPosition[i][j] = fieldState;
-                this.#currentPosition[col][j] = 0;
-            }
-        }
     }
 
     #isOver() {
@@ -198,7 +121,7 @@ export class Game {
 
     getNextMoveGroup() {
         if (this.#currentMove < this.#moves.length) {
-            return this.#extractGroup(this.#moves[this.#currentMove]);
+            return extractGroup(this.#currentPosition, this.#moves[this.#currentMove]);
         }
 
         return [];
@@ -244,22 +167,18 @@ export class Game {
     }
 
     getString() {
-        return Serializer.serializeGame(3, this.#startPosition, this.#moves, this.#times);
+        return Serializer.serializeGame(4, this.#startPosition, this.#moves, this.#times);
     }
 
     playMove(field) {
-        const group = this.#extractGroup(field);
+        const group = extractGroup(this.#currentPosition, field);
 
         // only groups of two or more fields can be clicked away
         if (group.length < 2) {
             return false;
         }
 
-        for (const [x, y] of group) {
-            this.#currentPosition[x][y] = COLORS + 1;
-        }
-        this.#collapseDown();
-        this.#collapseLeft();
+        removeGroup(this.#currentPosition, group);
         this.#currentMove++;
 
         if (this.#status === Game.Status.Play) {
