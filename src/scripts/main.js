@@ -26,6 +26,7 @@ el("forwardButton").addEventListener("click", Click.rewindForward);
 el("importButton").addEventListener("click", () => Click.importGame(window.prompt("Paste game link below")));
 el("linkButton").addEventListener("click", Click.promptGameLink);
 el("replayButton").addEventListener("click", Click.replayStartPosition);
+el("engineButton").addEventListener("click", Click.toggleEngine);
 
 for (const exampleIndex of [0, 1, 2]) {
     el(`example${exampleIndex}`).addEventListener("click", () => {

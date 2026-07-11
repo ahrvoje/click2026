@@ -10,6 +10,7 @@
  */
 
 import { Game } from "./game.js";
+import { EngineUI } from "./engine-ui.js";
 
 const examples = [
     "?position=544341454153245551352111315534254113553554342242333515335513533415541542111541422113121311534345113215252332331311244443442542241513343551454125&moves=65,54,21,43,31,42,30,29,17,15,13,13,37,24,25,24,14,13,14,26,26,38,38,54,66,78,89,88,88,77,87,87,73,84,60,37,36,12,1,0,12&times=533,929,374,344,492,642,406,218,320,236,178,414,344,266,344,352,484,586,188,264,258,430,1242,336,679,611,217,455,358,321,171,524,273,235,905,180,406,414,156,320",
@@ -118,6 +119,34 @@ function drawAllFields() {
     if (game.getStatus() === Status.Over || game.getStatus() === Status.AutoPlay) {
         highlightGroup(game.getNextMoveGroup());
     }
+
+    EngineUI.drawOverlays(ctx);
+}
+
+// the position currently shown on the board as engine bytes (column-major,
+// index = column * 12 + row), or null when nothing analyzable is shown
+function shownBoardBytes() {
+    const { Status } = Game;
+
+    let position = null;
+    if (game.getStatus() === Status.Ready) {
+        position = game.getStartPosition();
+    } else if ([Status.Play, Status.Over, Status.AutoPlay].includes(game.getStatus())) {
+        position = game.getCurrentPosition();
+    }
+
+    if (position?.[0] === undefined) {
+        return null;
+    }
+
+    const bytes = new Uint8Array(144);
+    for (let i = 0; i < 12; i++) {
+        for (let j = 0; j < 12; j++) {
+            bytes[i * 12 + j] = position[i][j];
+        }
+    }
+
+    return bytes;
 }
 
 //
@@ -170,6 +199,7 @@ function prepareInterface() {
     el("moveValue").textContent = `0 / ${game.getMoves().length}`;
     el("autoPauseButton").hidden = true;
     el("autoPlayButton").hidden = false;
+    EngineUI.onPositionChanged();
 }
 
 function gameFromString(gameString) {
@@ -192,6 +222,7 @@ function processClick(event) {
         drawAllFields();
         updateScore();
         updateMove();
+        EngineUI.onPositionChanged();
     }
 
     if (game.getStatus() === Game.Status.Over) {
@@ -211,6 +242,7 @@ function processMouseWheel(delta) {
 
     game.rewindToMove(game.getCurrentMove() + (delta < 0 ? 1 : -1));
     refreshInterface();
+    EngineUI.onPositionChanged();
 }
 
 function autoPlayMove() {
@@ -222,6 +254,7 @@ function autoPlayMove() {
         drawAllFields();
         updateMove();
         updateScore();
+        EngineUI.onPositionChanged();
     }
 
     if (game.getCurrentMove() === game.getMoves().length) {
@@ -244,6 +277,7 @@ export function onCanvasClick(event) {
         updateTimerInterval = setInterval(updateTimer, TIMER_INTERVAL_MS);
         updateScore();
         updateMove(); // starting manual play resets the recording, so refresh the counter
+        EngineUI.onPositionChanged();
 
         firstClick = true;
     }
@@ -321,6 +355,7 @@ export function rewindBackward() {
     game.rewindToMove(0);
     stopAutoPlay();
     refreshInterface();
+    EngineUI.onPositionChanged();
 }
 
 export function rewindForward() {
@@ -331,6 +366,7 @@ export function rewindForward() {
     game.rewindToMove(game.getMoves().length);
     stopAutoPlay();
     refreshInterface();
+    EngineUI.onPositionChanged();
 }
 
 export function importGame(importedString) {
@@ -350,9 +386,19 @@ export function loadExample(exampleIndex) {
     }
 }
 
+export function toggleEngine() {
+    EngineUI.toggle();
+}
+
 export function init() {
     canvas = el("gameCanvas");
     ctx = canvas.getContext("2d");
+
+    EngineUI.init({
+        getBoardBytes: shownBoardBytes,
+        redraw: drawAllFields,
+        playColors: colors.playColors,
+    });
 
     canvas.addEventListener("mousedown", onCanvasClick);
 

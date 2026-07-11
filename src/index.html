@@ -102,7 +102,34 @@
                         <img class="icon on" src="images/icon_replay_on.png" alt="">
                         <img class="icon off" src="images/icon_replay_off.png" alt="">
                     </button>
+                    <div class="buttonFillerIn"></div>
+                    <div class="buttonSeparator"></div>
+                    <div class="buttonFillerIn"></div>
+                    <button id="engineButton" class="smallButton" type="button" title="Engine analysis">
+                        <svg class="icon engineIcon" viewBox="0 0 26 26" width="26" height="26" aria-hidden="true">
+                            <circle class="engineDisc" cx="13" cy="13" r="13"/>
+                            <g class="engineGlyph">
+                                <path fill-rule="evenodd" d="M8.6 8.6h8.8v8.8H8.6Z M11.2 11.2h3.6v3.6h-3.6Z"/>
+                                <rect x="9.05" y="5.7" width="1.7" height="2.4"/>
+                                <rect x="12.15" y="5.7" width="1.7" height="2.4"/>
+                                <rect x="15.25" y="5.7" width="1.7" height="2.4"/>
+                                <rect x="9.05" y="17.9" width="1.7" height="2.4"/>
+                                <rect x="12.15" y="17.9" width="1.7" height="2.4"/>
+                                <rect x="15.25" y="17.9" width="1.7" height="2.4"/>
+                                <rect x="5.7" y="9.05" width="2.4" height="1.7"/>
+                                <rect x="5.7" y="12.15" width="2.4" height="1.7"/>
+                                <rect x="5.7" y="15.25" width="2.4" height="1.7"/>
+                                <rect x="17.9" y="9.05" width="2.4" height="1.7"/>
+                                <rect x="17.9" y="12.15" width="2.4" height="1.7"/>
+                                <rect x="17.9" y="15.25" width="2.4" height="1.7"/>
+                            </g>
+                        </svg>
+                    </button>
                     <div class="buttonFillerOut"></div>
+                </div>
+                <div id="engineSection" hidden>
+                    <ol id="engineList"></ol>
+                    <div id="engineStatus"></div>
                 </div>
             </div>
         </div>

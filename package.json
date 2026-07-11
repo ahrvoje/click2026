@@ -1,0 +1,19 @@
+{
+    "name": "click2026",
+    "version": "1.0.0",
+    "description": "Click2026 — color clicking puzzle with a WebAssembly analysis engine",
+    "author": "Hrvoje Abraham <ahrvoje@gmail.com>",
+    "license": "MIT",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "build:engine": "asc asm/engine.ts --outFile src/scripts/engine/engine.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert",
+        "test:engine": "npm run build:engine && node tools/engine.test.mjs",
+        "tune:engine": "node tools/engine.tune.mjs",
+        "serve": "py -m http.server 8123 -d src"
+    },
+    "devDependencies": {
+        "assemblyscript": "^0.28.9",
+        "puppeteer-core": "^25.3.0"
+    }
+}
