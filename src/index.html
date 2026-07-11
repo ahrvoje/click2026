@@ -1,137 +1,123 @@
 <!DOCTYPE html>
 
 <!--
- * Click2014
+ * Click2026
  *
- * Copyright 2014, Hrvoje Abraham ahrvoje@gmail.com
+ * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
- * http://www.opensource.org/licenses/mit-license.php
+ * https://opensource.org/licenses/MIT
  *
- * Date: Thu Aug 07, 2014 - initial
+ * Date: Thu Aug 07, 2014 - initial (Click2014)
  * Date: Thu Feb 04, 2020 - jquery update v2.1.1 to v3.4.1
+ * Date: Sat Jul 11, 2026 - modernized to Click2026, zero dependencies
  *
 -->
 
-<html>
-<head lang="en">
-    <title>Click2014</title>
+<html lang="en">
+<head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Click2026</title>
     <meta name="author" content="Hrvoje Abraham">
-    <meta name="date" content="2014-08-07">
+    <meta name="description" content="Color clicking puzzle.">
 
-    <!-- facebook OpenGraph data -->
-    <meta property="og:title" content="Click2014">
+    <!-- OpenGraph data -->
+    <meta property="og:title" content="Click2026">
     <meta property="og:description" content="Color clicking puzzle.">
-    <meta property="og:url" content="https://dl.dropboxusercontent.com/u/22729464/Click2014/index.html">
-    <meta property="og:image" content="https://dl.dropboxusercontent.com/u/22729464/Click2014/images/click2014_fbShare.png">
 
-    <link rel="stylesheet" type="text/css" href="css/reset.css">
-    <link rel="stylesheet" type="text/css" href="css/click2014.css">
-    <script src="scripts/jquery-3.4.1.min.js"></script>
-    <script src="scripts/misc.js"></script>
-    <script src="scripts/serial.js"></script>
-    <script src="scripts/objectGame.js"></script>
-    <script src="scripts/objectClick.js"></script>
-    <script src="scripts/tests.js"></script>
-    <script src="scripts/click2014.js"></script>
     <link rel="icon" type="image/png" href="images/click2014_favicon.png">
+    <link rel="stylesheet" href="css/click2026.css">
+    <script type="module" src="scripts/main.js"></script>
 </head>
 <body>
 <div id="mainDiv">
-    <div id="modalOverlay"></div>
-    <div id="testsDialog">
+    <dialog id="testsDialog">
         <div class="dialogTitle">Tests</div>
-        <div class="progressBar" id="pb1">
-            <div class="progressCount" id="pc1">0%</div>
-            <div class="progressShow" id="ps1"></div>
+        <div class="progressBar">
+            <div class="progressShow" id="progressShow"></div>
+            <div class="progressCount" id="progressCount">0%</div>
         </div>
-        <textarea cols="63" rows="18" id="progressReport"></textarea>
-        <div class="dialogStop" id="testsStop1"></div>
-    </div>
-    <div id="mainTop">
+        <textarea id="progressReport" readonly></textarea>
+        <button class="dialogStop" id="testsStop" type="button">Stop</button>
+    </dialog>
+    <main id="mainTop">
         <div id="mainLeft">
-            <div id="logo"><img id="logoImage" src="images/click2014_favicon.png">Click2014</div>
-            <div id="gameExamples">
-                <div><div id="example0" class="example">Example 1</div><div></div></div>
-                <div><div id="example1" class="example">Example 2</div><div></div></div>
-                <div><div id="example2" class="example">Example 3</div><div></div></div>
-                <div><div id="runTests" class="example">Run tests...</div><div></div></div>
-            </div>
+            <div id="logo"><img id="logoImage" src="images/click2014_favicon.png" alt="">Click2026</div>
+            <nav id="gameExamples">
+                <button id="example0" class="example" type="button">Example 1</button>
+                <button id="example1" class="example" type="button">Example 2</button>
+                <button id="example2" class="example" type="button">Example 3</button>
+                <button id="runTests" class="example" type="button">Run tests...</button>
+            </nav>
         </div>
         <div id="game">
-            <canvas id="gameCanvas" width="310px" height="310px"></canvas>
+            <canvas id="gameCanvas" width="310" height="310" aria-label="Game board"></canvas>
             <div id="control">
-                <div id="control-overlay"></div>
-                <div id="startButtonDiv"><div id="startButton" class="button">NEW GAME</div></div>
+                <div id="startButtonDiv"><button id="startButton" type="button">NEW GAME</button></div>
 
-                <div class="rowDiv"> <div id="rowInnerDiv" class="rowInnerDiv">
-                    <div class="leftDiv" id="timeText">Time:</div><div id="timeValue" class="rightDiv timeValue"></div>
-                    <div class="leftDiv" id="scoreText">Score:</div><div id="scoreValue" class="rightDiv scoreValue"></div>
+                <div class="rowDiv"><div id="rowInnerDiv" class="rowInnerDiv">
+                    <div class="leftDiv">Time:</div><div id="timeValue" class="rightDiv timeValue"></div>
+                    <div class="leftDiv">Score:</div><div id="scoreValue" class="rightDiv scoreValue"></div>
                     <div class="filler"></div>
-                    <div class="leftDiv" id="moveText">Move:</div><div id="moveValue" class="rightDiv moveValue"></div>
+                    <div class="leftDiv">Move:</div><div id="moveValue" class="rightDiv moveValue"></div>
                 </div></div>
                 <div id="buttonsContainer">
                     <div class="buttonFillerOut"></div>
-                    <div id="backward" class="smallButtonDiv">
-                        <div id="backwardButton" class="smallButton">
-                            <img class="icon on backward" src="images/icon_backward_on.png">
-                            <img class="icon off backward" src="images/icon_backward_off.png">
-                        </div>
+                    <button id="backwardButton" class="smallButton" type="button" title="Rewind to start">
+                        <img class="icon on" src="images/icon_backward_on.png" alt="">
+                        <img class="icon off" src="images/icon_backward_off.png" alt="">
+                    </button>
+                    <div class="buttonFillerIn"></div>
+                    <div class="smallButtonDiv">
+                        <button id="autoPlayButton" class="smallButton" type="button" title="Autoplay">
+                            <img class="icon on" src="images/icon_play_on.png" alt="">
+                            <img class="icon off" src="images/icon_play_off.png" alt="">
+                        </button>
+                        <button id="autoPauseButton" class="smallButton" type="button" title="Pause" hidden>
+                            <img class="icon on" src="images/icon_pause_on.png" alt="">
+                            <img class="icon off" src="images/icon_pause_off.png" alt="">
+                        </button>
                     </div>
                     <div class="buttonFillerIn"></div>
-                    <div id="autoPlay" class="smallButtonDiv">
-                        <div id="autoPlayButton" class="smallButton">
-                            <img class="icon on autoPlay" src="images/icon_play_on.png">
-                            <img class="icon off autoPlay" src="images/icon_play_off.png">
-                        </div>
-                        <div id="autoPauseButton" class="smallButton">
-                            <img class="icon on autoPlay" src="images/icon_pause_on.png">
-                            <img class="icon off autoPlay" src="images/icon_pause_off.png">
-                        </div>
-                    </div>
-                    <div class="buttonFillerIn"></div>
-                    <div id="forward" class="smallButtonDiv">
-                        <div id="forwardButton" class="smallButton">
-                            <img class="icon on forward" src="images/icon_forward_on.png">
-                            <img class="icon off forward" src="images/icon_forward_off.png">
-                        </div>
-                    </div>
+                    <button id="forwardButton" class="smallButton" type="button" title="Rewind to end">
+                        <img class="icon on" src="images/icon_forward_on.png" alt="">
+                        <img class="icon off" src="images/icon_forward_off.png" alt="">
+                    </button>
                     <div class="buttonFillerIn"></div>
                     <div class="buttonSeparator"></div>
                     <div class="buttonFillerIn"></div>
-                    <div id="import" class="smallButtonDiv">
-                        <div id="importButton" class="smallButton">
-                            <img class="icon on import" src="images/icon_import_on.png">
-                            <img class="icon off import" src="images/icon_import_off.png">
-                        </div>
-                    </div>
+                    <button id="importButton" class="smallButton" type="button" title="Import game link">
+                        <img class="icon on" src="images/icon_import_on.png" alt="">
+                        <img class="icon off" src="images/icon_import_off.png" alt="">
+                    </button>
                     <div class="buttonFillerIn"></div>
-                    <div id="link" class="smallButtonDiv">
-                        <div id="linkButton" class="smallButton">
-                            <img class="icon on link" src="images/icon_link_on.png">
-                            <img class="icon off link" src="images/icon_link_off.png">
-                        </div>
-                    </div>
+                    <button id="linkButton" class="smallButton" type="button" title="Get game link">
+                        <img class="icon on" src="images/icon_link_on.png" alt="">
+                        <img class="icon off" src="images/icon_link_off.png" alt="">
+                    </button>
                     <div class="buttonFillerIn"></div>
                     <div class="buttonSeparator"></div>
                     <div class="buttonFillerIn"></div>
-                    <div id="replay" class="smallButtonDiv">
-                        <div id="replayButton" class="smallButton">
-                            <img class="icon on replay" src="images/icon_replay_on.png">
-                            <img class="icon off replay" src="images/icon_replay_off.png">
-                        </div>
-                    </div>
+                    <button id="replayButton" class="smallButton" type="button" title="Replay start position">
+                        <img class="icon on" src="images/icon_replay_on.png" alt="">
+                        <img class="icon off" src="images/icon_replay_off.png" alt="">
+                    </button>
                     <div class="buttonFillerOut"></div>
                 </div>
             </div>
         </div>
         <div id="mainRight"></div>
-    </div>
+    </main>
     <div id="mainFiller"></div>
-    <div id="footer">
-        <div id="leftFooter"></div>
-        <div id="rightFooter"><div id="copy">Copyright 2014 &copy Hrvoje Abraham</div> &nbsp &nbsp <div id="mail">ahrvoje@gmail.com</div></div>
-    </div>
+    <footer id="footer">
+        <div id="leftFooter">
+            <label id="testsToggle"><input type="checkbox" id="testsCheckbox"> examples &amp; tests</label>
+        </div>
+        <div id="rightFooter">
+            <div id="copy">Copyright 2014&ndash;2026 &copy; Hrvoje Abraham</div>
+            <div id="mail">ahrvoje@gmail.com</div>
+        </div>
+    </footer>
 </div>
 </body>
 </html>

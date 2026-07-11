@@ -1,120 +1,95 @@
 /**
- * Click2014
+ * Click2026 — misc helpers: string padding, base conversions, Huffman coding, query parsing.
  *
- * Copyright 2014, Hrvoje Abraham ahrvoje@gmail.com
+ * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
- * http://www.opensource.org/licenses/mit-license.php
+ * https://opensource.org/licenses/MIT
  *
  * Date: Mon Sep 08, 2014
  *       Sat Oct 02, 2021
+ *       Sat Jul 11, 2026 - modernized to ES module, zero dependencies
  */
-/* jshint strict:false */
 
-isString = function (s) {return typeof s == 'string' || s instanceof String};
-padZeros = function (s, m) {while(m-- > 0){s = "0" + s} return s};
-padZerosMod = function (s, m) {while(s.length % m > 0){s = "0" + s} return s};
-appendZeros = function (s, m) {while(m-- > 0){s += "0"} return s};
-appendZerosMod = function (s, m) {while(s.length % m > 0){s += "0"} return s};
-topZeros = function (s) {var c=0; while(c < s.length && s[c++] === "0"){} return s.substring(c-1)};
-tailZeros = function (s) {var c=s.length; while(--c >= 0 && s[c] === "0"){} return s.slice(0, c+1)};
-swap_key_value = function (d) {var t={}; for(var key in d){t[d[key]]=key} return t};
-sign = function (x) {return typeof x === 'number' ? x ? x < 0 ? -1 : 1 : x === x ? 0 : NaN : NaN;};
-sqr = function (x) {return x * x};
-sum = function (l) {var s=0; for(var i=0; i<l.length; i++){s+=l[i]} return s};
-fmap = function (l, f) {var t=[]; for(var i=0; i<l.length; i++){t.push(f(l[i]))} return t};
+export const padZeros = (s, count) => "0".repeat(Math.max(0, count)) + s;
 
-getQueryParams = function (qs) {
-    var result = {};
-    var params = (qs.split('?')[1] || '').split('&');
-    var param, paramParts;
+export const padZerosMod = (s, mod) => s.padStart(s.length + (mod - (s.length % mod)) % mod, "0");
 
-    for(param in params) {
-        if (params.hasOwnProperty(param)) {
-            paramParts = params[param].split('=');
-            result[paramParts[0]] = decodeURIComponent(paramParts[1] || "")
-        }
-    }
+// strip leading zeros, but keep a single "0" if the string is all zeros
+export const topZeros = (s) => s.replace(/^0+(?=.)/, "");
 
-    return result
-};
+export const tailZeros = (s) => s.replace(/0+$/, "");
 
-extractWheelDelta = function (e) {
-    if (e.wheelDelta) {
-        return e.wheelDelta
-    }
+export const swapKeyValue = (d) => Object.fromEntries(Object.entries(d).map(([k, v]) => [v, k]));
 
-    if (e.originalEvent.detail) {
-        return e.originalEvent.detail * -40
-    }
+// digit alphabet shared by all base conversions, index = digit value (base up to 71)
+// all characters are URL-query safe, so serialized games survive inside a link
+const CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ$-_.+!*()";
 
-    if (e.originalEvent && e.originalEvent.wheelDelta) {
-        return e.originalEvent.wheelDelta
-    }
-};
-
-chars_encode = {  "0":"0",  "1":"1",  "2":"2",  "3":"3",  "4":"4",  "5":"5",  "6":"6",  "7":"7",  "8":"8",  "9":"9",
-                 "10":"a", "11":"b", "12":"c", "13":"d", "14":"e", "15":"f", "16":"g", "17":"h", "18":"i", "19":"j",
-                 "20":"k", "21":"l", "22":"m", "23":"n", "24":"o", "25":"p", "26":"q", "27":"r", "28":"s", "29":"t",
-                 "30":"u", "31":"v", "32":"w", "33":"x", "34":"y", "35":"z", "36":"A", "37":"B", "38":"C", "39":"D",
-                 "40":"E", "41":"F", "42":"G", "43":"H", "44":"I", "45":"J", "46":"K", "47":"L", "48":"M", "49":"N",
-                 "50":"O", "51":"P", "52":"Q", "53":"R", "54":"S", "55":"T", "56":"U", "57":"V", "58":"W", "59":"X",
-                 "60":"Y", "61":"Z", "62":"$", "63":"-", "64":"_", "65":".", "66":"+", "67":"!", "68":"*", "69":"(",
-                 "70":")"};
-chars_decode = swap_key_value(chars_encode);
-
-baseX_to_baseY = function (numberX, baseX, baseY) {
-    var i, number10 = 0, numberY = "", mod;
-
-    for (i=0; i<numberX.length; i++) {
-        number10 = baseX * number10 + Number(chars_decode[numberX[i]]);
+export function baseXtoBaseY(numberX, baseX, baseY) {
+    let number10 = 0;
+    for (const ch of numberX) {
+        number10 = baseX * number10 + CHARS.indexOf(ch);
     }
 
     if (number10 === 0) {
-        return "0"
+        return "0";
     }
 
+    let numberY = "";
     while (number10 > 0) {
-        mod = number10 % baseY;
-        numberY = chars_encode[String(mod)] + numberY;
-        number10 = (number10 - mod) / baseY
+        const mod = number10 % baseY;
+        numberY = CHARS[mod] + numberY;
+        number10 = (number10 - mod) / baseY;
     }
 
-    return numberY
-};
+    return numberY;
+}
 
-longX_to_longY = function (numberX, baseX, sizeX, baseY, sizeY) {
-    var i, numberY = "";
-
+// converts a long digit string between bases chunk by chunk,
+// sizeX source digits map to sizeY target digits, so precision never
+// exceeds Number.MAX_SAFE_INTEGER no matter how long the string is
+export function longXtoLongY(numberX, baseX, sizeX, baseY, sizeY) {
     numberX = padZerosMod(numberX, sizeX);
-    for (i = 0; i < numberX.length / sizeX; i++) {
-        numberY += padZerosMod(baseX_to_baseY(numberX.substring(sizeX*i, sizeX*i + sizeX), baseX, baseY), sizeY)
+
+    let numberY = "";
+    for (let i = 0; i < numberX.length / sizeX; i++) {
+        numberY += padZerosMod(baseXtoBaseY(numberX.substring(sizeX * i, sizeX * (i + 1)), baseX, baseY), sizeY);
     }
 
-    return numberY
-};
+    return numberY;
+}
 
-huffman_encode = function (array, encode_table) {
-    var i, t="";
+export function huffmanEncode(array, encodeTable) {
+    return array.map((x) => encodeTable[x]).join("");
+}
 
-    for (i = 0; i < array.length; i++) {
-        t += encode_table[array[i]]
-    }
+export function huffmanDecode(huffmanString, decodeTable) {
+    const array = [];
+    let code = "";
 
-    return t
-};
+    for (const bit of huffmanString) {
+        code += bit;
 
-huffman_decode = function (huffmanString, decode_table) {
-    var i, code="", x, array=[];
-
-    for (i = 0; i < huffmanString.length; i++) {
-        code += huffmanString[i];
-
-        x = decode_table[code];
+        const x = decodeTable[code];
         if (x !== undefined) {
             array.push(Number(x));
-            code = ""
+            code = "";
         }
     }
 
-    return array
-};
+    return array;
+}
+
+// NOTE: deliberately NOT URLSearchParams — it decodes "+" as a space, which would
+// corrupt legacy v2 game links whose base-71 alphabet contains "+", "!", "*", "(", ")"
+export function getQueryParams(qs) {
+    const result = {};
+    const query = qs.split("?")[1] ?? "";
+
+    for (const param of query.split("&")) {
+        const [key, value] = param.split("=");
+        result[key] = decodeURIComponent(value ?? "");
+    }
+
+    return result;
+}

@@ -1,0 +1,386 @@
+/*
+ * Click2026
+ *
+ * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
+ * Released under the MIT license.
+ * https://opensource.org/licenses/MIT
+ *
+ * Date: Fri Aug 08, 2014
+ *       Sat Jul 11, 2026 - modernized, reset merged in, prefixes dropped
+ */
+
+/* minimal modern reset */
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+:root {
+    --accent: rgb(19 121 202);
+    --accent-hover: rgb(236 134 53);
+    --board-size: 310px;
+}
+
+@font-face {
+    font-family: Gotham;
+    src: url("../fonts/Gotham-Book.otf");
+    font-display: swap;
+}
+
+html {
+    height: 100%;
+}
+
+body {
+    height: 100%;
+    margin: 0;
+
+    background: url("../images/background.jpg") rgb(19 121 202 / 0.1);
+    background-size: 100%;
+
+    font-family: Gotham, sans-serif;
+    line-height: 1;
+
+    cursor: default;
+    user-select: none;
+    -webkit-touch-callout: none;
+}
+
+#mainDiv {
+    width: 100%;
+    min-height: 100%;
+    font-size: 15px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+}
+
+#mainTop {
+    display: flex;
+}
+
+#logo {
+    padding: 10px 0 0 60px;
+
+    #logoImage {
+        padding-right: 10px;
+        vertical-align: baseline;
+    }
+}
+
+#mainFiller {
+    flex: 1;
+}
+
+/* footer / status bar */
+#footer {
+    min-width: 100%;
+    display: flex;
+    align-items: flex-end;
+    padding-bottom: 5px;
+}
+
+#leftFooter {
+    flex: 1;
+    text-align: left;
+    padding-left: 10px;
+}
+
+#testsToggle {
+    font-size: 12px;
+    opacity: 0.2;
+    transition: opacity 0.15s;
+
+    &:hover {
+        opacity: 1;
+        cursor: pointer;
+    }
+}
+
+#rightFooter {
+    flex: 10;
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    text-align: right;
+    padding-right: 10px;
+}
+
+#copy {
+    flex: 8;
+    min-width: 280px;
+    text-align: right;
+    opacity: 0.2;
+}
+
+#mail {
+    flex: 1;
+    min-width: 150px;
+    user-select: text;
+    text-align: left;
+    text-decoration: underline;
+    opacity: 0.4;
+
+    &:hover {
+        cursor: pointer;
+        opacity: 1;
+    }
+}
+
+/* left panel */
+#mainLeft,
+#mainRight {
+    flex: 0.5;
+    font-size: 35px;
+}
+
+#mainLeft {
+    min-width: 300px;
+}
+
+#gameExamples {
+    width: 110px;
+    font-size: 18px;
+    margin-left: 180px;
+    margin-top: 100px;
+    border: 1px dotted red;
+    border-radius: 5px;
+}
+
+.example {
+    display: block;
+    margin-top: 5px;
+    margin-bottom: 5px;
+    width: 105px;
+
+    &:hover {
+        background-color: orange;
+    }
+}
+
+/* the whole Examples & Tests panel stays hidden until the discrete footer checkbox is ticked */
+#gameExamples {
+    display: none;
+}
+
+#mainDiv:has(#testsCheckbox:checked) #gameExamples {
+    display: block;
+}
+
+/* game area — sits above the vertical middle, with a comfortable margin below the top */
+#game {
+    margin-top: clamp(40px, 12vh, 130px);
+    min-width: var(--board-size);
+    display: none; /* shown by main.js once scripts are running */
+}
+
+#gameCanvas {
+    width: var(--board-size);
+    background-color: black;
+    touch-action: none;
+}
+
+#control.disabled {
+    filter: opacity(0.2);
+    pointer-events: none;
+}
+
+.rowDiv {
+    line-height: 35px;
+    vertical-align: middle;
+}
+
+.rowInnerDiv {
+    font-size: 14px;
+    font-weight: bold;
+    display: flex;
+}
+
+#rowInnerDiv {
+    border-bottom: 1px dotted;
+}
+
+.leftDiv {
+    padding-right: 5px;
+    text-align: right;
+}
+
+.rightDiv {
+    text-align: left;
+}
+
+.timeValue {
+    width: 70px;
+}
+
+.scoreValue {
+    width: 35px;
+}
+
+.moveValue {
+    width: 60px;
+    text-align: right;
+}
+
+.filler {
+    flex: 1;
+}
+
+/* buttons */
+#startButtonDiv {
+    height: 30px;
+    margin-top: 2px;
+}
+
+#startButton {
+    display: block;
+    width: 100%;
+    background-color: var(--accent);
+    color: white;
+    text-align: center;
+    line-height: 30px;
+    padding-top: 1px;
+    border-radius: 15px;
+
+    &:hover {
+        background-color: var(--accent-hover);
+        color: black;
+    }
+}
+
+#buttonsContainer {
+    line-height: 26px;
+    width: var(--board-size);
+    padding-top: 4px;
+    display: flex;
+}
+
+.buttonFillerIn {
+    flex: 1;
+}
+
+.buttonFillerOut {
+    flex: 3;
+}
+
+.buttonSeparator {
+    width: 0;
+    height: 26px;
+    border-left: 1px dotted;
+}
+
+.smallButtonDiv {
+    display: inline-block;
+}
+
+.smallButton {
+    display: inline-block;
+    line-height: 26px;
+    width: 26px;
+    text-align: center;
+
+    /* icon pairs swap on hover: "on" is the resting look, "off" the highlighted one */
+    .icon.off {
+        display: none;
+    }
+
+    &:hover .icon.on {
+        display: none;
+    }
+
+    &:hover .icon.off {
+        display: inline;
+    }
+}
+
+/* tests dialog — a flex column: title bar, progress, report, Stop pinned to the bottom */
+#testsDialog {
+    width: 505px;
+    height: 300px;
+    padding: 0;
+    border: none;
+    color: oldlace;
+    background-color: oldlace;
+    border-radius: 5px;
+    overflow: hidden; /* children respect the rounded corners */
+
+    &[open] {
+        display: flex;
+        flex-direction: column;
+    }
+
+    &::backdrop {
+        background-color: peru;
+        opacity: 0.9;
+    }
+}
+
+.dialogTitle {
+    height: 34px;
+    padding: 9px 0 5px 10px;
+    background-color: darkblue;
+    border-radius: 0 0 5px 5px;
+}
+
+/* fill and percentage label stack in the same grid cell, so the fill always
+   stays inside the border and stretches exactly to the bar's inner height */
+.progressBar {
+    display: grid;
+    width: 450px;
+    height: 35px;
+    margin: 20px auto 0;
+    border: 1px solid black;
+    color: black;
+
+    > * {
+        grid-area: 1 / 1;
+    }
+}
+
+.progressShow {
+    width: 0;
+    background-color: aqua;
+}
+
+.progressCount {
+    place-self: center;
+}
+
+#progressReport {
+    height: 120px;
+    margin: 20px 20px 0;
+    background-color: papayawhip;
+    color: black;
+    text-align: left;
+    resize: none;
+}
+
+.dialogStop {
+    align-self: center;
+    margin-block: auto; /* centers the button in the space left below the report */
+    width: 100px;
+    height: 34px;
+    display: grid;
+    place-items: center; /* centers the label in both axes, independent of font metrics */
+    background-color: darkred;
+    border-radius: 5px;
+
+    &:hover {
+        background-color: red;
+    }
+}
