@@ -16,6 +16,9 @@
 export const SIZE = 12;
 export const COLORS = 5;
 
+// A-L coordinate notation: columns left to right, rows bottom to top
+export const LETTERS = "ABCDEFGHIJKL";
+
 export const clonePosition = (position) => position.map((column) => [...column]);
 
 // flood fill of the same-colored group containing the given field
@@ -44,6 +47,20 @@ export function extractGroup(position, [x, y]) {
     }
 
     return group;
+}
+
+// the canonical block of a group: same-group clicks are the same move, represented
+// by the group's lowest block, leftmost on ties (bottom-to-top, left-to-right priority)
+export function canonicalBlock(group) {
+    let [bx, by] = group[0];
+
+    for (const [x, y] of group) {
+        if (y < by || (y === by && x < bx)) {
+            [bx, by] = [x, y];
+        }
+    }
+
+    return [bx, by];
 }
 
 export function collapseDown(position) {

@@ -16,7 +16,7 @@ import { createTests } from "./tests.js";
 const el = (id) => document.getElementById(id);
 
 // the game area stays hidden unless scripts actually run
-el("game").style.display = "inline-block";
+el("game").style.display = "flex";
 
 el("startButton").addEventListener("click", Click.startNewGame);
 el("backwardButton").addEventListener("click", Click.rewindBackward);
@@ -27,6 +27,7 @@ el("importButton").addEventListener("click", () => Click.importGame(window.promp
 el("linkButton").addEventListener("click", Click.promptGameLink);
 el("replayButton").addEventListener("click", Click.replayStartPosition);
 el("engineButton").addEventListener("click", Click.toggleEngine);
+el("markersButton").addEventListener("click", Click.toggleEngineMarkers);
 
 for (const exampleIndex of [0, 1, 2]) {
     el(`example${exampleIndex}`).addEventListener("click", () => {

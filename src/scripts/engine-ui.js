@@ -13,6 +13,8 @@
  * Date: Sat Jul 11, 2026
  */
 
+import { canonicalBlock, LETTERS } from "./board.js";
+
 const TOP_N = 5;
 
 // rank accent colors, shared by the list rows and the board outlines; picked
@@ -25,8 +27,9 @@ const FIELD_PITCH = 25;
 const EDGE_LEFT = 5;
 const EDGE_BOTTOM = 305;
 
-let hooks = null;          // { getBoardBytes, redraw, playColors }
+let hooks = null;          // { getBoardBytes, redraw, playColors, playMove, onResult }
 let enabled = false;
+let markersOn = true;      // group outlines on the board — toggleable, they distract in real play
 let worker = null;
 let positionId = 0;
 let lastKey = null;
@@ -54,6 +57,9 @@ function onWorkerMessage(event) {
     if (msg.type === "result") {
         if (msg.id !== positionId) return; // stale analysis of a previous position
         result = msg;
+        // best score of the analyzed position — the game records it on the shown node;
+        // a terminal position's own remaining count is its exact score
+        hooks.onResult?.(msg.moves.length > 0 ? msg.moves[0].score : msg.remaining);
         renderResult();
         hooks.redraw();
         return;
@@ -134,9 +140,13 @@ function renderResult() {
         const square = span("engineSquare");
         square.style.backgroundColor = hooks.playColors[move.color - 1];
 
+        // the suggested block in the same A-L notation the position tree uses
+        const block = canonicalBlock(move.cells);
+
         row.append(
             rank,
             square,
+            span("engineLoc", LETTERS[block[0]] + LETTERS[block[1]]),
             span("engineScore", move.score === 0 ? "0 ★" : String(move.score)),
             span("engineSize", "×" + move.size),
             span("engineExact", move.exact ? "✓" : ""),
@@ -241,9 +251,16 @@ export const EngineUI = {
         worker.postMessage({ type: "analyze", id: positionId, board });
     },
 
+    // group-outline markers on the board can be switched off for real play
+    toggleMarkers() {
+        markersOn = !markersOn;
+        el("markersButton").classList.toggle("active", markersOn);
+        hooks.redraw();
+    },
+
     // called by the game controller at the end of every board repaint
     drawOverlays(ctx) {
-        if (!enabled || !result) return;
+        if (!enabled || !result || !markersOn) return;
 
         const moves = result.moves.slice(0, TOP_N);
         ctx.save();

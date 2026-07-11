@@ -47,6 +47,89 @@ function randomRecordedGame() {
     return { position, moves, times };
 }
 
+// random position tree with variant branches and engine scores, plus synthetic
+// times covering a random prefix of the main line — used by the v5 round-trip test
+function randomTreeGame() {
+    const position = new Game().getStartPosition();
+
+    let nodesLeft = 60;
+    const randomNode = (pos, depth) => {
+        const node = {
+            move: null,
+            score: Math.random() < 0.4 ? Math.floor(Math.random() * 145) : null,
+            children: [],
+        };
+
+        const groups = enumerateGroups(pos);
+        const r = Math.random();
+        let want = depth > 25 || nodesLeft <= 0 ? 0 : r < 0.15 ? 0 : r < 0.85 ? 1 : r < 0.97 ? 2 : 3;
+        want = Math.min(want, groups.length);
+
+        const picked = new Set();
+        while (picked.size < want) {
+            picked.add(Math.floor(Math.random() * groups.length));
+        }
+
+        for (const groupIndex of picked) {
+            const group = groups[groupIndex];
+            const next = clonePosition(pos);
+            removeGroup(next, group.cells);
+
+            nodesLeft--;
+            const child = randomNode(next, depth + 1);
+            child.move = [...group.cells[Math.floor(Math.random() * group.cells.length)]];
+            node.children.push(child);
+        }
+
+        return node;
+    };
+    const root = randomNode(clonePosition(position), 0);
+
+    let mainLength = 0;
+    for (let node = root; node.children.length > 0; node = node.children[0]) {
+        mainLength++;
+    }
+
+    const times = [];
+    if (mainLength > 0 && Math.random() > 0.2) {
+        const timedCount = 1 + Math.floor(Math.random() * mainLength);
+        times.push(0);
+        for (let i = 1; i < timedCount; i++) {
+            times.push(times[i - 1] + Math.floor(20 + 5000 * Math.random()));
+        }
+    }
+
+    return { position, root, times };
+}
+
+// deep tree comparison by replay: both moves must select the same group, scores and
+// child counts must match exactly; returns true when the trees are equivalent
+function sameTree(pos1, node1, pos2, node2) {
+    if (node1.score !== node2.score || node1.children.length !== node2.children.length) {
+        return false;
+    }
+
+    for (let i = 0; i < node1.children.length; i++) {
+        const g1 = extractGroup(pos1, node1.children[i].move);
+        const g2 = extractGroup(pos2, node2.children[i].move);
+        if (g1.length < 2 || g1.length !== g2.length) {
+            return false;
+        }
+
+        const next1 = clonePosition(pos1);
+        const next2 = clonePosition(pos2);
+        removeGroup(next1, g1);
+        removeGroup(next2, g2);
+
+        if (JSON.stringify(next1) !== JSON.stringify(next2) ||
+            !sameTree(next1, node1.children[i], next2, node2.children[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 export function createTests() {
     let testIndex = 0;
     let testIter = 0;
@@ -117,6 +200,57 @@ export function createTests() {
                     logFailure("Test failed: v4 game round-trip", [
                         ["position", position],
                         ["moves", moves],
+                        ["times", times],
+                        ["serialized", serialized],
+                        ["deserialized", d],
+                    ]);
+                    return false;
+                }
+                return true;
+            },
+        }, {
+            name: "v5 tree serialization",
+            count: 500,
+            groupSize: 5,
+            prologText: "500 v5 position-tree round-trip checks running...\n",
+            epilogText: "Test finished OK.\n",
+            blocking: true,
+            exec() {
+                const { position, root, times } = randomTreeGame();
+
+                const serialized = Serializer.serializeGameTree(position, root, times);
+                const d = Serializer.deserializeGame("?" + serialized);
+
+                let ok = JSON.stringify(d.p) === JSON.stringify(position) &&
+                    d.tree !== undefined &&
+                    sameTree(clonePosition(position), root, clonePosition(d.p), d.tree);
+
+                if (ok && times.length > 0) {
+                    // total time of the timed prefix is exact, times stay monotone
+                    ok = d.t.length === times.length && d.t[d.t.length - 1] === times[times.length - 1];
+                    for (let i = 1; ok && i < times.length; i++) {
+                        const err = times[i] - d.t[i];
+                        ok = d.t[i] >= d.t[i - 1] &&
+                            (i === times.length - 1 || (err >= 0 && err <= Math.max(1, (times[i] - d.t[i - 1]) / 69 + 1)));
+                    }
+                } else if (ok) {
+                    ok = d.t.length === 0;
+                }
+
+                // decoded game must re-serialize to the identical string
+                ok = ok && Serializer.serializeGameTree(d.p, d.tree, d.t) === serialized;
+
+                // a Game built from the link must serialize back to the same link,
+                // unless the tree is trivial enough for the shorter v4 format
+                if (ok) {
+                    const gameString = new Game("?" + serialized).getString();
+                    ok = gameString === serialized || gameString.startsWith("v=4&");
+                }
+
+                if (!ok) {
+                    logFailure("Test failed: v5 tree round-trip", [
+                        ["position", position],
+                        ["tree", root],
                         ["times", times],
                         ["serialized", serialized],
                         ["deserialized", d],

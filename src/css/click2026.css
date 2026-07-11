@@ -184,24 +184,124 @@ body {
     display: block;
 }
 
-/* game area — sits above the vertical middle, with a comfortable margin below the top */
+/* game area — sits above the vertical middle, with a comfortable margin below the top;
+   a flex row: the board column on the left, the position tree panel on the right */
 #game {
     margin-top: clamp(40px, 12vh, 130px);
+    display: none; /* shown by main.js (as flex) once scripts are running */
+    gap: 10px;
+    align-items: flex-start;
+}
+
+#gameMain {
     min-width: var(--board-size);
-    display: none; /* shown by main.js once scripts are running */
 }
 
 #gameCanvas {
+    display: block; /* no inline baseline gap — the panel heights must line up */
     width: var(--board-size);
     background-color: black;
     touch-action: none;
 }
 
-/* during manual play everything is disabled EXCEPT the engine toggle and its
-   panel, so analysis can be switched on and read while the game is running */
-#control.disabled :is(#startButton, #rowInnerDiv, .smallButton:not(#engineButton), .buttonSeparator) {
-    filter: opacity(0.2);
-    pointer-events: none;
+/* discrete A-L helper labels along the top and left board edges; absolutely
+   positioned into the surrounding whitespace, so they never affect the layout */
+#boardWrap {
+    position: relative;
+}
+
+#boardColLabels,
+#boardRowLabels {
+    position: absolute;
+    display: flex;
+    font-size: 11px;
+    color: rgb(0 0 0 / 0.4);
+}
+
+#boardColLabels {
+    top: -15px;
+    left: 5px; /* the 5px board margin — one label centered over each column */
+
+    span {
+        width: 25px;
+        text-align: center;
+    }
+}
+
+#boardRowLabels {
+    top: 5px;
+    left: -15px;
+    flex-direction: column; /* rendered top-down, letters supplied L..A — A sits at the bottom */
+
+    span {
+        width: 12px;
+        height: 25px;
+        line-height: 25px;
+        text-align: center;
+    }
+}
+
+/* position tree — wide enough for six variant columns; the height is constant:
+   board (310) + start button (32) + status row (36) + buttons (38) + engine
+   block (136), so closing the engine panel never hides the bottom of the tree */
+#treePanel {
+    position: relative;
+    width: 380px;
+    height: 552px;
+    background-color: rgb(232 232 232);
+}
+
+#treeScroll {
+    position: absolute;
+    inset: 0;
+    overflow: auto;
+}
+
+.treeEdge {
+    stroke: rgb(0 0 0 / 0.35);
+    fill: none;
+}
+
+.treeNode {
+    cursor: pointer;
+}
+
+.treeBox {
+    fill: white;
+    stroke: rgb(0 0 0 / 0.3);
+}
+
+.treeNode:hover .treeBox {
+    stroke: var(--accent-hover);
+}
+
+.treeNode.focus .treeBox {
+    fill: rgb(19 121 202 / 0.15);
+    stroke: var(--accent);
+    stroke-width: 2;
+}
+
+/* the root node marks the start position — it has no move to label */
+.treeRootMark {
+    fill: none;
+    stroke: rgb(0 0 0 / 0.55);
+    stroke-width: 2;
+}
+
+.treeSwatch {
+    stroke: rgb(0 0 0 / 0.4);
+}
+
+.treeLabel {
+    fill: black;
+    font-size: 10px;
+}
+
+/* best engine score recorded for the node's position — the headline datum of a
+   node, so deep black and a size up from the location label */
+.treeScore {
+    fill: black;
+    font-size: 12px;
 }
 
 .rowDiv {
@@ -312,8 +412,9 @@ body {
     }
 }
 
-/* engine — toggle button and the analysis panel below the button row */
-#engineButton {
+/* engine — analysis toggle, board-marker toggle and the panel below the buttons */
+#engineButton,
+#markersButton {
     /* the svg stays inline so it gets the exact same baseline layout as the
        sibling <img> icons — do not make it a block, buttons center blocks */
     .engineDisc {
@@ -324,11 +425,19 @@ body {
         fill: white;
     }
 
+    /* group-outline glyph of the marker toggle */
+    .markerGlyph {
+        fill: none;
+        stroke: white;
+        stroke-width: 1.8;
+        stroke-dasharray: 3 1.6;
+    }
+
     &:hover .engineDisc {
         fill: var(--accent-hover);
     }
 
-    /* engine-on ring, on the icon box itself so it stays a circle */
+    /* toggle-on ring, on the icon box itself so it stays a circle */
     &.active .engineIcon {
         outline: 2px solid var(--accent);
         outline-offset: 1px;
@@ -374,6 +483,12 @@ body {
     width: 13px;
     height: 13px;
     border: 1px solid rgb(0 0 0 / 0.4);
+}
+
+/* suggested block in the same A-L notation the position tree uses */
+.engineLoc {
+    min-width: 24px;
+    opacity: 0.75;
 }
 
 /* estimated blocks left after the best line found; 0 ★ = clears the board */

@@ -7,9 +7,12 @@
  *   v3               — base-64 position; moves/times exist in two dialects: the deployed
  *                      2021 build packed them base-71 (v2 style), a later build base-64 —
  *                      decoding auto-detects the dialect by replay validation
- *   v4               — single "g" param: one rANS entropy-coded BigInt stream (current format)
- * New games are always serialized as v4. The encoding tables and compression math of all
- * versions are frozen — do not "clean them up", links depend on them.
+ *   v4               — single "g" param: one rANS entropy-coded BigInt stream
+ *   v5               — v4 extended with the whole position tree: variant branches and
+ *                      per-node engine scores (current format)
+ * New games serialize as v4, or as v5 when the position tree holds variants or engine
+ * data. The encoding tables and compression math of all versions are frozen — do not
+ * "clean them up", links depend on them.
  *
  * The v4 stream packs, in decode order: the start position (48 uniform base-125 symbols),
  * the move count, a has-times flag, one group-rank symbol per move, one gap symbol per
@@ -908,6 +911,206 @@ const Serializer4 = {
 };
 
 //
+// v5 — v4 extended with the whole position tree: variant branches and per-node
+//      engine scores; the main line keeps v4's exact-total-time coding
+//
+
+// ---- frozen v5 coding tables — wire format, keep verbatim ----
+
+// child-count frequencies (0 = leaf, 1 = the line continues, 2+ = variant branches);
+// counts beyond the table share frequency 1
+const CHILD_FREQ = [96, 800, 48, 16, 8, 4, 2, 2];
+const CHILD_PREFIX = prefixSums(
+    Array.from({ length: MOVES_RADIX }, (_, c) => (c < CHILD_FREQ.length ? CHILD_FREQ[c] : 1)));
+
+// engine scores are blocks left after the best line found: 0..144
+const SCORE_RADIX = 145;
+
+// tree nodes travel as { move: [x, y] | null, score: number | null, children: [...] };
+// the root carries no move. The decoder replays the game exactly like v4 does, so the
+// board.js rules are part of this wire format too.
+const Serializer5 = {
+    serializeGame(position, root, times) {
+        if (!Array.isArray(position) || position.length !== SIZE ||
+            position.some((col) => !Array.isArray(col) || col.length !== SIZE ||
+                col.some((c) => !Number.isInteger(c) || c < 1 || c > COLORS))) {
+            throw new Error("v5 can only serialize a full 12x12 start position");
+        }
+
+        const encoder = new RansEncoder();
+
+        // start position: 3 base-5 fields per uniform base-125 symbol
+        const flat = position.flat();
+        for (let i = 0; i < flat.length; i += 3) {
+            encoder.uniform((flat[i] - 1) * 25 + (flat[i + 1] - 1) * 5 + (flat[i + 2] - 1), 125);
+        }
+
+        // pre-order DFS over the tree: per node its engine score and child count,
+        // then per child the move (rank-coded like v4) followed by its whole subtree
+        const visit = (node, pos, anchor) => {
+            encoder.uniform(node.score === null || node.score === undefined ? 0 : 1, 2);
+            if (node.score !== null && node.score !== undefined) {
+                encoder.uniform(node.score, SCORE_RADIX);
+            }
+
+            const groups = enumerateGroups(pos);
+            const count = node.children.length;
+            encoder.push(CHILD_PREFIX[count + 1] - CHILD_PREFIX[count], CHILD_PREFIX[count],
+                CHILD_PREFIX[Math.min(groups.length, MOVES_RADIX - 1) + 1]);
+
+            for (const child of node.children) {
+                const chosen = groups.findIndex((group) =>
+                    group.cells.some(([x, y]) => x === child.move[0] && y === child.move[1]));
+                if (chosen < 0) {
+                    throw new Error("v5 tree move does not replay");
+                }
+
+                if (anchor === null) {
+                    encoder.uniform(chosen, groups.length);
+                } else {
+                    const rank = orderedGroupIndices(groups, anchor).indexOf(chosen);
+                    encoder.push(RANK_PREFIX[rank + 1] - RANK_PREFIX[rank], RANK_PREFIX[rank],
+                        RANK_PREFIX[Math.min(groups.length, 72)]);
+                }
+
+                const next = clonePosition(pos);
+                removeGroup(next, groups[chosen].cells);
+                visit(child, next, groups[chosen].rep);
+            }
+        };
+        visit(root, clonePosition(position), null);
+
+        // times cover the timed prefix of the main line, coded exactly like v4;
+        // insane times are dropped entirely
+        let mainLength = 0;
+        for (let node = root; node.children.length > 0; node = node.children[0]) {
+            mainLength++;
+        }
+
+        const timedCount = Array.isArray(times) && times.length > 0 && times.length <= mainLength &&
+            times[0] === 0 && times[times.length - 1] < GAP_MAX &&
+            times.every((t, i) => Number.isInteger(t) && (i === 0 || t >= times[i - 1]))
+            ? times.length : 0;
+
+        encoder.uniform(timedCount, MOVES_RADIX);
+
+        if (timedCount > 0) {
+            // error-diffusion floor quantization against the reconstructed clock — see v4
+            let reconstructed = 0;
+            for (let i = 1; i < timedCount; i++) {
+                const symbol = gapToSymbol(times[i] - reconstructed);
+                reconstructed += GAP_CODEBOOK[symbol];
+                encoder.push(GAP_FREQ[symbol], GAP_PREFIX[symbol], GAP_PREFIX[GAP_PREFIX.length - 1]);
+            }
+
+            // non-negative residual makes the total time exact to the millisecond
+            const residual = BigInt(times[timedCount - 1] - reconstructed);
+            const bits = residual === 0n ? 0 : residual.toString(2).length;
+            encoder.uniform(bits, RESIDUAL_RADIX);
+            if (bits > 1) {
+                encoder.push(1n, residual - (1n << BigInt(bits - 1)), 1n << BigInt(bits - 1));
+            }
+        }
+
+        let x = encoder.finish();
+        let coded = "";
+        while (x > 0n) {
+            coded = B64[Number(x % 64n)] + coded;
+            x /= 64n;
+        }
+
+        return "v=5&g=" + coded;
+    },
+
+    deserializeGame(gameString) {
+        if (typeof gameString !== "string" || gameString.length === 0) {
+            return { p: [], m: [], t: [] };
+        }
+
+        let x = 0n;
+        for (const ch of gameString) {
+            const digit = B64.indexOf(ch);
+            if (digit < 0) {
+                throw new Error("invalid v5 character");
+            }
+            x = x * 64n + BigInt(digit);
+        }
+
+        const decoder = new RansDecoder(x);
+
+        const flat = [];
+        for (let i = 0; i < (SIZE * SIZE) / 3; i++) {
+            const v = decoder.uniform(125);
+            flat.push(Math.floor(v / 25) + 1, Math.floor(v / 5) % 5 + 1, (v % 5) + 1);
+        }
+        const position = [];
+        for (let i = 0; i < SIZE; i++) {
+            position.push(flat.slice(i * SIZE, (i + 1) * SIZE));
+        }
+
+        const readNode = (pos, anchor) => {
+            const node = { move: null, score: null, children: [] };
+
+            if (decoder.uniform(2) === 1) {
+                node.score = decoder.uniform(SCORE_RADIX);
+            }
+
+            const groups = enumerateGroups(pos);
+            const count = decoder.symbol(CHILD_PREFIX.slice(0, Math.min(groups.length, MOVES_RADIX - 1) + 2));
+
+            for (let i = 0; i < count; i++) {
+                let chosen;
+                if (anchor === null) {
+                    chosen = decoder.uniform(groups.length);
+                } else {
+                    const rank = decoder.symbol(RANK_PREFIX.slice(0, Math.min(groups.length, 72) + 1));
+                    chosen = orderedGroupIndices(groups, anchor)[rank];
+                }
+
+                const next = clonePosition(pos);
+                removeGroup(next, groups[chosen].cells);
+
+                const child = readNode(next, groups[chosen].rep);
+                child.move = [...groups[chosen].rep];
+                node.children.push(child);
+            }
+
+            return node;
+        };
+        const root = readNode(clonePosition(position), null);
+
+        const timedCount = decoder.uniform(MOVES_RADIX);
+        let times = [];
+        if (timedCount > 0) {
+            times = [0];
+            for (let i = 1; i < timedCount; i++) {
+                times.push(times[i - 1] + GAP_CODEBOOK[decoder.symbol(GAP_PREFIX)]);
+            }
+
+            const bits = decoder.uniform(RESIDUAL_RADIX);
+            const residual = bits === 0 ? 0n :
+                bits === 1 ? 1n : (1n << BigInt(bits - 1)) + decoder.uniformBig(1n << BigInt(bits - 1));
+            times[timedCount - 1] += Number(residual);
+        }
+
+        decoder.verifyEndState();
+
+        // the main line doubles as the legacy flat move list
+        const moves = [];
+        for (let node = root; node.children.length > 0; ) {
+            node = node.children[0];
+            moves.push([...node.move]);
+        }
+
+        if (timedCount > moves.length) {
+            throw new Error("v5 times exceed the main line");
+        }
+
+        return { p: position, m: moves, t: times, tree: root };
+    },
+};
+
+//
 // version dispatcher — public API
 //
 const unknownVersion = () => {
@@ -944,6 +1147,9 @@ export const Serializer = {
         }
     },
 
+    // v5 — serializes the whole position tree (variants and engine scores included)
+    serializeGameTree: (position, tree, times) => Serializer5.serializeGame(position, tree, times),
+
     // never throws — malformed links deserialize to an empty game
     deserializeGame(gameString) {
         try {
@@ -954,6 +1160,7 @@ export const Serializer = {
                 case "2": return Serializer2.deserializeGame(gameParams.p, gameParams.m, gameParams.t);
                 case "3": return Serializer3.deserializeGame(gameParams.p, gameParams.m, gameParams.t);
                 case "4": return Serializer4.deserializeGame(gameParams.g);
+                case "5": return Serializer5.deserializeGame(gameParams.g);
                 default: return unknownVersion() ?? { p: [], m: [], t: [] };
             }
         } catch {

@@ -1,16 +1,25 @@
 /**
  * Click2026 — UI controller: canvas rendering, timers, autoplay and replay controls.
  *
+ * The game clock runs only while the game is played purely on the board: the moment
+ * any other control is used (buttons, mouse wheel, engine or tree clicks), the clock
+ * stops for good and the times recorded so far remain the official gameplay data.
+ * Everything keeps working afterwards — moves played from then on are untimed and
+ * amend the position tree as variants.
+ *
  * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
  * https://opensource.org/licenses/MIT
  *
  * Date: Fri Aug 08, 2014
  *       Sat Jul 11, 2026 - modernized to ES module, zero dependencies
+ *       Sat Jul 11, 2026 - position tree, official-time-only clock
  */
 
 import { Game } from "./game.js";
+import { LETTERS } from "./board.js";
 import { EngineUI } from "./engine-ui.js";
+import { TreeUI } from "./tree-ui.js";
 
 const examples = [
     "?position=544341454153245551352111315534254113553554342242333515335513533415541542111541422113121311534345113215252332331311244443442542241513343551454125&moves=65,54,21,43,31,42,30,29,17,15,13,13,37,24,25,24,14,13,14,26,26,38,38,54,66,78,89,88,88,77,87,87,73,84,60,37,36,12,1,0,12&times=533,929,374,344,492,642,406,218,320,236,178,414,344,266,344,352,484,586,188,264,258,430,1242,336,679,611,217,455,358,321,171,524,273,235,905,180,406,414,156,320",
@@ -163,8 +172,15 @@ function updateTimer() {
 }
 
 function updateTimeText() {
-    const currentMoveTime = game.getCurrentMove() === 0 ? 0 : game.getCurrentMoveTime();
-    el("timeValue").textContent = currentMoveTime ? String(currentMoveTime / 1000) : "0";
+    if (game.getCurrentMove() === 0) {
+        el("timeValue").textContent = "0";
+        return;
+    }
+
+    const currentMoveTime = game.getCurrentMoveTime();
+
+    // official time exists only on the originally played line — variants show a dash
+    el("timeValue").textContent = currentMoveTime === undefined ? "–" : String(currentMoveTime / 1000);
 }
 
 function updateScore() {
@@ -186,20 +202,32 @@ function refreshInterface() {
 // controls
 //
 
-const showButtons = () => el("control").classList.remove("disabled");
-const hideButtons = () => el("control").classList.add("disabled");
+// called whenever the shown position or the tree may have changed
+function onShownPositionChanged() {
+    EngineUI.onPositionChanged();
+    TreeUI.update(game);
+}
+
+// any control interaction outside pure board play permanently stops the game clock —
+// the times recorded so far stay the official gameplay data, play continues untimed
+function endTimedPlay() {
+    if (game.getStatus() === Game.Status.Play) {
+        clearInterval(updateTimerInterval);
+        game.setStatus(Game.Status.Over);
+        updateTimeText();
+    }
+}
 
 function prepareInterface() {
     clearInterval(updateTimerInterval);
     clearInterval(autoPlayTimerInterval);
-    showButtons();
     drawAllFields();
     el("timeValue").textContent = "0";
     el("scoreValue").textContent = game.getScore();
     el("moveValue").textContent = `0 / ${game.getMoves().length}`;
     el("autoPauseButton").hidden = true;
     el("autoPlayButton").hidden = false;
-    EngineUI.onPositionChanged();
+    onShownPositionChanged();
 }
 
 function gameFromString(gameString) {
@@ -220,7 +248,7 @@ function playField(field) {
         drawAllFields();
         updateScore();
         updateMove();
-        EngineUI.onPositionChanged();
+        onShownPositionChanged();
     }
 
     if (game.getStatus() === Game.Status.Over) {
@@ -228,7 +256,6 @@ function playField(field) {
 
         // make sure timer shows the exact time of the last move played
         updateTimeText();
-        showButtons();
     }
 }
 
@@ -237,35 +264,44 @@ function processClick(event) {
     playField([x, y]);
 }
 
-// engine hook: clicking a suggested move plays it exactly like a board click,
-// including the first-click transition that starts a fresh game
+// engine hook: clicking a suggested move plays it like a board click, except the
+// game clock never runs for engine-assisted moves — such lines carry no times
 function playEngineMove(field) {
-    if (game.getStatus() === Game.Status.Ready) {
-        hideButtons();
-        game.startGame();
-        lastClickTime = game.getStartTime();
+    endTimedPlay();
 
-        updateTimerInterval = setInterval(updateTimer, TIMER_INTERVAL_MS);
+    if (game.getStatus() === Game.Status.AutoPlay) {
+        stopAutoPlay();
+    }
+
+    if (game.getStatus() === Game.Status.Ready) {
+        // materialize the shown start position at move 0 and play untimed from there
+        game.rewindToMove(0);
+        game.setStatus(Game.Status.Over);
         updateScore();
         updateMove();
-        EngineUI.onPositionChanged();
     }
 
-    if (game.getStatus() === Game.Status.Play) {
-        playField(field);
-        lastClickTime = Date.now();
-    }
+    playField(field);
+    lastClickTime = Date.now();
 }
 
 function processMouseWheel(delta) {
-    // mouse wheel rewinding enabled only when there is a recording to navigate
-    if (delta === 0 || !ensureNavigable()) {
+    if (delta === 0) {
         return;
     }
 
+    // wheel navigation is a control interaction — it also stops the game clock
+    endTimedPlay();
+
+    // mouse wheel rewinding enabled only when there is a recording to navigate
+    if (!ensureNavigable()) {
+        return;
+    }
+
+    // going down the tree follows the main line of the current node (its first child)
     game.rewindToMove(game.getCurrentMove() + (delta < 0 ? 1 : -1));
     refreshInterface();
-    EngineUI.onPositionChanged();
+    onShownPositionChanged();
 }
 
 function autoPlayMove() {
@@ -277,12 +313,28 @@ function autoPlayMove() {
         drawAllFields();
         updateMove();
         updateScore();
-        EngineUI.onPositionChanged();
+        onShownPositionChanged();
     }
 
-    if (game.getCurrentMove() === game.getMoves().length) {
+    // replay covers only the timed prefix of the main line
+    if (game.getCurrentMove() >= game.getTimes().length) {
         stopAutoPlay();
     }
+}
+
+// selecting a tree node reloads its position — playing from there amends the tree
+function selectTreeNode(node) {
+    endTimedPlay();
+
+    if (game.getStatus() === Game.Status.AutoPlay) {
+        stopAutoPlay();
+    }
+
+    ensureNavigable(); // materializes a replayed recording; no-op on a fresh game
+
+    game.focusNode(node);
+    refreshInterface();
+    onShownPositionChanged();
 }
 
 //
@@ -292,28 +344,29 @@ function autoPlayMove() {
 export function onCanvasClick(event) {
     let firstClick = false;
 
+    // clicking the board during replay takes over — pause it and play from here
+    if (game.getStatus() === Game.Status.AutoPlay) {
+        stopAutoPlay();
+    }
+
     if (game.getStatus() === Game.Status.Ready) {
-        hideButtons();
         game.startGame();
         lastClickTime = game.getStartTime();
 
         updateTimerInterval = setInterval(updateTimer, TIMER_INTERVAL_MS);
         updateScore();
         updateMove(); // starting manual play resets the recording, so refresh the counter
-        EngineUI.onPositionChanged();
+        onShownPositionChanged();
 
         firstClick = true;
     }
 
-    if (game.getStatus() === Game.Status.Play) {
-        const currentTime = Date.now();
-
-        if (firstClick || currentTime - lastClickTime > MIN_DOUBLE_CLICK_MS) {
-            processClick(event);
-        }
-
-        lastClickTime = currentTime;
+    // timed play (Play) and untimed variant play (Over) both happen on the board
+    const currentTime = Date.now();
+    if (firstClick || currentTime - lastClickTime > MIN_DOUBLE_CLICK_MS) {
+        processClick(event);
     }
+    lastClickTime = currentTime;
 }
 
 export function startNewGame() {
@@ -322,6 +375,7 @@ export function startNewGame() {
 }
 
 export function replayStartPosition() {
+    endTimedPlay();
     game.replay();
     prepareInterface();
 }
@@ -335,11 +389,12 @@ export function stopAutoPlay() {
 }
 
 export function autoPlay() {
+    endTimedPlay();
     ensureNavigable();
 
     if (game.getStatus() === Game.Status.Over) {
-        // exit if game is already at the end
-        if (game.getCurrentMove() === game.getMoves().length) {
+        // replay and times exist only for the original (main) playing line
+        if (!game.isFocusOnMainLine() || game.getCurrentMove() >= game.getTimes().length) {
             return;
         }
 
@@ -371,6 +426,8 @@ function ensureNavigable() {
 }
 
 export function rewindBackward() {
+    endTimedPlay();
+
     if (!ensureNavigable()) {
         return;
     }
@@ -378,10 +435,12 @@ export function rewindBackward() {
     game.rewindToMove(0);
     stopAutoPlay();
     refreshInterface();
-    EngineUI.onPositionChanged();
+    onShownPositionChanged();
 }
 
 export function rewindForward() {
+    endTimedPlay();
+
     if (!ensureNavigable()) {
         return;
     }
@@ -389,16 +448,20 @@ export function rewindForward() {
     game.rewindToMove(game.getMoves().length);
     stopAutoPlay();
     refreshInterface();
-    EngineUI.onPositionChanged();
+    onShownPositionChanged();
 }
 
 export function importGame(importedString) {
+    endTimedPlay();
+
     if (importedString !== "" && importedString !== null && importedString !== undefined) {
         gameFromString(importedString);
     }
 }
 
 export function promptGameLink() {
+    endTimedPlay();
+
     window.prompt("Copy link to clipboard (Ctrl+C)",
         String(document.location).split("?", 1)[0] + "?" + game.getString());
 }
@@ -410,18 +473,40 @@ export function loadExample(exampleIndex) {
 }
 
 export function toggleEngine() {
+    endTimedPlay();
     EngineUI.toggle();
+}
+
+export function toggleEngineMarkers() {
+    endTimedPlay();
+    EngineUI.toggleMarkers();
 }
 
 export function init() {
     canvas = el("gameCanvas");
     ctx = canvas.getContext("2d");
 
+    // discrete A-L helper labels along the top and left board edges
+    for (let i = 0; i < 12; i++) {
+        el("boardColLabels").append(Object.assign(document.createElement("span"), { textContent: LETTERS[i] }));
+        el("boardRowLabels").append(Object.assign(document.createElement("span"), { textContent: LETTERS[11 - i] }));
+    }
+
     EngineUI.init({
         getBoardBytes: shownBoardBytes,
         redraw: drawAllFields,
         playColors: colors.playColors,
         playMove: playEngineMove,
+        onResult: (score) => {
+            game.recordEngineScore(score);
+            TreeUI.update(game);
+        },
+    });
+
+    TreeUI.init({
+        container: el("treeScroll"),
+        playColors: colors.playColors,
+        onSelect: selectTreeNode,
     });
 
     canvas.addEventListener("mousedown", onCanvasClick);

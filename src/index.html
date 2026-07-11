@@ -51,87 +51,103 @@
             </nav>
         </div>
         <div id="game">
-            <canvas id="gameCanvas" width="310" height="310" aria-label="Game board"></canvas>
-            <div id="control">
-                <div id="startButtonDiv"><button id="startButton" type="button">NEW GAME</button></div>
-
-                <div class="rowDiv"><div id="rowInnerDiv" class="rowInnerDiv">
-                    <div class="leftDiv">Time:</div><div id="timeValue" class="rightDiv timeValue"></div>
-                    <div class="leftDiv">Score:</div><div id="scoreValue" class="rightDiv scoreValue"></div>
-                    <div class="filler"></div>
-                    <div class="leftDiv">Move:</div><div id="moveValue" class="rightDiv moveValue"></div>
-                </div></div>
-                <div id="buttonsContainer">
-                    <div class="buttonFillerOut"></div>
-                    <button id="backwardButton" class="smallButton" type="button" title="Rewind to start">
-                        <img class="icon on" src="images/icon_backward_on.png" alt="">
-                        <img class="icon off" src="images/icon_backward_off.png" alt="">
-                    </button>
-                    <div class="buttonFillerIn"></div>
-                    <div class="smallButtonDiv">
-                        <button id="autoPlayButton" class="smallButton" type="button" title="Autoplay">
-                            <img class="icon on" src="images/icon_play_on.png" alt="">
-                            <img class="icon off" src="images/icon_play_off.png" alt="">
-                        </button>
-                        <button id="autoPauseButton" class="smallButton" type="button" title="Pause" hidden>
-                            <img class="icon on" src="images/icon_pause_on.png" alt="">
-                            <img class="icon off" src="images/icon_pause_off.png" alt="">
-                        </button>
-                    </div>
-                    <div class="buttonFillerIn"></div>
-                    <button id="forwardButton" class="smallButton" type="button" title="Rewind to end">
-                        <img class="icon on" src="images/icon_forward_on.png" alt="">
-                        <img class="icon off" src="images/icon_forward_off.png" alt="">
-                    </button>
-                    <div class="buttonFillerIn"></div>
-                    <div class="buttonSeparator"></div>
-                    <div class="buttonFillerIn"></div>
-                    <button id="importButton" class="smallButton" type="button" title="Import game link">
-                        <img class="icon on" src="images/icon_import_on.png" alt="">
-                        <img class="icon off" src="images/icon_import_off.png" alt="">
-                    </button>
-                    <div class="buttonFillerIn"></div>
-                    <button id="linkButton" class="smallButton" type="button" title="Get game link">
-                        <img class="icon on" src="images/icon_link_on.png" alt="">
-                        <img class="icon off" src="images/icon_link_off.png" alt="">
-                    </button>
-                    <div class="buttonFillerIn"></div>
-                    <div class="buttonSeparator"></div>
-                    <div class="buttonFillerIn"></div>
-                    <button id="replayButton" class="smallButton" type="button" title="Replay start position">
-                        <img class="icon on" src="images/icon_replay_on.png" alt="">
-                        <img class="icon off" src="images/icon_replay_off.png" alt="">
-                    </button>
-                    <div class="buttonFillerIn"></div>
-                    <div class="buttonSeparator"></div>
-                    <div class="buttonFillerIn"></div>
-                    <button id="engineButton" class="smallButton" type="button" title="Engine analysis">
-                        <svg class="icon engineIcon" viewBox="0 0 26 26" width="26" height="26" aria-hidden="true">
-                            <circle class="engineDisc" cx="13" cy="13" r="13"/>
-                            <g class="engineGlyph">
-                                <path fill-rule="evenodd" d="M8.6 8.6h8.8v8.8H8.6Z M11.2 11.2h3.6v3.6h-3.6Z"/>
-                                <rect x="9.05" y="5.7" width="1.7" height="2.4"/>
-                                <rect x="12.15" y="5.7" width="1.7" height="2.4"/>
-                                <rect x="15.25" y="5.7" width="1.7" height="2.4"/>
-                                <rect x="9.05" y="17.9" width="1.7" height="2.4"/>
-                                <rect x="12.15" y="17.9" width="1.7" height="2.4"/>
-                                <rect x="15.25" y="17.9" width="1.7" height="2.4"/>
-                                <rect x="5.7" y="9.05" width="2.4" height="1.7"/>
-                                <rect x="5.7" y="12.15" width="2.4" height="1.7"/>
-                                <rect x="5.7" y="15.25" width="2.4" height="1.7"/>
-                                <rect x="17.9" y="9.05" width="2.4" height="1.7"/>
-                                <rect x="17.9" y="12.15" width="2.4" height="1.7"/>
-                                <rect x="17.9" y="15.25" width="2.4" height="1.7"/>
-                            </g>
-                        </svg>
-                    </button>
-                    <div class="buttonFillerOut"></div>
+            <div id="gameMain">
+                <div id="boardWrap">
+                    <div id="boardColLabels" aria-hidden="true"></div>
+                    <div id="boardRowLabels" aria-hidden="true"></div>
+                    <canvas id="gameCanvas" width="310" height="310" aria-label="Game board"></canvas>
                 </div>
-                <div id="engineSection" hidden>
-                    <ol id="engineList"></ol>
-                    <div id="engineStatus"></div>
+                <div id="control">
+                    <div id="startButtonDiv"><button id="startButton" type="button">NEW GAME</button></div>
+
+                    <div class="rowDiv"><div id="rowInnerDiv" class="rowInnerDiv">
+                        <div class="leftDiv">Time:</div><div id="timeValue" class="rightDiv timeValue"></div>
+                        <div class="leftDiv">Score:</div><div id="scoreValue" class="rightDiv scoreValue"></div>
+                        <div class="filler"></div>
+                        <div class="leftDiv">Move:</div><div id="moveValue" class="rightDiv moveValue"></div>
+                    </div></div>
+                    <div id="buttonsContainer">
+                        <div class="buttonFillerOut"></div>
+                        <button id="backwardButton" class="smallButton" type="button" title="Rewind to start">
+                            <img class="icon on" src="images/icon_backward_on.png" alt="">
+                            <img class="icon off" src="images/icon_backward_off.png" alt="">
+                        </button>
+                        <div class="buttonFillerIn"></div>
+                        <div class="smallButtonDiv">
+                            <button id="autoPlayButton" class="smallButton" type="button" title="Autoplay">
+                                <img class="icon on" src="images/icon_play_on.png" alt="">
+                                <img class="icon off" src="images/icon_play_off.png" alt="">
+                            </button>
+                            <button id="autoPauseButton" class="smallButton" type="button" title="Pause" hidden>
+                                <img class="icon on" src="images/icon_pause_on.png" alt="">
+                                <img class="icon off" src="images/icon_pause_off.png" alt="">
+                            </button>
+                        </div>
+                        <div class="buttonFillerIn"></div>
+                        <button id="forwardButton" class="smallButton" type="button" title="Rewind to end">
+                            <img class="icon on" src="images/icon_forward_on.png" alt="">
+                            <img class="icon off" src="images/icon_forward_off.png" alt="">
+                        </button>
+                        <div class="buttonFillerIn"></div>
+                        <div class="buttonSeparator"></div>
+                        <div class="buttonFillerIn"></div>
+                        <button id="importButton" class="smallButton" type="button" title="Import game link">
+                            <img class="icon on" src="images/icon_import_on.png" alt="">
+                            <img class="icon off" src="images/icon_import_off.png" alt="">
+                        </button>
+                        <div class="buttonFillerIn"></div>
+                        <button id="linkButton" class="smallButton" type="button" title="Get game link">
+                            <img class="icon on" src="images/icon_link_on.png" alt="">
+                            <img class="icon off" src="images/icon_link_off.png" alt="">
+                        </button>
+                        <div class="buttonFillerIn"></div>
+                        <div class="buttonSeparator"></div>
+                        <div class="buttonFillerIn"></div>
+                        <button id="replayButton" class="smallButton" type="button" title="Replay start position">
+                            <img class="icon on" src="images/icon_replay_on.png" alt="">
+                            <img class="icon off" src="images/icon_replay_off.png" alt="">
+                        </button>
+                        <div class="buttonFillerIn"></div>
+                        <div class="buttonSeparator"></div>
+                        <div class="buttonFillerIn"></div>
+                        <button id="engineButton" class="smallButton" type="button" title="Engine analysis">
+                            <svg class="icon engineIcon" viewBox="0 0 26 26" width="26" height="26" aria-hidden="true">
+                                <circle class="engineDisc" cx="13" cy="13" r="13"/>
+                                <g class="engineGlyph">
+                                    <path fill-rule="evenodd" d="M8.6 8.6h8.8v8.8H8.6Z M11.2 11.2h3.6v3.6h-3.6Z"/>
+                                    <rect x="9.05" y="5.7" width="1.7" height="2.4"/>
+                                    <rect x="12.15" y="5.7" width="1.7" height="2.4"/>
+                                    <rect x="15.25" y="5.7" width="1.7" height="2.4"/>
+                                    <rect x="9.05" y="17.9" width="1.7" height="2.4"/>
+                                    <rect x="12.15" y="17.9" width="1.7" height="2.4"/>
+                                    <rect x="15.25" y="17.9" width="1.7" height="2.4"/>
+                                    <rect x="5.7" y="9.05" width="2.4" height="1.7"/>
+                                    <rect x="5.7" y="12.15" width="2.4" height="1.7"/>
+                                    <rect x="5.7" y="15.25" width="2.4" height="1.7"/>
+                                    <rect x="17.9" y="9.05" width="2.4" height="1.7"/>
+                                    <rect x="17.9" y="12.15" width="2.4" height="1.7"/>
+                                    <rect x="17.9" y="15.25" width="2.4" height="1.7"/>
+                                </g>
+                            </svg>
+                        </button>
+                        <div class="buttonFillerIn"></div>
+                        <button id="markersButton" class="smallButton active" type="button" title="Engine move markers on board">
+                            <svg class="icon engineIcon" viewBox="0 0 26 26" width="26" height="26" aria-hidden="true">
+                                <circle class="engineDisc" cx="13" cy="13" r="13"/>
+                                <path class="markerGlyph" d="M 8 8 H 18 V 14.5 H 14.5 V 18 H 8 Z"/>
+                            </svg>
+                        </button>
+                        <div class="buttonFillerOut"></div>
+                    </div>
+                    <div id="engineSection" hidden>
+                        <ol id="engineList"></ol>
+                        <div id="engineStatus"></div>
+                    </div>
                 </div>
             </div>
+            <aside id="treePanel" aria-label="Position tree">
+                <div id="treeScroll"></div>
+            </aside>
         </div>
         <div id="mainRight"></div>
     </main>
