@@ -148,6 +148,61 @@ console.log(`beam width 512: ${(beamNodes / 1e6).toFixed(2)}M nodes over ${beamB
     `median ${beamSamples[1].toFixed(3)}M nodes/s ` +
     `(samples ${beamSamples.map((n) => n.toFixed(3)).join(", ")})`);
 
+// --- permanent-separator proof ---------------------------------------------
+
+// R-B-R is permanently split by the singleton B column. Nine unrelated
+// removable groups make the old singleton-only bound insufficient to prove
+// the positive score from the greedy line; the fixed point proves every root
+// immediately, without enumeration.
+const separatorBoard = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+separatorBoard[0][0] = 1;
+separatorBoard[1][0] = 2;
+separatorBoard[2][0] = 1;
+for (let col = 3; col < SIZE; col++) {
+    const color = 3 + col % 3;
+    separatorBoard[col][0] = separatorBoard[col][1] = color;
+}
+const separatorEngine = await makeEngine();
+const separatorStart = performance.now();
+const separatorRoots = separatorEngine.setBoard(separatorBoard);
+const separatorResult = separatorEngine.collect();
+const separatorMs = performance.now() - separatorStart;
+if (separatorRoots !== 9 || separatorResult.roots.some((move, k) =>
+    move.best !== 3 || !move.exact || separatorEngine.eng.getRootLower(k) !== 3)) {
+    throw new Error("permanent-separator proof fixture failed");
+}
+console.log(`permanent separator: ${separatorRoots}/${separatorRoots} roots proved score 3 ` +
+    `at setup in ${separatorMs.toFixed(2)} ms, 0 search nodes`);
+
+// --- complementary-policy blind-spot regression ---------------------------
+
+// Supplied game at move 25. The tuned heuristic reaches 2 but rejects the
+// temporary fragmentation on its clearing corridor. The permanent-only
+// portfolio member must find and replay the clean line with bounded work.
+const portfolioColumns = [
+    "5424343", "54", "534", "552444", "515141",
+    "12342443225", "313245151", "342415341", "353121411211",
+];
+const portfolioBoard = Array.from({ length: SIZE }, (_, col) =>
+    Array.from({ length: SIZE }, (_, row) => Number(portfolioColumns[col]?.[row] ?? 0)));
+const portfolioEngine = await makeEngine();
+portfolioEngine.setBoard(portfolioBoard);
+let portfolioResult = portfolioEngine.collect();
+const portfolioRoot = portfolioResult.roots.find((move) => move.rep === 62);
+if (!portfolioRoot) throw new Error("move-25 portfolio root FC missing");
+const portfolioStart = performance.now();
+portfolioEngine.eng.beamBeginRootPermanent(portfolioRoot.k, 8192);
+while (portfolioEngine.eng.beamStep(400_000) === 0) { /* complete pass */ }
+const portfolioMs = performance.now() - portfolioStart;
+portfolioResult = portfolioEngine.collect();
+const portfolioMove = portfolioResult.roots[portfolioRoot.k];
+if (portfolioMove.best !== 0 || !portfolioMove.exact ||
+    replayLine(portfolioBoard, portfolioMove.line) !== 0) {
+    throw new Error("move-25 permanent-only portfolio failed");
+}
+console.log(`temporary-fragmentation clear: ${(portfolioResult.nodes / 1e3).toFixed(0)}k nodes, ` +
+    `${portfolioMs.toFixed(2)} ms, score 0 proved`);
+
 // --- exact proof corpus -----------------------------------------------------
 
 const PROOFS = [

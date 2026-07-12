@@ -199,6 +199,44 @@ try {
         "root-private widening clears the starvation counterexample", starvationResult);
     await page.click("#engineButton");
 
+    // Regression: move 25 of this recording needs a temporarily fragmented
+    // corridor. The bounded permanent-only portfolio must resolve FC to a
+    // replayable/proven zero before the normal heuristic can settle at 2.
+    const fragmentationCase = "?v=5&g=BanJkAhMlxgvWGHOJNM7B0JS-20PRwJU6AfudCmzcF3cYlDaHIhRydZ8xoRe7e3Hxd2HzIMOEa_X26eg_wQQA5waAY4ZYkm_Oa-pX8KVh3Xa73NcBt2VpwT9tkxjGcluEc34dyGau_uyeWIs6ESM-bdaaxMfG3CKk8PUIEmUrQawuUVtAd8Xp98UWFLIIJuKpFkoL6sMzQGB_h0mSn9";
+    await page.goto("http://localhost:8123/" + fragmentationCase, { waitUntil: "networkidle0" });
+    await page.evaluate(() => {
+        const canvas = document.getElementById("gameCanvas");
+        for (let i = 0; i < 25; i++) {
+            canvas.dispatchEvent(new WheelEvent("wheel", {
+                deltaY: 100, bubbles: true, cancelable: true,
+            }));
+        }
+    });
+    check((await page.$eval("#moveValue", (e) => e.textContent)).startsWith("25 / 48"),
+        "fragmentation regression navigates to move 25");
+    if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
+    await page.waitForFunction(() => Array.from(document.querySelectorAll("#engineList .engineRow"))
+        .some((row) => row.querySelector(".engineLoc")?.textContent === "FC" &&
+            parseInt(row.querySelector(".engineScore")?.textContent ?? "9999", 10) === 0 &&
+            row.querySelector(".engineExact")?.textContent === "✓"), { timeout: 30000 });
+    const fragmentationResult = await page.evaluate(() => {
+        const row = Array.from(document.querySelectorAll("#engineList .engineRow"))
+            .find((candidate) => candidate.querySelector(".engineLoc")?.textContent === "FC");
+        return {
+            score: row?.querySelector(".engineScore")?.textContent,
+            exact: row?.querySelector(".engineExact")?.textContent,
+            status: document.getElementById("engineStatus").textContent,
+        };
+    });
+    check(fragmentationResult.score === "0 ★" && fragmentationResult.exact === "✓",
+        "permanent-only portfolio clears the move-25 fragmentation regression",
+        fragmentationResult);
+    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
+
     // endgame proving: rewind a recorded game to 10 moves before its end —
     // 32 remaining cells, the size class that used to cycle under the old
     // 32-cell gate; the value solver must prove every move and report complete

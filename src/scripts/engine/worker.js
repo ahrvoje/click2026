@@ -14,6 +14,7 @@
  *   1. greedy baselines            — instant score for every root move
  *   2. CPU playout portfolio       — strong tabu policy plus full-support samples
  *   3. widening beam passes        — deterministic, widths 8..2048
+ *      with one bounded permanent-only late-game portfolio member
  *   4. continuous investigation    — alternating global beam passes (widths
  *      512..16384) and root-locked passes that widen independently per move,
  *      plus playout rounds biased to the current top moves
@@ -31,8 +32,8 @@
  *
  * Knowledge survives moves: every posted result is cached by board key, and
  * a new analysis is seeded with the cached lines of its own position plus
- * the line suffixes of the previous position (replay-validated in WASM), so
- * playing a suggested move never makes the engine forget the line it showed.
+ * the line suffixes of the previous position and cached one-ply child lines
+ * (all replay-validated in WASM), so forward play and rewind retain knowledge.
  *
  * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
@@ -48,7 +49,11 @@ const SIZE = 12;
 const CHUNK = 16000;            // beam expansions per slice, ~10 ms
 const EXACT_CHUNK = 60000;      // exact solver expansions per slice
 const EXACT_REMAINING = 56;     // full-speed exact proving at or below this many cells
-const EXACT_TRY_REMAINING = 88; // above 56 up to here: proving trickles at 1 chunk/cycle
+const EXACT_TRY_REMAINING = 88; // above 56 up to here: proving runs at half the full quantum
+const CLEAR_PORTFOLIO_REMAINING = 72; // late positions merit an orthogonal clear-focused beam
+const CLEAR_PORTFOLIO_WIDTH = 8192;
+const CLEAR_PORTFOLIO_SCORE = 5;
+const CLEAR_PORTFOLIO_ROOTS = 2;
 const BOUND_BUDGET = 2000000;   // one fast branch-and-bound attempt before full value solving
 const EXACT_BUDGET = 8000000;   // first value-memo attempt; retries resume and escalate ×4
 const EXACT_BUDGET_MAX = 2000000000; // i32-safe budget per resumable attempt
@@ -66,10 +71,12 @@ let eng = null;
 let IO = 0;
 let gpu = null;
 let gpuState = "off";           // "off" | "on" | "failed"
+let pendingGpu = null;          // one shared-buffer batch may be in flight
 
 let job = null;
 let jobVersion = 0;
 let kickWaiter = null;
+const jobChangeWaiters = new Set();
 
 // warm-start memory: boardKey -> last posted move list (lines, scores, proofs);
 // insertion order doubles as LRU order
@@ -92,6 +99,8 @@ self.onmessage = (event) => {
     if (msg.type === "analyze") {
         job = msg;
         jobVersion++;
+        for (const wake of jobChangeWaiters) wake();
+        jobChangeWaiters.clear();
         if (kickWaiter) {
             kickWaiter();
             kickWaiter = null;
@@ -201,6 +210,32 @@ async function analyze(myJob, isStale) {
     if (moves.every((m) => m.exact)) { post(true); return; }
 
     let seedBase = 1;
+    const launchGpu = (snapshot, samples, seed) => {
+        if (pendingGpu !== null || gpuState !== "on") return false;
+        let pending;
+        pending = gpuRound(snapshot, samples, seed, isStale)
+            .catch(() => disableGpu())
+            .finally(() => {
+                if (pendingGpu === pending) pendingGpu = null;
+            });
+        pendingGpu = pending;
+        return true;
+    };
+    const drainGpu = async () => {
+        const pending = pendingGpu;
+        if (pending === null) return;
+        let wakeJobChange;
+        const changed = new Promise((resolve) => {
+            wakeJobChange = resolve;
+            jobChangeWaiters.add(resolve);
+        });
+        if (isStale()) wakeJobChange();
+        try {
+            await Promise.race([pending, changed]);
+        } finally {
+            jobChangeWaiters.delete(wakeJobChange);
+        }
+    };
 
     // 2. quick CPU playout round: 32 playouts per root move
     for (let k = 0; k < moves.length; k++) {
@@ -220,21 +255,45 @@ async function analyze(myJob, isStale) {
     // 3. deterministic widening beam passes — always the full ladder, even
     // when a clear shows up early: the other top moves still need refining
     for (const width of WIDEN_WIDTHS) {
+        // GPU playout state is independent once submitted. Let it run while
+        // the CPU expands the beam instead of idling through map/readback.
+        const gpuLaunched = launchGpu(moves, 512, seedBase);
+        if (gpuLaunched) seedBase += 512;
         eng.beamBegin(width, 0);
         for (;;) {
+            // The submitted batch owns only GPU buffers now. A stale job can
+            // return immediately; the next job uses the CPU until it clears.
             if (isStale()) return;
             if (eng.beamStep(CHUNK) === 1) break;
             postIfDue();
             await nextTick();
         }
+        if (gpuLaunched) await drainGpu();
+        if (isStale()) return;
         moves = post(false);
         if (moves.every((m) => m.exact)) { post(true); return; }
 
-        if (gpuState === "on") {
-            await gpuRound(moves, 512, seedBase, isStale);
-            seedBase += 512;
-            if (isStale()) return;
-            moves = post(false);
+        // Every normal beam shares the tuned fragmentation heuristic. Near
+        // the end, add a bounded orthogonal member before the widest default
+        // pass: it keeps only progress + proved-permanent penalties, rescuing
+        // solutions that must look temporarily fragmented for a move or two.
+        if (width === 512 && eng.getRemaining() <= CLEAR_PORTFOLIO_REMAINING &&
+            moves[0].score <= CLEAR_PORTFOLIO_SCORE) {
+            const candidates = moves.filter((m) => !m.exact &&
+                eng.getRootLower(m.k) === 0).slice(0, CLEAR_PORTFOLIO_ROOTS);
+            for (const candidate of candidates) {
+                if (isStale()) return;
+                eng.beamBeginRootPermanent(candidate.k, CLEAR_PORTFOLIO_WIDTH);
+                for (;;) {
+                    if (isStale()) return;
+                    if (eng.beamStep(CHUNK) === 1) break;
+                    postIfDue();
+                    await nextTick();
+                }
+                moves = post(false);
+                if (moves.every((m) => m.exact)) break;
+            }
+            if (moves.every((m) => m.exact)) { post(true); return; }
         }
     }
 
@@ -256,7 +315,7 @@ async function analyze(myJob, isStale) {
             return;
         }
 
-        // exact-proof ladder: one bounded slice per cycle, hopefuls first
+        // exact-proof ladder: a bounded quantum per cycle, objective first
         if (await ladder.advance(moves)) {
             moves = post(false);
             progress.lastSignature = moves
@@ -295,6 +354,9 @@ async function analyze(myJob, isStale) {
             }
         }
         let globalWidth = 0;
+        const playoutSeed = seedBase;
+        const gpuLaunched = s % 2 === 0 && launchGpu(moves, 1024, playoutSeed);
+        if (gpuLaunched) seedBase += 1024;
         if (lockedMove !== null) {
             const move = lockedMove;
             const attempt = lockedAttempts.get(move.cell) ?? 0;
@@ -317,10 +379,10 @@ async function analyze(myJob, isStale) {
 
         // playout refinement, biased to the moves the player actually sees
         if (s % 2 === 0) {
-            if (gpuState === "on") {
-                await gpuRound(moves, 1024, seedBase, isStale);
-                await cpuSoftPlayoutRound(moves, seedBase, isStale);
-                seedBase += 1024;
+            if (gpuLaunched) {
+                await cpuSoftPlayoutRound(moves, playoutSeed, isStale);
+                if (isStale()) return;
+                await drainGpu();
             } else {
                 seedBase = await cpuPlayoutRound(moves, seedBase, isStale);
             }
@@ -372,8 +434,13 @@ function uncoveredPrivateCandidates(moves, maxWidths) {
     if (moves.length === 0) return [];
     const incumbent = moves[0].score;
     const maxWidth = LOCKED_WIDTHS[LOCKED_WIDTHS.length - 1];
-    return moves.filter((m) => !m.exact && eng.getRootLower(m.k) < incumbent &&
-        (maxWidths.get(m.cell) ?? 0) < maxWidth);
+    return moves.filter((m) => {
+        const lower = eng.getRootLower(m.k);
+        const canImprove = lower < incumbent;
+        const canAlsoClear = incumbent === 0 && m.score > 0 && lower === 0;
+        return !m.exact && (canImprove || canAlsoClear) &&
+            (maxWidths.get(m.cell) ?? 0) < maxWidth;
+    });
 }
 
 // warm start: replay every remembered line that could apply to this position —
@@ -395,6 +462,29 @@ function seedFromMemory(key) {
     if (prevAnalysis && prevAnalysis.key !== key) {
         for (const m of prevAnalysis.moves) {
             if (m.line.length > 1) seeds.push({ line: m.line.slice(1) });
+        }
+    }
+
+    // Rewind/general transposition reuse: this position may be the parent of
+    // a cached board. Materialize every one-ply child, and when its board key
+    // is known, prepend the creating root move to each cached continuation.
+    // seedLine replay-validates the composition. This makes moving backward
+    // retain a clearing line instead of only supporting forward suffixes.
+    const roots = collectResults().moves;
+    for (const root of roots) {
+        if (eng.childToIO(root.k) !== 1) continue;
+        const childKey = mem().slice(IO, IO + SIZE * SIZE).join(",");
+        const childMoves = resultCache.get(childKey);
+        if (!childMoves || childMoves.length === 0) continue;
+        const childPositionExact = childMoves.every((m) => m.exact);
+        for (let rank = 0; rank < childMoves.length; rank++) {
+            const child = childMoves[rank];
+            if (child.line.length === 0) continue;
+            seeds.push({
+                line: [root.cell, ...child.line],
+                exact: childPositionExact && rank === 0,
+                score: child.score,
+            });
         }
     }
 
@@ -454,9 +544,10 @@ function createExactLadder(isStale) {
             const remaining = eng.getRemaining();
             if (moves.length === 0 || remaining > EXACT_TRY_REMAINING) return false;
 
-            // full speed below the gate, a background trickle above it —
-            // the memo keeps every explored state either way
-            const slices = remaining <= EXACT_REMAINING ? 8 : 1;
+            // Full speed below the gate; a meaningful half-sized quantum
+            // above it. One chunk per cycle let beam work reach settlement
+            // while a much cheaper exact result was still starved.
+            const slices = remaining <= EXACT_REMAINING ? 8 : 4;
 
             // A beam/playout may have reached the root lower bound while a
             // proof was sliced across cycles. Do not keep solving a row that
@@ -464,9 +555,11 @@ function createExactLadder(isStale) {
             if (active && moves.find((m) => m.cell === active.cell)?.exact) active = null;
 
             if (!active) {
-                // hopefuls first: proving a bigger group's value directly
-                // answers "can I click the big one instead?"
-                const next = biggerHopefuls(moves)[0] ?? moves.find((m) => !m.exact);
+                // Objective first. `moves` is already score-ascending and
+                // size-descending on ties, so this still prefers a bigger
+                // equal move without letting a worse hopeful monopolize the
+                // only retained exact frontier.
+                const next = moves.find((m) => !m.exact);
                 if (!next) return false; // everything proven
 
                 if (!boundTried.has(next.cell)) {
@@ -558,6 +651,12 @@ function createExactLadder(isStale) {
     };
 }
 
+function disableGpu() {
+    try { gpu?.destroy(); } catch { /* device may already be lost */ }
+    gpuState = "failed";
+    gpu = null;
+}
+
 // one GPU playout round over all root children; falls back permanently on the
 // first verification mismatch (results are only merged after a CPU replay)
 async function gpuRound(moves, playouts, seedBase, isStale) {
@@ -578,8 +677,7 @@ async function gpuRound(moves, playouts, seedBase, isStale) {
     try {
         results = await gpu.runBatch(boards, tabu, playouts, seedBase);
     } catch (error) {
-        gpuState = "failed";
-        gpu = null;
+        disableGpu();
         return;
     }
     if (isStale()) return;
@@ -591,8 +689,7 @@ async function gpuRound(moves, playouts, seedBase, isStale) {
         if (eng.playoutVerify(k, seedBase + seedIdx, final) === 0) {
             // GPU and CPU disagree on a deterministic playout — GPU results
             // cannot be trusted on this device, disable them for good
-            gpuState = "failed";
-            gpu = null;
+            disableGpu();
             return;
         }
     }
@@ -604,8 +701,7 @@ async function initGpu() {
     try {
         gpu = await createGpu();
     } catch (error) {
-        gpu = null;
-        gpuState = "failed";
+        disableGpu();
         return;
     }
     if (!gpu) return;
@@ -626,8 +722,7 @@ async function initGpu() {
         if (cpuFinal !== result.final) throw new Error(`self-test mismatch cpu ${cpuFinal} gpu ${result.final}`);
         gpuState = "on";
     } catch (error) {
-        gpu = null;
-        gpuState = "failed";
+        disableGpu();
     }
 }
 
@@ -651,8 +746,10 @@ async function main() {
             await new Promise((resolve) => { kickWaiter = resolve; });
             continue;
         }
-        doneVersion = jobVersion;
-        await analyze(job, () => jobVersion !== doneVersion);
+        const analysisVersion = jobVersion;
+        const analysisJob = job;
+        doneVersion = analysisVersion;
+        await analyze(analysisJob, () => jobVersion !== analysisVersion);
     }
 }
 

@@ -432,6 +432,167 @@ suite("intrinsic proofs: terminal and lower-bound scores need no search", () => 
         "constructive zero score was not auto-proven", roots[0]);
 });
 
+suite("permanent separators: fixed-point lower bound is sound", () => {
+    const empty = () => Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+
+    // Horizontal R-B-R: the globally singleton B makes its column permanent,
+    // so the two globally unique R partners can never become adjacent.
+    const horizontal = empty();
+    horizontal[0][0] = 1;
+    horizontal[1][0] = 2;
+    horizontal[2][0] = 1;
+    horizontal[3][0] = horizontal[3][1] = 3;
+    horizontal[4][0] = horizontal[4][1] = 4;
+    setIOBoard(horizontal);
+    check(eng.testLowerBound() === 3, "horizontal RBR lower bound missed", {
+        lower: eng.testLowerBound(),
+    });
+    check(eng.setBoard() === 2, "horizontal RBR fixture has wrong root count");
+    let roots = collectResults().roots;
+    check(roots.every((_, k) => eng.getRootLower(k) === 3),
+        "horizontal RBR root bounds were not strengthened");
+    check(roots.every((root) => root.best === 3 && root.exact),
+        "horizontal RBR scores were not intrinsically proven", roots);
+
+    // Vertical order inside a column is invariant, so the singleton B also
+    // permanently separates the only two R cells above and below it.
+    const vertical = empty();
+    vertical[0][0] = 1;
+    vertical[0][1] = 2;
+    vertical[0][2] = 1;
+    vertical[1][0] = vertical[1][1] = 3;
+    setIOBoard(vertical);
+    check(eng.testLowerBound() === 3, "vertical RBR lower bound missed", {
+        lower: eng.testLowerBound(),
+    });
+
+    // Fixed point: B proves both R cells; their now-permanent columns prove
+    // both outer G cells in the following wave.
+    const cascade = empty();
+    cascade[0][0] = 4;
+    cascade[1][0] = 1;
+    cascade[2][0] = 2;
+    cascade[3][0] = 1;
+    cascade[4][0] = 4;
+    cascade[5][0] = cascade[5][1] = 3;
+    setIOBoard(cascade);
+    check(eng.testLowerBound() === 5, "separator fixed point did not cascade", {
+        lower: eng.testLowerBound(),
+    });
+
+    // A color-disjoint slab with no legal pair is immutable even without a
+    // singleton seed. The left 2x2 checkerboard can never interact with the
+    // two active one-color slabs on its right.
+    const island = empty();
+    island[0][0] = 1; island[0][1] = 2;
+    island[1][0] = 2; island[1][1] = 1;
+    island[2][0] = island[2][1] = 3;
+    island[3][0] = island[3][1] = 4;
+    setIOBoard(island);
+    check(eng.testLowerBound() === 4, "immutable disjoint slab was not proved", {
+        lower: eng.testLowerBound(),
+    });
+    check(eng.setBoard() === 2, "immutable-slab fixture has wrong root count");
+    roots = collectResults().roots;
+    check(roots.every((root) => root.best === 4 && root.exact),
+        "immutable-slab roots were not intrinsically proven", roots);
+
+    // The same slab proof must run for large roots even when no color is a
+    // singleton. Every child still has 40 cells, beyond the late-beam gate.
+    const largeIsland = empty();
+    largeIsland[0][0] = 1; largeIsland[0][1] = 2;
+    largeIsland[1][0] = 2; largeIsland[1][1] = 1;
+    for (let col = 2; col < SIZE; col++) {
+        const color = 3 + (col - 2) % 3;
+        for (let row = 0; row < 4; row++) largeIsland[col][row] = color;
+    }
+    setIOBoard(largeIsland);
+    check(eng.setBoard() === 10, "large immutable-slab fixture has wrong root count");
+    roots = collectResults().roots;
+    check(roots.every((root, k) => root.best === 4 && root.exact && eng.getRootLower(k) === 4),
+        "large no-singleton slab roots were not proved at setup", roots);
+
+    // Counterexamples to naive isolation: the separator is removable, so
+    // horizontal column closure or vertical fall joins and clears the R pair.
+    const closes = empty();
+    closes[0][0] = 1;
+    closes[1][0] = closes[1][1] = 2;
+    closes[2][0] = 1;
+    setIOBoard(closes);
+    check(eng.testLowerBound() === 0, "removable horizontal separator was treated as permanent");
+    eng.setBoard();
+    roots = collectResults().roots;
+    check(roots.length === 1 && roots[0].best === 0 && roots[0].exact,
+        "horizontal mergeable counterexample no longer clears", roots);
+
+    const falls = empty();
+    falls[0][0] = 1;
+    falls[0][1] = falls[0][2] = 2;
+    falls[0][3] = 1;
+    setIOBoard(falls);
+    check(eng.testLowerBound() === 0, "removable vertical separator was treated as permanent");
+    eng.setBoard();
+    roots = collectResults().roots;
+    check(roots.length === 1 && roots[0].best === 0 && roots[0].exact,
+        "vertical mergeable counterexample no longer clears", roots);
+
+    // Exhaust every normalized board up to 3x3 with three colors. A shared
+    // brute-force memo covers the entire reachable state family cheaply.
+    const columns = [];
+    for (let height = 1; height <= 3; height++) {
+        const make = (prefix) => {
+            if (prefix.length === height) { columns.push(prefix); return; }
+            for (let color = 1; color <= 3; color++) make([...prefix, color]);
+        };
+        make([]);
+    }
+    const memo = new Map();
+    const brute = (position) => {
+        let key = "";
+        for (let col = 0; col < 3; col++) {
+            for (let row = 0; row < 3; row++) key += String.fromCharCode(48 + position[col][row]);
+        }
+        const cached = memo.get(key);
+        if (cached !== undefined) return cached;
+        const groups = enumerateGroups(position);
+        if (groups.length === 0) {
+            const value = remainingOf(position);
+            memo.set(key, value);
+            return value;
+        }
+        let value = Infinity;
+        for (const group of groups) {
+            const child = clonePosition(position);
+            removeGroup(child, group.cells);
+            value = Math.min(value, brute(child));
+        }
+        memo.set(key, value);
+        return value;
+    };
+
+    let checked = 0;
+    let violation = null;
+    const enumerateBoards = (chosen, width) => {
+        if (violation) return;
+        if (chosen.length === width) {
+            const position = empty();
+            for (let col = 0; col < width; col++) {
+                for (let row = 0; row < chosen[col].length; row++) position[col][row] = chosen[col][row];
+            }
+            setIOBoard(position);
+            const lower = eng.testLowerBound();
+            const optimum = brute(position);
+            checked++;
+            if (lower > optimum) violation = { chosen, lower, optimum };
+            return;
+        }
+        for (const column of columns) enumerateBoards([...chosen, column], width);
+    };
+    for (let width = 0; width <= 3; width++) enumerateBoards([], width);
+    check(checked === 60_880, "separator exhaustive corpus incomplete", { checked });
+    check(violation === null, "separator lower bound exceeded exact optimum", violation);
+});
+
 suite("value solver: exact per-move values from one shared enumeration", () => {
     const rnd = mulberry32(60451);
 
@@ -556,6 +717,63 @@ suite("root-locked passes improve only their move", () => {
     }
     for (const r of after) {
         check(replayLine(position, r.line) === r.best, "line broken after locked pass", { rep: r.rep });
+    }
+});
+
+suite("permanent-only portfolio crosses temporary fragmentation", () => {
+    // Supplied game at move 25, compact columns bottom-up. Every tuned beam
+    // stalls above zero because the clearing line is temporarily fragmented;
+    // the orthogonal permanent-only member must retain and replay that line.
+    const compact = [
+        "5424343", "54", "534", "552444", "515141",
+        "12342443225", "313245151", "342415341", "353121411211",
+    ];
+    const position = Array.from({ length: SIZE }, (_, col) =>
+        Array.from({ length: SIZE }, (_, row) => Number(compact[col]?.[row] ?? 0)));
+    setIOBoard(position);
+    eng.setBoard();
+    let roots = collectResults().roots;
+    const k = roots.findIndex((root) => root.rep === 62); // FC
+    check(k >= 0, "move-25 clearing root FC is missing");
+    if (k < 0) return;
+
+    // Mirror the worker stages up through width 512, then its bounded
+    // score-ordered portfolio audit.
+    let seed = 1;
+    for (let root = 0; root < roots.length; root++) {
+        eng.playoutRoot(root, 32, seed);
+        eng.playoutRootSoft(root, 4, seed);
+        seed += 32;
+    }
+    for (const width of [8, 32, 128, 512]) {
+        eng.beamBegin(width, 0);
+        while (eng.beamStep(400_000) === 0) { /* complete pass */ }
+    }
+    roots = collectResults().roots;
+    const ordered = roots.map((root, index) => ({ ...root, index }))
+        .sort((a, b) => a.best - b.best || b.size - a.size || a.rep - b.rep);
+    const candidates = ordered.filter((root) => !root.exact &&
+        eng.getRootLower(root.index) === 0).slice(0, 2);
+    check(ordered[0].best <= 5 && candidates.some((root) => root.index === k),
+        "move-25 clear fell outside the bounded worker portfolio", ordered);
+    for (const candidate of candidates) {
+        eng.beamBeginRootPermanent(candidate.index, 8192);
+        while (eng.beamStep(400_000) === 0) { /* run complementary pass */ }
+        if (collectResults().roots.some((root) => root.best === 0)) break;
+    }
+    roots = collectResults().roots;
+    check(roots[k].best === 0 && roots[k].exact,
+        "permanent-only portfolio missed the move-25 clear", roots[k]);
+    check(replayLine(position, roots[k].line) === 0,
+        "move-25 portfolio line does not replay to a clean board", roots[k]);
+
+    // The admissible separator bound must stay zero along this solution; the
+    // original miss is heuristic focusing, not an unsound permanent prune.
+    const replay = clonePosition(position);
+    for (const cell of roots[k].line) {
+        setIOBoard(replay);
+        check(eng.testLowerBound() === 0, "clear line received a positive permanent bound", { cell });
+        removeGroup(replay, extractGroup(replay, fieldOf(cell)));
     }
 });
 

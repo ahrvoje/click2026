@@ -248,7 +248,16 @@ export async function createGpu() {
 
     let device;
     try {
-        const adapter = await navigator.gpu.requestAdapter();
+        // A hint only—the browser retains final adapter choice—but preferable
+        // for an explicitly enabled analysis engine. Fall back for browsers
+        // that cannot satisfy or do not recognize the preference.
+        let adapter = null;
+        try {
+            adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+        } catch {
+            // Older implementations may reject an unknown options member.
+        }
+        if (!adapter) adapter = await navigator.gpu.requestAdapter();
         if (!adapter) return null;
         device = await adapter.requestDevice();
     } catch {

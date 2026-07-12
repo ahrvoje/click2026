@@ -40,6 +40,8 @@ const TT_WAYS: i32 = 4;
 const TT_SETS: i32 = TT_CAP / TT_WAYS;
 const TT_SET_MASK: i32 = TT_SETS - 1;
 const EXACT_STACK: i32 = 80;        // exact solver DFS depth bound
+const PERMANENT_BEAM_REMAINING: i32 = 30; // separator-rich region for heuristic scans
+const PERMANENT_EXACT_REMAINING: i32 = 8;  // recompute once when a path enters this late zone
 
 const NO_EDGE: u32 = 0xFFFFFFFF;
 const NO_SCORE: i32 = 0x7FFFFFFF;
@@ -47,8 +49,8 @@ const TABU_WEIGHT: i32 = 8;          // non-tabu groups are favored, never force
 
 // evaluation weights (see docs/ENGINE.md "Evaluation function"); tunable via
 // setWeights, defaults tuned with tools/engine.tune.mjs on 2026-07-11:
-// 56/60 random boards cleared, mean 0.27 cells left under the live schedule
-let W_DEAD: f32 = 6.0;              // cells of a color with exactly one cell left — stuck forever
+// 55/60 random boards cleared, mean 0.20 left under the validation schedule
+let W_DEAD: f32 = 6.0;              // cells proved permanently unremovable
 let W_SINGLE: f32 = 2.0;            // size-1 components of otherwise pairable colors
 let W_FRAG: f32 = 0.6;              // extra components per color beyond the first
 let W_FROZEN: f32 = 0.5;            // cells of a "frozen" color: >= 2 cells but no playable pair
@@ -74,6 +76,16 @@ const REP_COLORS = new StaticArray<u8>(MAX_ROOTS);
 const REP_SIZES = new StaticArray<u8>(MAX_ROOTS);
 const REP_OFFSETS = new StaticArray<u8>(MAX_ROOTS);
 const ENUM_CELLS = new StaticArray<u8>(CELLS);
+
+// Sound permanent-cell lower-bound scratch. Globally singleton colors seed
+// FORCED_CELL; fixed-point separator rules can prove additional cells stuck.
+const FORCED_CELL = new StaticArray<u8>(CELLS);
+const POT_COLOR_LAST = new StaticArray<u8>(COLORS + 1);
+const POT_ROW_MASK = new StaticArray<u16>(CELLS);
+const POT_COL_FORCED = new StaticArray<u8>(SIZE);
+const POT_COL_COLOR_ROWS = new StaticArray<u16>(SIZE * (COLORS + 1));
+const POT_COLORS = new StaticArray<u8>(SIZE);
+const POT_SUFFIX_COLORS = new StaticArray<u8>(SIZE + 1);
 
 // beam arenas — two banks flipped between layers
 const BOARDS_A = new StaticArray<u8>(MAX_WIDTH * CELLS);
@@ -125,6 +137,8 @@ const EX_COUNT = new StaticArray<i32>(EXACT_STACK);
 const EX_CURSOR = new StaticArray<i32>(EXACT_STACK);
 const EX_MOVE = new StaticArray<u8>(EXACT_STACK);
 const EX_LINE = new StaticArray<u8>(LINE_MAX);
+const EX_CHILD_LOWER = new StaticArray<u8>(EXACT_STACK * MAX_ROOTS);
+const EX_REMAINING = new StaticArray<u8>(EXACT_STACK);
 const TT_KEY = new StaticArray<u64>(TT_CAP);
 const TT_STAMP = new StaticArray<u32>(TT_CAP);
 
@@ -135,6 +149,10 @@ const TT_STAMP = new StaticArray<u32>(TT_CAP);
 // @ts-ignore: decorator is valid AssemblyScript
 @inline
 function pu8(arr: StaticArray<u8>): usize { return changetype<usize>(arr); }
+
+// @ts-ignore
+@inline
+function pu16(arr: StaticArray<u16>): usize { return changetype<usize>(arr); }
 
 // @ts-ignore
 @inline
@@ -367,10 +385,204 @@ function applyEnumeratedMove(bd: usize, g: i32): i32 {
 let evalRemaining: i32 = 0;
 let evalHash: u64 = 0;
 let evalHasMoves: bool = false;
+let evalLower: i32 = 0;
 
 const colorTotal = new StaticArray<i32>(COLORS + 1);
 const colorComps = new StaticArray<i32>(COLORS + 1);
 const colorHasPair = new StaticArray<i32>(COLORS + 1);
+
+// A slab separated by color-disjoint cuts cannot ever interact with outside
+// columns. If it has no legal pair now, no move can change it, so every cell
+// in the slab is permanent. Returns newly marked cells.
+function seedImmutableSlab(bd: usize, firstCol: i32, lastCol: i32): i32 {
+    let hasPair = false;
+    for (let col = firstCol; col <= lastCol && !hasPair; col++) {
+        for (let row = 0; row < SIZE; row++) {
+            const cell = col * SIZE + row;
+            const color = cellAt(bd, cell);
+            if (color == 0) break;
+            if (row > 0 && cellAt(bd, cell - 1) == color) { hasPair = true; break; }
+            if (col > firstCol && cellAt(bd, cell - SIZE) == color) { hasPair = true; break; }
+        }
+    }
+    if (hasPair) return 0;
+
+    let added = 0;
+    for (let col = firstCol; col <= lastCol; col++) {
+        for (let row = 0; row < SIZE; row++) {
+            const cell = col * SIZE + row;
+            if (cellAt(bd, cell) == 0) break;
+            if (!unchecked(FORCED_CELL[cell])) {
+                unchecked(FORCED_CELL[cell] = 1);
+                added++;
+            }
+        }
+    }
+    return added;
+}
+
+// Strengthens the globally-singleton lower bound to a fixed point of cells
+// separated by already-proven permanent blockers. `colorTotal` must describe
+// bd on entry. Every returned cell is impossible to remove under any future
+// sequence, so the count is admissible for exact pruning.
+//
+// A cell's possible future rows are over-approximated by [number of forced
+// cells below, current row]. Vertical order is invariant; horizontally, a
+// column containing a forced cell can never disappear. If no same-color cell
+// can possibly touch through those row intervals and barriers, the cell is
+// permanent too. Batched iteration derives R-B-R sandwiches, permanent-wall
+// partitions, height mismatches and multi-wave cascades without circular
+// reasoning.
+function permanentLower(bd: usize): i32 {
+    memory.fill(pu8(FORCED_CELL), 0, CELLS);
+    memory.fill(pu8(POT_COLOR_LAST), 0, COLORS + 1);
+    memory.fill(pu8(POT_COLORS), 0, SIZE);
+
+    let columns = 0;
+    for (let col = 0; col < SIZE; col++) {
+        if (cellAt(bd, col * SIZE) == 0) break;
+        let colors: u8 = 0;
+        for (let row = 0; row < SIZE; row++) {
+            const cell = col * SIZE + row;
+            const color = <i32>cellAt(bd, cell);
+            if (color == 0) break;
+            unchecked(POT_COLOR_LAST[color] = <u8>cell);
+            colors |= <u8>(<u32>1 << <u32>color);
+        }
+        unchecked(POT_COLORS[col] = colors);
+        columns++;
+    }
+
+    let forced = 0;
+    for (let color = 1; color <= COLORS; color++) {
+        if (unchecked(colorTotal[color]) == 1) {
+            const cell = <i32>unchecked(POT_COLOR_LAST[color]);
+            unchecked(FORCED_CELL[cell] = 1);
+            forced++;
+        }
+    }
+
+    // Color-disjoint cuts define independent slabs. A slab with no legal
+    // pair is immutable and supplies permanent seeds even when no color is
+    // globally singleton (for example a checkerboard terminal island).
+    if (columns > 0) {
+        unchecked(POT_SUFFIX_COLORS[columns] = 0);
+        for (let col = columns - 1; col >= 0; col--) {
+            unchecked(POT_SUFFIX_COLORS[col] =
+                unchecked(POT_SUFFIX_COLORS[col + 1]) | unchecked(POT_COLORS[col]));
+        }
+        let first = 0;
+        let left: u8 = 0;
+        for (let col = 0; col < columns - 1; col++) {
+            left |= unchecked(POT_COLORS[col]);
+            if ((left & unchecked(POT_SUFFIX_COLORS[col + 1])) == 0) {
+                forced += seedImmutableSlab(bd, first, col);
+                first = col + 1;
+                left = 0;
+            }
+        }
+        forced += seedImmutableSlab(bd, first, columns - 1);
+    }
+
+    if (forced == 0) return 0;
+
+    for (;;) {
+        memory.fill(pu8(POT_COL_FORCED), 0, SIZE);
+        memory.fill(pu16(POT_COL_COLOR_ROWS), 0, SIZE * (COLORS + 1) * sizeof<u16>());
+
+        // A surviving cell can only fall from its current row to the number
+        // of already-forced cells below it. ROW_MASK over-approximates every
+        // future row it may occupy. A forced cell makes its column permanent.
+        for (let col = 0; col < SIZE; col++) {
+            let forcedBelow = 0;
+            for (let row = 0; row < SIZE; row++) {
+                const cell = col * SIZE + row;
+                const color = <i32>cellAt(bd, cell);
+                if (color == 0) break;
+                const high = (<u32>1 << <u32>(row + 1)) - 1;
+                const low = (<u32>1 << <u32>forcedBelow) - 1;
+                const rows = <u16>(high ^ low);
+                unchecked(POT_ROW_MASK[cell] = rows);
+                const at = col * (COLORS + 1) + color;
+                unchecked(POT_COL_COLOR_ROWS[at] = unchecked(POT_COL_COLOR_ROWS[at]) | rows);
+                if (unchecked(FORCED_CELL[cell]) == 1) {
+                    unchecked(POT_COL_FORCED[col] = 1);
+                    forcedBelow++;
+                }
+            }
+        }
+
+        let pending = 0;
+        for (let col = 0; col < SIZE; col++) {
+            if (cellAt(bd, col * SIZE) == 0) break;
+            for (let row = 0; row < SIZE; row++) {
+                const cell = col * SIZE + row;
+                const color = <i32>cellAt(bd, cell);
+                if (color == 0) break;
+                if (unchecked(FORCED_CELL[cell]) != 0) continue;
+
+                let canTouch = false;
+
+                // Vertical order is invariant. The first forced cell remains
+                // a possible neighbor itself, but permanently blocks beyond.
+                for (let otherRow = row - 1; otherRow >= 0; otherRow--) {
+                    const other = col * SIZE + otherRow;
+                    if (<i32>cellAt(bd, other) == color) { canTouch = true; break; }
+                    if (unchecked(FORCED_CELL[other]) == 1) break;
+                }
+                if (!canTouch) {
+                    for (let otherRow = row + 1; otherRow < SIZE; otherRow++) {
+                        const other = col * SIZE + otherRow;
+                        if (cellAt(bd, other) == 0) break;
+                        if (<i32>cellAt(bd, other) == color) { canTouch = true; break; }
+                        if (unchecked(FORCED_CELL[other]) == 1) break;
+                    }
+                }
+
+                // Non-permanent columns may disappear while order stays
+                // stable. Row-range overlap is necessary for a horizontal
+                // pair. The first permanent column is reachable; none beyond
+                // it can ever become adjacent to this cell's column.
+                if (!canTouch) {
+                    for (let otherCol = col - 1; otherCol >= 0; otherCol--) {
+                        const at = otherCol * (COLORS + 1) + color;
+                        if ((unchecked(POT_COL_COLOR_ROWS[at]) & unchecked(POT_ROW_MASK[cell])) != 0) {
+                            canTouch = true;
+                            break;
+                        }
+                        if (unchecked(POT_COL_FORCED[otherCol])) break;
+                    }
+                }
+                if (!canTouch) {
+                    for (let otherCol = col + 1; otherCol < SIZE; otherCol++) {
+                        if (cellAt(bd, otherCol * SIZE) == 0) break;
+                        const at = otherCol * (COLORS + 1) + color;
+                        if ((unchecked(POT_COL_COLOR_ROWS[at]) & unchecked(POT_ROW_MASK[cell])) != 0) {
+                            canTouch = true;
+                            break;
+                        }
+                        if (unchecked(POT_COL_FORCED[otherCol])) break;
+                    }
+                }
+
+                // Mark only after all cells in this wave have been tested;
+                // pending deductions cannot justify one another cyclically.
+                if (!canTouch) {
+                    unchecked(FORCED_CELL[cell] = 2);
+                    pending++;
+                }
+            }
+        }
+
+        if (pending == 0) break;
+        for (let cell = 0; cell < CELLS; cell++) {
+            if (unchecked(FORCED_CELL[cell]) == 2) unchecked(FORCED_CELL[cell] = 1);
+        }
+        forced += pending;
+    }
+
+    return forced;
+}
 
 // heuristic value of a board, lower is better; fills evalRemaining, evalHash
 // and evalHasMoves as side products of the same scan
@@ -431,21 +643,25 @@ function evalBoard(bd: usize, noiseSeed: u32): f32 {
     evalHash = hash;
     evalHasMoves = hasMoves;
 
-    let dead = 0;   // colors reduced to a single cell — that cell is stuck forever
+    let singletonColors = 0;
     let frag = 0;   // components beyond the first, per color
     let frozen = 0; // cells of colors with >= 2 cells but no playable pair anywhere:
                     // only a gravity merge can save them, most end up as leftovers
     for (let c = 1; c <= COLORS; c++) {
         const total = unchecked(colorTotal[c]);
-        if (total == 1) dead++;
+        if (total == 1) singletonColors++;
         else if (total > 1 && !unchecked(colorHasPair[c])) frozen += total;
         const comps = unchecked(colorComps[c]);
         if (comps > 1) frag += comps - 1;
     }
 
+    const forced = remaining <= PERMANENT_BEAM_REMAINING
+        ? permanentLower(bd) : singletonColors;
+    evalLower = forced;
+
     let value = <f32>remaining
-        + W_DEAD * <f32>dead
-        + W_SINGLE * <f32>(singles - dead)
+        + W_DEAD * <f32>forced
+        + W_SINGLE * <f32>(singles - forced)
         + W_FRAG * <f32>frag
         + W_FROZEN * <f32>frozen;
 
@@ -487,6 +703,10 @@ let nodesExpanded: u64 = 0;
 // beam pass state
 let passWidth: i32 = 0;
 let passNoise: u32 = 0;
+let savedSingleWeight: f32 = 0.0;
+let savedFragWeight: f32 = 0.0;
+let savedFrozenWeight: f32 = 0.0;
+let beamWeightsSwapped: bool = false;
 let passActive: bool = false;
 let curArena: i32 = 0;              // 0 -> bank A is the current layer
 let curCount: i32 = 0;
@@ -531,7 +751,7 @@ function setNxtRemaining(i: i32, remaining: i32): void {
 // ---------------------------------------------------------------------------
 
 // ROOT_BEST is always backed by a replayable line. If it meets the admissible
-// dead-color bound of that root child, the two bounds coincide and the move
+// permanent-cell bound of that root child, the two bounds coincide and the move
 // is proven without enumerating its subtree (in particular, every clear is
 // self-proving).
 // @ts-ignore
@@ -618,6 +838,9 @@ export function ioPtr(): usize {
 // reads a 144-byte column-major board from IO, resets all analysis state,
 // enumerates root moves; returns the number of legal moves
 export function setBoard(): i32 {
+    // A stale worker job may abandon a portfolio pass between beam slices.
+    // Restore the tuned objective before initializing the new position.
+    restoreBeamWeights();
     memory.copy(pu8(ROOT_BOARD), pu8(IO), CELLS);
     nodesExpanded = 0;
     passActive = false;
@@ -628,15 +851,6 @@ export function setBoard(): i32 {
     passWidth = 0;
     rootRemaining = boardRemaining(pu8(ROOT_BOARD));
 
-    // Counts change only through removals; collapse preserves them. Derive
-    // every root child's singleton-color lower bound without materializing
-    // the child board.
-    for (let c = 0; c <= COLORS; c++) unchecked(colorTotal[c] = 0);
-    for (let cell = 0; cell < CELLS; cell++) {
-        const c = <i32>cellAt(pu8(ROOT_BOARD), cell);
-        unchecked(colorTotal[c] = unchecked(colorTotal[c]) + 1);
-    }
-
     rootCount = enumerateGroups(pu8(ROOT_BOARD));
     let cellsOff = 0;
     for (let k = 0; k < rootCount; k++) {
@@ -646,15 +860,6 @@ export function setBoard(): i32 {
         unchecked(ROOT_BEST[k] = NO_SCORE);
         unchecked(ROOT_EXACT[k] = 0);
         unchecked(ROOT_LINE_LEN[k] = 0);
-
-        let lower = 0;
-        const removedColor = <i32>unchecked(ROOT_COLOR[k]);
-        const removed = <i32>unchecked(ROOT_SIZE[k]);
-        for (let c = 1; c <= COLORS; c++) {
-            const after = unchecked(colorTotal[c]) - (c == removedColor ? removed : 0);
-            if (after == 1) lower++;
-        }
-        unchecked(ROOT_LOWER[k] = <u8>lower);
 
         // store the group cells for UI outlines (groups are disjoint)
         const size = floodFill(pu8(ROOT_BOARD), <i32>unchecked(ROOT_REP[k]));
@@ -668,6 +873,9 @@ export function setBoard(): i32 {
     for (let k = 0; k < rootCount; k++) {
         memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
         applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
+        scanExactStats(pu8(PLAYOUT_BOARD));
+        strengthenExactStats(pu8(PLAYOUT_BOARD));
+        unchecked(ROOT_LOWER[k] = <u8>statLower);
         greedyRollout(k);
     }
 
@@ -685,7 +893,17 @@ export function getRootLower(root: i32): i32 {
     return <i32>unchecked(ROOT_LOWER[root]);
 }
 
+function restoreBeamWeights(): void {
+    if (!beamWeightsSwapped) return;
+    W_SINGLE = savedSingleWeight;
+    W_FRAG = savedFragWeight;
+    W_FROZEN = savedFrozenWeight;
+    beamWeightsSwapped = false;
+}
+
 export function setWeights(dead: f32, single: f32, frag: f32, frozen: f32, noise: f32): void {
+    restoreBeamWeights();
+    passActive = false; // changing an objective invalidates any retained beam heap
     W_DEAD = dead;
     W_SINGLE = single;
     W_FRAG = frag;
@@ -746,7 +964,7 @@ function dedupInsert(hash: u64): bool {
     return true; // table region saturated — allow potential duplicate
 }
 
-// pass setup shared by beamBegin/beamBeginRoot; onlyRoot -1 = all root moves
+// Pass setup shared by beam entry points; onlyRoot -1 = all root moves.
 function beamInit(width: i32, noiseSeed: u32, onlyRoot: i32): void {
     if (width > MAX_WIDTH) width = MAX_WIDTH;
     passWidth = width;
@@ -789,18 +1007,39 @@ function beamInit(width: i32, noiseSeed: u32, onlyRoot: i32): void {
 
 // starts an anytime pass; noiseSeed 0 = deterministic, else stochastic variant
 export function beamBegin(width: i32, noiseSeed: u32): void {
+    restoreBeamWeights();
     beamInit(width, noiseSeed, -1);
 }
 
 // root-locked pass: the whole beam explores only the subtree of root move k,
 // deepening the most promising candidates instead of re-searching everything
 export function beamBeginRoot(k: i32, width: i32, noiseSeed: u32): void {
+    restoreBeamWeights();
     beamInit(width, noiseSeed, k >= 0 && k < rootCount ? k : -1);
+}
+
+// Orthogonal root-locked member for near-clear positions. It ranks by cells
+// remaining plus the admissible permanent-cell bound only, allowing temporary
+// fragmentation/frozen mass that every tuned-policy beam would discard.
+export function beamBeginRootPermanent(k: i32, width: i32): void {
+    restoreBeamWeights();
+    savedSingleWeight = W_SINGLE;
+    savedFragWeight = W_FRAG;
+    savedFrozenWeight = W_FROZEN;
+    W_SINGLE = 0.0;
+    W_FRAG = 0.0;
+    W_FROZEN = 0.0;
+    beamWeightsSwapped = true;
+    beamInit(width, 0, k >= 0 && k < rootCount ? k : -1);
+    if (!passActive) restoreBeamWeights();
 }
 
 // expands up to `budget` child evaluations; returns 1 when the pass is finished
 export function beamStep(budget: i32): i32 {
-    if (!passActive) return 1;
+    if (!passActive) {
+        restoreBeamWeights();
+        return 1;
+    }
 
     let spent = 0;
 
@@ -809,6 +1048,7 @@ export function beamStep(budget: i32): i32 {
             // layer exhausted — promote heap survivors to the next layer
             if (heapSize == 0) {
                 passActive = false;
+                restoreBeamWeights();
                 return 1;
             }
 
@@ -830,6 +1070,7 @@ export function beamStep(budget: i32): i32 {
             if (edgeCount + passWidth + 8 >= EDGE_MAX) {
                 // edge arena nearly full — end the pass cleanly (should not happen)
                 passActive = false;
+                restoreBeamWeights();
                 return 1;
             }
             continue;
@@ -870,6 +1111,10 @@ export function beamStep(budget: i32): i32 {
                 reportTerminal(nodeRoot, evalRemaining, nodeEdge, move);
                 continue;
             }
+
+            // Unlike the heuristic evaluation, this forced-cell lower bound
+            // is permanent. The subtree cannot strictly improve its root.
+            if (evalLower >= unchecked(ROOT_BEST[nodeRoot])) continue;
 
             // beam admission: quick reject against the current worst
             if (heapSize >= passWidth &&
@@ -1094,8 +1339,9 @@ export function seedLine(len: i32): i32 {
     return final;
 }
 
-// warm start: restores a proof flag from a cached analysis of this very board;
-// only applies when the root's current best equals the remembered proven score
+// Warm start: restores a proof flag from a cached exact value for this root
+// child (either the same analysis board or a composed one-ply child cache).
+// Only applies when the replayed best equals the remembered proven score.
 export function seedExactByCell(cell: i32, score: i32): i32 {
     for (let k = 0; k < rootCount; k++) {
         if (<i32>unchecked(ROOT_REP[k]) == cell) {
@@ -1134,6 +1380,7 @@ let ttStamp: u32 = 0;
 
 let statRemaining: i32 = 0;
 let statLower: i32 = 0;
+let statSingletonLower: i32 = 0;
 let statHash: u64 = 0;
 
 // One board pass for the three exact-search side products that used to be
@@ -1151,13 +1398,20 @@ function scanExactStats(bd: usize): void {
             hash ^= unchecked(ZOB[cell * COLORS + c - 1]);
         }
     }
-    let lower = 0;
+    let singletonLower = 0;
     for (let c = 1; c <= COLORS; c++) {
-        if (unchecked(colorTotal[c]) == 1) lower++;
+        if (unchecked(colorTotal[c]) == 1) singletonLower++;
     }
     statRemaining = remaining;
-    statLower = lower;
+    statSingletonLower = singletonLower;
+    statLower = singletonLower;
     statHash = hash;
+}
+
+// Root scans are rare and seed every descendant, so pay for the full
+// separator fixed point there. Descendants inherit this bound monotonically.
+function strengthenExactStats(bd: usize): void {
+    statLower = permanentLower(bd);
 }
 
 function exPush(bd: usize): void {
@@ -1168,6 +1422,8 @@ function exPush(bd: usize): void {
     memory.copy(pu8(EX_REPS) + <usize>(frame * MAX_ROOTS), pu8(REPS), n);
     unchecked(EX_COUNT[frame] = n);
     unchecked(EX_CURSOR[frame] = 0);
+    unchecked(EX_LOWER[frame] = <u8>statLower);
+    unchecked(EX_REMAINING[frame] = <u8>statRemaining);
     exDepth++;
 }
 
@@ -1212,6 +1468,8 @@ export function exactBegin(budget: i32): void {
         }
     }
 
+    scanExactStats(pu8(ROOT_BOARD));
+    strengthenExactStats(pu8(ROOT_BOARD));
     exPush(pu8(ROOT_BOARD));
 }
 
@@ -1278,6 +1536,12 @@ export function exactStep(chunk: i32): i32 {
 
         // bound: this subtree cannot beat the best known final
         scanExactStats(child);
+        if (statRemaining <= PERMANENT_EXACT_REMAINING &&
+            <i32>unchecked(EX_REMAINING[frame]) > PERMANENT_EXACT_REMAINING) {
+            statLower = permanentLower(child);
+        }
+        const inheritedLower = <i32>unchecked(EX_LOWER[frame]);
+        if (statLower < inheritedLower) statLower = inheritedLower;
         if (statLower >= exBest) continue;
 
         // transposition: skip boards already explored in this search
@@ -1310,6 +1574,8 @@ export function exactBeginChild(k: i32, budget: i32): i32 {
 
     memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
     applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
+    scanExactStats(pu8(PLAYOUT_BOARD));
+    strengthenExactStats(pu8(PLAYOUT_BOARD));
     exPush(pu8(PLAYOUT_BOARD));
     return 1;
 }
@@ -1355,6 +1621,8 @@ export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
 
     memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
     applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
+    scanExactStats(pu8(PLAYOUT_BOARD));
+    strengthenExactStats(pu8(PLAYOUT_BOARD));
     exPush(pu8(PLAYOUT_BOARD));
     return 1;
 }
@@ -1448,10 +1716,17 @@ function vttStore(hash: u64, value: i32, move: i32): void {
     unchecked(VTT_DATA[at] = <u16>(value | (move << 8)));
 }
 
-// pushes a board, or resolves it immediately; returns -1 when pushed,
-// the board's exact value on a memo hit or terminal
-function vsPush(bd: usize): i32 {
+// Pushes a board, resolves it immediately, or proves that it cannot improve
+// an already resolved sibling. Returns -1 when pushed, an exact value on a
+// memo hit/terminal, or CELLS+1 for a safely skipped sibling.
+function vsPush(bd: usize, cutoff: i32, inheritedLower: i32, parentRemaining: i32): i32 {
     scanExactStats(bd);
+    if (statRemaining <= PERMANENT_EXACT_REMAINING &&
+        parentRemaining > PERMANENT_EXACT_REMAINING) {
+        statLower = permanentLower(bd);
+    }
+    if (statLower < inheritedLower) statLower = inheritedLower;
+    if (cutoff != NO_SCORE && statLower >= cutoff) return CELLS + 1;
     const hash = statHash;
     const memo = vttLookup(hash);
     if (memo >= 0) return memo;
@@ -1467,13 +1742,25 @@ function vsPush(bd: usize): i32 {
         return value;
     }
 
-    memory.copy(pu8(EX_REPS) + <usize>(frame * MAX_ROOTS), pu8(REPS), n);
+    // Cheap pre-copy sibling bounds in the existing stable scan order. An
+    // O(n²) ordering experiment reduced nodes but increased total time; keep
+    // the cutoff without paying that per-frame sorting cost.
+    for (let g = 0; g < n; g++) {
+        const color = <i32>unchecked(REP_COLORS[g]);
+        const size = <i32>unchecked(REP_SIZES[g]);
+        const after = unchecked(colorTotal[color]) - size;
+        const singleton = statSingletonLower + (after == 1 ? 1 : 0);
+        const lower = statLower > singleton ? statLower : singleton;
+        unchecked(EX_REPS[frame * MAX_ROOTS + g] = unchecked(REPS[g]));
+        unchecked(EX_CHILD_LOWER[frame * MAX_ROOTS + g] = <u8>lower);
+    }
     unchecked(EX_COUNT[frame] = n);
     unchecked(EX_CURSOR[frame] = 0);
     unchecked(EX_MIN[frame] = NO_SCORE);
     unchecked(EX_BEST_MOVE[frame] = 255);
     unchecked(EX_HASH[frame] = hash);
     unchecked(EX_LOWER[frame] = <u8>statLower);
+    unchecked(EX_REMAINING[frame] = <u8>statRemaining);
     vsDepth++;
     return -1;
 }
@@ -1505,7 +1792,8 @@ export function vsBegin(k: i32, budget: i32): i32 {
     memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
     applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
 
-    const immediate = vsPush(pu8(PLAYOUT_BOARD));
+    const immediate = vsPush(pu8(PLAYOUT_BOARD), NO_SCORE,
+        <i32>unchecked(ROOT_LOWER[k]), 0);
     vsActive = immediate < 0;
     vsPausedRoot = k;
     return immediate;
@@ -1538,6 +1826,10 @@ export function vsStep(chunk: i32): i32 {
             }
 
             unchecked(EX_CURSOR[frame] = cursor + 1);
+            const childLower = <i32>unchecked(EX_CHILD_LOWER[frame * MAX_ROOTS + cursor]);
+            if (unchecked(EX_MIN[frame]) != NO_SCORE && childLower >= unchecked(EX_MIN[frame])) {
+                continue;
+            }
             const child = pu8(EX_BOARDS) + <usize>(vsDepth * CELLS);
             memory.copy(child, pu8(EX_BOARDS) + <usize>(frame * CELLS), CELLS);
             applyMove(child, <i32>unchecked(EX_REPS[frame * MAX_ROOTS + cursor]));
@@ -1545,7 +1837,8 @@ export function vsStep(chunk: i32): i32 {
             spent++;
             nodesExpanded++;
 
-            const value = vsPush(child);
+            const value = vsPush(child, unchecked(EX_MIN[frame]), childLower,
+                <i32>unchecked(EX_REMAINING[frame]));
             if (value >= 0 && value < unchecked(EX_MIN[frame])) {
                 unchecked(EX_MIN[frame] = value);
                 unchecked(EX_BEST_MOVE[frame] = unchecked(EX_REPS[frame * MAX_ROOTS + cursor]));
@@ -1692,6 +1985,14 @@ export function testGroup(cell: i32): i32 {
 export function testHash(): u32 {
     const h = boardHash(pu8(IO));
     return <u32>(h ^ (h >> 32));
+}
+
+// Admissible forced-cell lower bound of the IO board, exposed for exhaustive
+// separator validation in the Node suite.
+export function testLowerBound(): i32 {
+    scanExactStats(pu8(IO));
+    strengthenExactStats(pu8(IO));
+    return statLower;
 }
 
 // one recorded playout on the IO board (no root move); returns final remaining,

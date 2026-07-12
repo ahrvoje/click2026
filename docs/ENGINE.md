@@ -42,8 +42,10 @@ layout, protocols, tuning method, and the reasoning behind each decision.
   score it reports is backed by a concrete line it actually found
   (see "Score semantics" below).
 * A color reduced to exactly **one cell** can never be removed (counts never
-  grow), so it is a permanent +1 on the final result. This is both the core
-  of the evaluation and an admissible lower bound for the exact solver.
+  grow), so it seeds a permanent-cell lower bound. Permanent cells can in
+  turn create permanent columns and vertical barriers; a fixed-point future-
+  touch analysis proves additional `R-B-R`-style leftovers. This bound is
+  used by both heuristic focusing and exact proof.
 
 ## 2. Strategy and tactics (what the engine — and a human — should do)
 
@@ -123,8 +125,11 @@ result table inside the WASM module and posts a snapshot to the UI:
    posted. A new analysis is seeded with the cached lines of its own
    position plus the *suffixes* of the previous position's lines — after the
    player plays move `m`, the rest of `m`'s line is by construction a line
-   of the new position. Every seed is replay-validated inside WASM before
-   being merged (wrong guesses are rejected, never trusted), and cached
+   of the new position. For rewind/general transposition reuse it also
+   materializes each one-ply child; if that child board is cached, its line is
+   prepended with the creating root move. Every seed is replay-validated
+   inside WASM before being merged (wrong guesses are rejected, never
+   trusted), and cached
    proof flags are restored when the seeded score matches. Consequence:
    playing a suggested `0 ★` move can never make the engine "lose" the
    clearing line, and revisiting a position (rewind) restores everything
@@ -132,7 +137,7 @@ result table inside the WASM module and posts a snapshot to the UI:
 1. **Greedy baselines** (`setBoard`): for each legal move, a
    largest-group-first rollout. Instant (~15 ms for 144 cells), guarantees
    every root has a real score before anything else is shown. Each root child
-   also gets an admissible singleton-color lower bound; a baseline that meets
+   also gets an admissible permanent-cell lower bound; a baseline that meets
    it is proven immediately.
 2. **CPU playout portfolio**: 32 hard-tabu random playouts plus 4
    full-support soft-tabu playouts per unproven root (`playoutRoot` and
@@ -151,14 +156,24 @@ result table inside the WASM module and posts a snapshot to the UI:
    about 1.9–2.0 M considered children/s. Proven roots are omitted, and a
    remaining-count lower bound rejects hopeless children before board copy,
    removal, collapse and evaluation.
+   On positions with at most 72 cells whose current best is at most 5, after
+   width 512 and before width 2048, the leading two zero-lower-bound roots
+   also receive one root-private
+   width-8192 **permanent-only portfolio** pass. It ranks only by cells
+   remaining plus proved-permanent cells. This bounded orthogonal objective
+   preserves corridors that temporarily accumulate fragments/frozen colors
+   immediately before a gravity merge, instead of asking random noise to
+   overcome the same scalar bias in every beam.
 4. **Continuous investigation** — ends in exactly three ways: a new
    position arrives, every move is **proven**, or the search is **settled**
    (stagnant at the top of the width ladder on a board too large to
    enumerate) — never by an arbitrary timer:
    * **bigger-group priority**: moves whose group is *larger* than the best-
      scoring move's group but whose score has not yet matched it
-     ("hopefuls") get first claim on locked passes, playout samples and
-     proofs. Rationale: the rating is time-based, and equal outcomes through
+      ("hopefuls") get first claim on locked passes and playout samples.
+      Exact work stays score-first (and therefore size-first on equal scores)
+      so a worse large group cannot monopolize its single retained frontier.
+      Rationale: the rating is time-based, and equal outcomes through
      bigger groups need fewer clicks — when the player sees a `0 ★` on a
      2-group, the engine actively investigates whether the big group
      clears too (ties already rank bigger groups first);
@@ -167,8 +182,9 @@ result table inside the WASM module and posts a snapshot to the UI:
      2048 → 4096 → 8192 → 16384 and its own attempt-seed stream (hopefuls
      first, then the unproven top 5). Even passes search globally with an
      independent seed stream. Once the global tier reaches 16384, a fairness
-     audit gives every unresolved root whose admissible lower bound can beat
-     the incumbent its own width-16384 pass. The engine cannot settle until
+      audit gives every unresolved root whose admissible lower bound can beat
+      the incumbent—or can match a zero incumbent—its own width-16384 pass.
+      The engine cannot settle until
      this audit is complete; a weak-looking winning first move therefore
      cannot be permanently starved by the shared global heap;
    * **objective stagnation escalates width**: global passes start at 512
@@ -182,7 +198,7 @@ result table inside the WASM module and posts a snapshot to the UI:
      soft-tabu supplement when available; otherwise CPU 48+6 samples for
      prioritized moves and 8+1 for the rest);
    * the **exact-proof ladder** (Section 6): full speed once
-     `remaining ≤ 56`, and a background trickle (one chunk per cycle) up to
+     `remaining ≤ 56`, and four chunks (half the full quantum) per cycle up to
      `remaining ≤ 88`. It first tries a 2 M-node incumbent-driven branch and
      bound; if that exhausts, it falls back to the persistent exact-value
      memo. Value retries retain both the DFS frontier and completed entries.
@@ -212,7 +228,7 @@ For a candidate board (computed in one component-labeling scan,
 
 ```
 value = remaining
-      + W_DEAD   · #{colors with exactly 1 cell left}     // stuck forever
+      + W_DEAD   · #{cells proved permanently stuck}      // exact lower bound
       + W_SINGLE · #{size-1 components of live colors}    // probable leftovers
       + W_FRAG   · Σ_colors max(0, components − 1)        // fragmentation
       + W_FROZEN · #{cells of frozen colors}              // hopeless-color mass
@@ -223,11 +239,30 @@ Lower is better. `remaining` rewards progress, the penalties encode
 Section 2. A **frozen** color has ≥ 2 cells but no playable pair anywhere on
 the board — only a lucky gravity merge can save those cells, so each one is
 a probable leftover (`W_FROZEN 0.5`, tuned: 48/60 clears vs 46/60 without).
-Note the asymmetry with the exact solver: frozen cells are *usually* lost
-but not provably (columns can still close and merge them), so this feature
-may only bias the heuristic search — the exact solver's lower bound uses
-dead colors only, which is admissible. The same scan also yields the
-Zobrist hash and terminality for free.
+Frozen cells are *usually* lost but not provably—columns can still close and
+merge them—so that feature remains heuristic-only. The exact lower bound is
+seeded by globally singleton colors. It also detects color-disjoint column
+slabs: if no color occurs outside a slab and the slab has no legal pair, no
+future move can change it, so every cell in it is permanent. From those
+seeds, the analysis repeatedly proves a cell permanent when no same-color
+cell can possibly touch it: vertical order cannot cross a permanent cell, a
+column containing one can never disappear, and possible future row intervals
+must overlap for horizontal contact. Deductions are batched per wave to avoid
+circular reasoning.
+
+This covers horizontal and vertical `R-B-R`, permanent walls, forced-height
+mismatches, and cascades where one dead color proves another color dead. Full
+geometry is evaluated only in separator-rich late beam states; roots are
+always strengthened, and exact descendants inherit the bound with one late
+recomputation. The bound was exhaustively checked against every normalized
+3-color board up to 3×3 (60,880 boards) with no violation. Removable
+separators such as `R-BB-R` remain unpruned and are explicit regressions.
+
+The tuned weights remain the primary policy. The permanent-only portfolio
+sets `W_SINGLE`, `W_FRAG` and `W_FROZEN` effectively to zero for one bounded
+private pass; `W_DEAD` remains because it is admissible. Effective weights
+are selected once at pass setup, so the normal per-node hot path has no policy
+branch. This is deliberately targeted rather than a second global schedule.
 
 Weights are **empirical**, tuned with `npm run tune:engine` (60 fixed random
 boards, full-clear rate as the primary criterion). Grid results, 2026-07-11
@@ -270,18 +305,18 @@ otherwise idle machine.
 
 ## 6. Exact solver
 
-Before any enumeration, each root child gets a permanent-color lower bound:
-the number of colors whose post-move total is exactly one. Color counts can
-only decrease, so those cells can never belong to a legal group. Every stored
-score is a constructive upper bound; equality of the two bounds proves that
-move immediately. Thus a replayable score 0 is self-proving. Proven roots are
-removed from subsequent beam, CPU-playout and GPU-playout work.
+Before any enumeration, each root child gets the permanent-cell lower bound
+described in Section 5. Every stored score is a constructive upper bound;
+equality of the two bounds proves that move immediately. Thus a replayable
+score 0 is self-proving, while separator positions can also prove positive
+scores without enumeration. Proven roots are removed from subsequent beam,
+CPU-playout and GPU-playout work.
 
 Budgeted branch & bound DFS (`exactBegin`/`exactStep`/`exactMerge`):
 
 * upper bound: best line already known from the beams (start value);
-* lower bound (admissible): number of colors with exactly one cell —
-  subtrees whose bound reaches the incumbent are cut;
+* lower bound (admissible): propagated permanent cells plus newly created
+  singleton colors; subtrees whose bound reaches the incumbent are cut;
 * transposition table: 2^20 entries in four-way buckets, keyed by Zobrist
   hash (replacement can cause re-expansion but never an invalid prune);
 * child boards are generated directly in the next explicit-stack frame, and
@@ -323,8 +358,16 @@ first because a good constructive incumbent often makes it orders of
 magnitude cheaper than full values, then uses VTT only after that attempt
 exhausts.
 
-The gates: full-speed proving at `remaining ≤ 56`, a background trickle
-(one chunk per cycle) up to `remaining ≤ 88`. For the heuristic beams above
+Once one sibling has exact value `m`, another child whose sound lower bound
+is already `≥ m` is skipped before board copy. A stronger post-materialization
+check supplies a second cutoff. Skipped children are never memoized as exact;
+the parent remains exact because they cannot improve its resolved minimum.
+Root separator bounds propagate monotonically. Recomputing the geometric
+fixed point at every node reduced nodes but increased time, so it is refreshed
+only once when a path first enters the final eight cells.
+
+The gates: full-speed proving at `remaining ≤ 56`, a half-quantum background
+run (four chunks per cycle) up to `remaining ≤ 88`. For the heuristic beams above
 that, a global seen-set is deliberately NOT used: stochastic passes revisit
 states *on purpose* with different noise and beam context — blocking
 revisits would break diversification, and no memory could come close to
@@ -358,6 +401,15 @@ one thread per playout and one dispatch row per candidate move (≤ 72 children 
 * Because a playout's whole move line is determined by its seed, the GPU
   only ever needs to return 32 bits per candidate — the CPU reconstructs the
   line from the seed when it improves a score.
+* A batch is submitted before its corresponding CPU beam. WASM expands the
+  beam and runs the soft-policy supplement while the device computes, then
+  drains the one in-flight readback before another submission. On the
+  development machine, controlled beam+GPU pairs took 24–41% less combined
+  wall time than sequential execution. The browser is asked for its
+  high-performance adapter (the browser retains the final choice). A stale
+  position releases the CPU immediately while its already-submitted batch
+  finishes; the next position skips GPU submission until the shared buffers
+  are free.
 * WGSL gotchas encountered: `move` and `target` are reserved words; comments
   inside the JS template literal must not contain backticks.
 
@@ -432,7 +484,7 @@ npm run serve             # http://localhost:8123 (any static server works)
 node tools/engine.e2e.mjs [--shot]   # headless end-to-end against the served game
 ```
 
-The compiled `engine.wasm` (~12 KB) is committed, so *playing* needs no
+The compiled `engine.wasm` (~14 KB) is committed, so *playing* needs no
 toolchain — only engine development does. The game itself remains
 dependency-free at runtime.
 
@@ -441,8 +493,16 @@ Current reference numbers (this machine, single core, 2026-07-12):
 ~1.68–1.73 M before the hot-path changes. The medium proof corpus has three
 clear roots proven directly from bound equality (0 enumeration nodes), a
 positive score-1 root proven in ~1.11 M B&B nodes, and a score-3 root in
-~0.20 M nodes. Memo-policy line recovery adds no search nodes. The short
-quality snapshot remains 8/10 full boards cleared with mean 0.2 left.
+~0.20 M nodes. Memo-policy line recovery adds no search nodes. Permanent
+bounds and sibling cutoffs reduced a deterministic 165-position value corpus
+by about 3.9% in nodes in a one-off before/after development run and modestly
+reduced its alternating-run median wall time while preserving opening
+throughput. The short quality snapshot is
+9/10 full boards cleared with mean 0.1 left; the broader 60-board validation
+remains 55/60 with mean 0.20. The move-25 temporary-fragmentation regression
+is proved clear by the complementary member in about 410k considered children
+and 120–130 ms; repeated tuned-policy beams had remained at score 2 beyond
+62 M children.
 
 ## 11. Limitations and future directions
 
@@ -457,22 +517,22 @@ quality snapshot remains 8/10 full boards cleared with mean 0.2 left.
 * **Single-threaded WASM**: SharedArrayBuffer + N worker beams (different
   noise seeds) would scale nearly linearly, at the cost of COOP/COEP
   headers.
-* **Exact lower bound is deliberately conservative** (dead colors only — the
-  sound subset of the hopeless-node ideas). Two promising next reductions are
-  fixed-point permanent-column barriers and exact decomposition at a column
-  cut whose left/right color sets are disjoint. Any connectivity-aware bound
-  must be proved under every future gravity/column-close sequence; unsound
-  shortcuts would corrupt ✓. The heuristic side already uses the
-  unsound-but-useful frozen-color feature (Section 5).
+* **Permanent reachability remains conservative**: the future-touch graph is
+  an over-approximation, so connected cells may still be impossible to join.
+  Exact column-slab canonicalization is sound at proven interaction-free cuts
+  and reduced targeted node counts, but its repeated cut scan did not reduce
+  mixed-corpus wall time and was deliberately not retained.
 * **Symmetry canonicalization is unexploited**: color renaming and reversal of
   the contiguous occupied columns preserve exact value. They may improve VTT
   reuse, but normalization overhead and mirrored policy coordinates should be
   instrumented before adding them to the exact hot path.
-* **Beam eval is local**: no notion of "which color to farm" beyond
-  fragmentation penalties; a color-plan feature (dominant-color
-  connectivity potential) is the most promising strength gain.
-* **GPU underused**: only playouts run there. Layer-parallel beam expansion
-  is possible but the divergent flood fills make it a research project.
+* **Beam eval is still local**: the permanent-only member removes one scalar
+  blind spot, but neither policy models which color to farm. A color-plan
+  feature (dominant-color connectivity potential) remains promising.
+* **GPU scope remains narrow**: playouts now overlap CPU beams, but beam and
+  exact expansion themselves remain single-threaded WASM. Layer-parallel GPU
+  expansion is possible, though divergent flood fills make it a research
+  project.
 * The in-app "Run tests…" dialog runs synchronous tests only; engine tests
   live in Node (`npm run test:engine`) to keep the dialog untouched.
 * UI ideas: preview a row's whole line move-by-move on long-press; a
