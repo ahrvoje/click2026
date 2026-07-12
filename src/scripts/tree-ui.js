@@ -23,14 +23,19 @@ const NODE_H = 18;
 const COL_W = 62;
 const ROW_H = 25;
 const PAD = 6;
+const PANEL_GUTTER = 4;
+const DOUBLE_PRESS_MS = 500;
 
 let container = null;   // scrollable element the SVG is rendered into
 let playColors = null;
 let onSelect = null;
+let onReplay = null;
 
 let lastGame = null;    // rebuild bookkeeping — see update()
 let lastSig = null;
 let lastFocus = null;
+let lastPressedNode = null;
+let lastPressedAt = -Infinity;
 
 // Band layout with no connectors crossing through chains or nodes. Every branch
 // (a chain of first children) occupies one column and every variant subtree a
@@ -80,10 +85,13 @@ export const TreeUI = {
         container = hooks.container;
         playColors = hooks.playColors;
         onSelect = hooks.onSelect;
+        onReplay = hooks.onReplay;
     },
 
     update(game) {
         const focus = game.getFocus();
+        const replayNodes = new Set(game.getReplayNodes());
+        replayNodes.add(game.getRoot());
 
         // engine results arrive at a high rate — skip the rebuild when nothing
         // visible changed, otherwise nodes get replaced mid-press (swallowing
@@ -91,7 +99,8 @@ export const TreeUI = {
         let sig = "";
         const walk = (node) => {
             sig += (node.move === null ? "R" : LETTERS[node.move[0]] + LETTERS[node.move[1]]) +
-                (node.score ?? "") + (node === focus ? "*" : "") + "(";
+                (node.score ?? "") + (node === focus ? "*" : "") +
+                (replayNodes.has(node) ? "!" : "") + "(";
             for (const child of node.children) {
                 walk(child);
             }
@@ -114,10 +123,12 @@ export const TreeUI = {
             maxCol = Math.max(maxCol, col);
         }
 
+        const svgWidth = 2 * PAD + maxCol * COL_W + NODE_W;
         const svg = svgEl("svg", {
-            width: 2 * PAD + maxCol * COL_W + NODE_W,
+            width: svgWidth,
             height: 2 * PAD + maxRow * ROW_H + NODE_H,
         });
+        container.parentElement.style.setProperty("--tree-content-width", `${svgWidth + PANEL_GUTTER}px`);
 
         // when elbows of different parents share a row gap (a rare nested-branch
         // case) each gets its own horizontal lane, so the lines stay apart;
@@ -132,7 +143,10 @@ export const TreeUI = {
             return lane;
         };
 
-        // edges first, so the node boxes paint over them
+        // Edges paint before nodes. Replay edges get a second, later pass so their
+        // shared elbow segments cannot be covered by an ordinary sibling edge.
+        const ordinaryEdges = [];
+        const replayEdges = [];
         for (const [node, { row, col }] of placed) {
             if (node.parent === null) {
                 continue;
@@ -153,8 +167,11 @@ export const TreeUI = {
                 const hy = py + [3.5, 1.75, 5.25][lane];
                 d = `M ${px} ${py} L ${px} ${hy} L ${cx} ${hy} L ${cx} ${cy}`;
             }
-            svg.append(svgEl("path", { class: "treeEdge", d }));
+            const edge = svgEl("path", { class: "treeEdge" + (replayNodes.has(node) ? " replay" : ""), d });
+            (replayNodes.has(node) ? replayEdges : ordinaryEdges).push(edge);
         }
+        ordinaryEdges.forEach((edge) => svg.append(edge));
+        replayEdges.forEach((edge) => svg.append(edge));
 
         let focusPlace = null;
         for (const [node, { row, col }] of placed) {
@@ -187,7 +204,23 @@ export const TreeUI = {
 
             // mousedown, like the board — a rebuild between press and release
             // would swallow a full click
-            g.addEventListener("mousedown", () => onSelect(node));
+            g.addEventListener("mousedown", (event) => {
+                const now = performance.now();
+                let isDoublePress = false;
+                if (event.button === 0) {
+                    isDoublePress = lastPressedNode === node && now - lastPressedAt <= DOUBLE_PRESS_MS;
+                    lastPressedNode = isDoublePress ? null : node;
+                    lastPressedAt = isDoublePress ? -Infinity : now;
+                } else {
+                    lastPressedNode = null;
+                    lastPressedAt = -Infinity;
+                }
+
+                onSelect(node);
+                if (isDoublePress) {
+                    onReplay?.(node);
+                }
+            });
             svg.append(g);
 
             if (node === focus) {

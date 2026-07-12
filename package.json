@@ -9,6 +9,7 @@
     "scripts": {
         "build:engine": "asc asm/engine.ts --outFile src/scripts/engine/engine.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert",
         "test:engine": "npm run build:engine && node tools/engine.test.mjs",
+        "test:tree": "node tools/tree.test.mjs",
         "bench:engine": "npm run build:engine && node tools/engine.bench.mjs",
         "tune:engine": "npm run build:engine && node tools/engine.tune.mjs",
         "serve": "py -m http.server 8123 -d src"

@@ -32,6 +32,7 @@ export class Game {
     #currentPosition = [];
     #root = makeNode(null, null, null);
     #focus = this.#root;
+    #replayTarget = this.#root; // selects a replay route without changing structural child order
     #times = [];        // cumulative ms of the timed prefix of the main line
     #currentMove = 0;   // depth of the focus node
     #startTime = 0;
@@ -61,6 +62,7 @@ export class Game {
             this.#root = makeNode(null, null, null); // moves that do not replay are dropped entirely
         }
         this.#focus = this.#root;
+        this.#replayTarget = this.#root;
 
         const mainLength = this.#mainLineNodes().length;
         this.#times = mainLength > 0 && Array.isArray(gameData.t) ? gameData.t.slice(0, mainLength) : [];
@@ -120,15 +122,25 @@ export class Game {
         return path.reverse();
     }
 
-    // the line shown by the move counter and navigation: the path to the focus,
-    // continued forward along first children (the main line of the focus node)
-    #currentLineNodes() {
-        const line = this.#pathNodes(this.#focus);
-        for (let node = this.#focus; node.children.length > 0; ) {
+    // The replay route is independent of structural child order. It reaches the
+    // selected target, then follows that target's first-child continuation.
+    #replayLineNodes() {
+        const line = this.#pathNodes(this.#replayTarget);
+        for (let node = this.#replayTarget; node.children.length > 0; ) {
             node = node.children[0];
             line.push(node);
         }
         return line;
+    }
+
+    #replaySuccessor(node) {
+        const line = this.#replayLineNodes();
+        if (node === this.#root) {
+            return line[0];
+        }
+
+        const index = line.indexOf(node);
+        return index === -1 ? undefined : line[index + 1];
     }
 
     #recomputePosition() {
@@ -179,8 +191,18 @@ export class Game {
     getStartTime() { return this.#startTime; }
     getRoot() { return this.#root; }
     getFocus() { return this.#focus; }
+    getReplayTarget() { return this.#replayTarget; }
 
-    getMoves() { return this.#currentLineNodes().map((node) => node.move); }
+    getReplayNodes() { return this.#replayLineNodes(); }
+    getMoves() { return this.#replayLineNodes().map((node) => node.move); }
+
+    isFocusOnReplayLine() {
+        return this.#focus === this.#root || this.#replayLineNodes().includes(this.#focus);
+    }
+
+    isReplayOnMainLine() {
+        return this.#replayLineNodes().every((node) => node.parent.children[0] === node);
+    }
 
     // true when the path to the focus follows first children only — the original line
     isFocusOnMainLine() {
@@ -197,6 +219,7 @@ export class Game {
         // manual play starts a fresh recording — the old position tree is discarded here
         this.#root = makeNode(null, null, null);
         this.#focus = this.#root;
+        this.#replayTarget = this.#root;
         this.#times = [];
         this.#currentMove = 0;
         this.#startTime = Date.now();
@@ -213,11 +236,8 @@ export class Game {
     }
 
     getNextMoveGroup() {
-        if (this.#focus.children.length > 0) {
-            return extractGroup(this.#currentPosition, this.#focus.children[0].move);
-        }
-
-        return [];
+        const next = this.#replaySuccessor(this.#focus);
+        return next === undefined ? [] : extractGroup(this.#currentPosition, next.move);
     }
 
     // official time exists only on the timed prefix of the main line — undefined
@@ -300,6 +320,7 @@ export class Game {
         if (child === undefined) {
             child = makeNode(move, color, this.#focus);
             this.#focus.children.push(child);
+            this.#replayTarget = child;
         }
         this.#focus = child;
 
@@ -316,13 +337,12 @@ export class Game {
     }
 
     playNextMove() {
-        if (this.#focus.children.length > 0) {
-            this.playMove(this.#focus.children[0].move);
-        }
+        const next = this.#replaySuccessor(this.#focus);
+        return next === undefined ? false : this.playMove(next.move);
     }
 
     rewindToMove(moveIndex) {
-        const line = this.#currentLineNodes();
+        const line = this.#replayLineNodes();
 
         if (moveIndex < 0 || moveIndex > line.length) {
             return false;
@@ -337,6 +357,18 @@ export class Game {
     focusNode(node) {
         this.#focus = node;
         this.#recomputePosition();
+    }
+
+    // Chooses the replay route through an existing node. The choice is transient:
+    // it never reorders children and therefore never changes official times or links.
+    selectReplayNode(node) {
+        for (let ancestor = node; ancestor !== null; ancestor = ancestor.parent) {
+            if (ancestor === this.#root) {
+                this.#replayTarget = node;
+                return true;
+            }
+        }
+        return false;
     }
 
     // best (lowest) engine evaluation seen for the position at the focus node

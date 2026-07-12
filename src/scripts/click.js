@@ -42,6 +42,7 @@ const BOARD_MARGIN = 5;
 // these values shape the replay timing precision, keep them
 const TIMER_INTERVAL_MS = 17;
 const AUTOPLAY_INTERVAL_MS = 10;
+const UNTIMED_REPLAY_STEP_MS = 500;
 
 // clicks faster than this are treated as one (debounces double-fired events)
 const MIN_DOUBLE_CLICK_MS = 5;
@@ -298,26 +299,43 @@ function processMouseWheel(delta) {
         return;
     }
 
-    // going down the tree follows the main line of the current node (its first child)
+    // both directions navigate the globally selected replay route
     game.rewindToMove(game.getCurrentMove() + (delta < 0 ? 1 : -1));
     refreshInterface();
     onShownPositionChanged();
 }
 
+// Official main-line replay keeps its recorded timestamps. Variant routes have
+// no timing data, so they use a neutral fixed cadence without manufacturing times.
+function replayMoveTime(moveIndex) {
+    return game.isReplayOnMainLine()
+        ? game.getTimes()[moveIndex]
+        : moveIndex * UNTIMED_REPLAY_STEP_MS;
+}
+
+function replayEndMove() {
+    const routeLength = game.getMoves().length;
+    return game.isReplayOnMainLine()
+        ? Math.min(routeLength, game.getTimes().length)
+        : routeLength;
+}
+
 function autoPlayMove() {
     const autoPlayTime = Date.now() - autoPlaySystemStartTime + autoPlayGameStartTime;
-    updateTimer();
+    if (game.isReplayOnMainLine()) {
+        updateTimer();
+    }
 
-    if (autoPlayTime >= game.getTimes()[game.getCurrentMove()]) {
+    if (autoPlayTime >= replayMoveTime(game.getCurrentMove())) {
         game.playNextMove();
         drawAllFields();
+        updateTimeText();
         updateMove();
         updateScore();
         onShownPositionChanged();
     }
 
-    // replay covers only the timed prefix of the main line
-    if (game.getCurrentMove() >= game.getTimes().length) {
+    if (game.getCurrentMove() >= replayEndMove()) {
         stopAutoPlay();
     }
 }
@@ -335,6 +353,15 @@ function selectTreeNode(node) {
     game.focusNode(node);
     refreshInterface();
     onShownPositionChanged();
+}
+
+// A second press on a tree node promotes its route to the one used by replay
+// navigation. This does not alter the original main line or its official times.
+function selectReplayTreeNode(node) {
+    if (game.selectReplayNode(node)) {
+        refreshInterface();
+        TreeUI.update(game);
+    }
 }
 
 //
@@ -393,12 +420,13 @@ export function autoPlay() {
     ensureNavigable();
 
     if (game.getStatus() === Game.Status.Over) {
-        // replay and times exist only for the original (main) playing line
-        if (!game.isFocusOnMainLine() || game.getCurrentMove() >= game.getTimes().length) {
+        if (!game.isFocusOnReplayLine() || game.getCurrentMove() >= replayEndMove()) {
             return;
         }
 
-        autoPlayGameStartTime = game.getCurrentMove() > 0 ? game.getTimes()[game.getCurrentMove() - 1] : 0;
+        autoPlayGameStartTime = game.getCurrentMove() > 0
+            ? replayMoveTime(game.getCurrentMove() - 1)
+            : 0;
 
         el("autoPlayButton").hidden = true;
         el("autoPauseButton").hidden = false;
@@ -507,6 +535,7 @@ export function init() {
         container: el("treeScroll"),
         playColors: colors.playColors,
         onSelect: selectTreeNode,
+        onReplay: selectReplayTreeNode,
     });
 
     canvas.addEventListener("mousedown", onCanvasClick);
@@ -518,4 +547,5 @@ export function init() {
     }, { passive: false });
 
     gameFromString(document.location.search);
+    EngineUI.toggle(); // analysis is on by default; the button still toggles it normally
 }

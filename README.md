@@ -49,13 +49,17 @@ game runs vertically as the main line, alternative tries branch horizontally to 
 Each node shows the color played, the A–L column/row of the clicked block (a group is
 represented by its lowest-leftmost block) and the best engine score seen for that position.
 Clicking a node reloads its position; playing a move that is already in the tree just moves
-the focus, anything new amends the tree. The mouse wheel steps along the current line,
-always following the main continuation downwards.
+the focus, anything new amends the tree. The thicker red connector marks the selected replay
+route. It starts on the vertical main line; double-click any node to route replay through it,
+or play a new branch to select that branch automatically. The mouse wheel and rewind controls
+step along this route. The panel shows five tree columns by default, expands into available
+window space for wider trees, then scrolls horizontally when necessary.
 
 The game clock is strict about what counts: it runs only while a fresh game is played purely
 on the board, and the moment any other control is used (buttons, wheel, engine or tree
 clicks) it stops for good — the times recorded up to then remain the official result.
-Replay and per-move times exist only for the main line; variants show a dash instead.
+Official per-move times exist only for the main line; variants show a dash and autoplay at a
+neutral fixed cadence instead.
 
 Examples & self tests
 ---------------------

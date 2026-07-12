@@ -241,12 +241,14 @@ body {
     }
 }
 
-/* position tree — wide enough for six variant columns; the height is constant:
+/* position tree — five lattice columns wide by default. Wider trees consume spare
+   viewport space before falling back to horizontal scrolling. The height is constant:
    board (310) + start button (32) + status row (36) + buttons (38) + engine
    block (136), so closing the engine panel never hides the bottom of the tree */
 #treePanel {
     position: relative;
-    width: 380px;
+    width: clamp(318px, var(--tree-content-width, 318px), calc(100vw - 620px));
+    flex: 0 0 auto;
     height: 552px;
     background-color: rgb(232 232 232);
 }
@@ -260,6 +262,13 @@ body {
 .treeEdge {
     stroke: rgb(0 0 0 / 0.35);
     fill: none;
+}
+
+.treeEdge.replay {
+    stroke: red;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
 }
 
 .treeNode {
