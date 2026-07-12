@@ -33,7 +33,8 @@ layout, protocols, tuning method, and the reasoning behind each decision.
   transpositions (different orders of "independent" moves often reach the
   same board), which per-depth hashing exploits.
 * Deciding whether a board can be cleared completely (Clickomania) is
-  **NP-complete** even for 2 colors and 5 columns (Biedl et al., 2002).
+  **NP-complete** for 2 columns and 5 colors, or for 5 columns and 3 colors
+  ([Biedl et al.](https://erikdemaine.org/papers/ClickomaniaGameTheory2000/)).
   Exhaustive search of a 144-cell, 5-color start is hopeless: branching is
   20–35 near the start and the state space is astronomically large. An
   engine must therefore be *heuristic and anytime* — but it can still be
@@ -50,8 +51,11 @@ layout, protocols, tuning method, and the reasoning behind each decision.
    backbone. Removing it early splinters the board into color islands.
    Playing the *other* colors first lets gravity merge the dominant color
    into one huge group that is removed late, often clearing whole regions.
-   The engine's playout policy ("tabu color") encodes exactly this: random
-   playouts never click the dominant color while any alternative exists.
+   The engine's playout portfolio encodes this as a strong bias. Most samples
+   never click the dominant post-root color while any alternative exists; a
+   smaller full-support member gives every legal group non-zero probability
+   (non-tabu groups have 8× the weight). The second member matters when a
+   solution must temporarily break the usual strategic rule.
 2. **Never orphan a color.** Leaving a color with a single cell is a
    guaranteed leftover; leaving it with 2–3 scattered cells is a probable
    one. The evaluation punishes "dead" cells hardest, then size-1 fragments.
@@ -84,6 +88,7 @@ canvas + engineList                                    engine.wasm (search core)
 | --- | --- |
 | `asm/engine.ts` | AssemblyScript search core → `src/scripts/engine/engine.wasm` |
 | `src/scripts/engine/worker.js` | anytime scheduler, protocol, GPU orchestration |
+| `src/scripts/engine/schedule.js` | pure, unit-tested stagnation/settlement state transitions |
 | `src/scripts/engine/gpu.js` | WebGPU playout kernel (WGSL) + JS twin helpers |
 | `src/scripts/engine-ui.js` | button state, move list, canvas outlines |
 | `src/scripts/click.js` | position change notifications, redraw hook |
@@ -104,9 +109,9 @@ has found so far starting with that move** — an *achievable upper bound* on
 the true optimum, never a guess. Internally every root move stores its best
 line; the Node suite replays those lines through `board.js` and fails if a
 claimed score does not reproduce. `0 ★` means a full clear is in hand; `✓`
-means the exact solver *proved* the score optimal. Scores only ever improve
-(decrease) while the engine keeps thinking, exactly like a chess engine
-deepening.
+means the score is proved optimal, either by equality with an admissible bound
+or by exact search. Scores only ever improve (decrease) while the engine keeps
+thinking, exactly like a chess engine deepening.
 
 ## 4. Search pipeline (per position)
 
@@ -126,18 +131,26 @@ result table inside the WASM module and posts a snapshot to the UI:
    it ever knew about it instantly.
 1. **Greedy baselines** (`setBoard`): for each legal move, a
    largest-group-first rollout. Instant (~15 ms for 144 cells), guarantees
-   every root has a real score before anything else is shown.
-2. **CPU playout round**: 32 tabu-color random playouts per root
-   (`playoutRoot`). Cheap variance reduction before the beams start.
+   every root has a real score before anything else is shown. Each root child
+   also gets an admissible singleton-color lower bound; a baseline that meets
+   it is proven immediately.
+2. **CPU playout portfolio**: 32 hard-tabu random playouts plus 4
+   full-support soft-tabu playouts per unproven root (`playoutRoot` and
+   `playoutRootSoft`). The original high-quality policy is preserved; the
+   supplement removes its zero-probability blind spot.
 3. **Iterative-widening beam search**: deterministic passes with widths
    8 → 32 → 128 → 512 → 2048. Each pass expands layer by layer (layer *d* =
    boards after *d* moves), keeps the best `width` children per layer by
    evaluation (replace-max heap), dedups transpositions inside a layer via
-   64-bit Zobrist hashes, and reports every terminal reached. Root moves are
-   *all* kept in layer 1 regardless of width, so every move keeps improving.
+   64-bit Zobrist hashes, and reports every terminal reached. All unproven
+   root moves are kept in layer 1 regardless of width. Later layers share a
+   heap, so continuous search also supplies private per-root passes (below)
+   rather than assuming that initial inclusion prevents starvation.
    A pass over a full board costs roughly `width × 60 layers × 25 children`
-   evaluations; at the measured ~1.8 M evals/s the width-512 pass takes
-   ~120 ms, width-2048 ~0.5 s.
+   evaluations; on the development benchmark the optimized core processes
+   about 1.9–2.0 M considered children/s. Proven roots are omitted, and a
+   remaining-count lower bound rejects hopeless children before board copy,
+   removal, collapse and evaluation.
 4. **Continuous investigation** — ends in exactly three ways: a new
    position arrives, every move is **proven**, or the search is **settled**
    (stagnant at the top of the width ladder on a board too large to
@@ -150,28 +163,37 @@ result table inside the WASM module and posts a snapshot to the UI:
      2-group, the engine actively investigates whether the big group
      clears too (ties already rank bigger groups first);
    * alternating passes: odd passes are **root-locked** — the whole beam
-     (width 2048) explores the subtree of a single candidate (hopefuls
-     first, then the unproven top 5); even passes search globally.
-     Deterministic per-board evaluation noise seeded by the pass number
-     makes every pass explore a different corridor;
-   * **stagnation escalates width**: global passes start at 512 and climb
-     512 → 1024 → … → 16384 as passes go by without any score or proof
-     changing (any change resets the ladder). Wider beams are genuinely
-     deeper searches, so stagnation buys exploration instead of repetition;
+     explores one subtree, with that root's private width escalating
+     2048 → 4096 → 8192 → 16384 and its own attempt-seed stream (hopefuls
+     first, then the unproven top 5). Even passes search globally with an
+     independent seed stream. Once the global tier reaches 16384, a fairness
+     audit gives every unresolved root whose admissible lower bound can beat
+     the incumbent its own width-16384 pass. The engine cannot settle until
+     this audit is complete; a weak-looking winning first move therefore
+     cannot be permanently starved by the shared global heap;
+   * **objective stagnation escalates width**: global passes start at 512
+     and climb 512 → 1024 → … → 16384 according to passes without an
+     improvement to the *best position score*. Improvements and proofs in
+     low-ranked rows no longer reset this ladder. Wider beams buy exploration
+     of the objective instead of letting irrelevant tail churn hold the
+     search at a narrow width;
    * every 2nd pass a playout round biased to the displayed moves and the
-     hopefuls (GPU batch of 1024/root when available, else CPU 48 playouts
-     for the prioritized moves, 8 for the rest);
+     hopefuls (GPU batch of 1024 hard-tabu samples/root plus a small CPU
+     soft-tabu supplement when available; otherwise CPU 48+6 samples for
+     prioritized moves and 8+1 for the rest);
    * the **exact-proof ladder** (Section 6): full speed once
      `remaining ≤ 56`, and a background trickle (one chunk per cycle) up to
-     `remaining ≤ 88` — the memo keeps every explored state either way, so
-     this is monotone, never-repeated work. Budgets start at 8 M expansions
-     and escalate ×4 without a cap; a retry resumes at the old frontier.
-     A finished proof marks the row ✓ (and often improves its score via a
-     bound-directed line seek).
+     `remaining ≤ 88`. It first tries a 2 M-node incumbent-driven branch and
+     bound; if that exhausts, it falls back to the persistent exact-value
+     memo. Value retries retain both the DFS frontier and completed entries.
+     Per-attempt budgets escalate ×4 up to the WASM-safe i32 limit, while
+     total progress remains unbounded. A finished proof marks the row ✓.
    Terminal states: **`proven ✓`** — all moves proven, nothing can change,
-   compute stops. **`settled`** — nothing improved for 24 consecutive
-   passes *at maximum width* on a board above the proving gate; the engine
-   stops honestly instead of cycling. Below the gate it never settles:
+   compute stops. **`settled`** — 24 completed, unchanged *global*
+   width-16384 passes on a board above the proving gate, after the private
+   max-width audit described above; locked and submaximal passes do not
+   consume that budget. The engine stops honestly instead of cycling. Below
+   the gate it never settles:
    proofs always land eventually. Scores are maintained as monotone minima,
    so the top list only ever gets more reliable with time; any player move
    restarts analysis on the new position (stale results discarded by id).
@@ -225,18 +247,47 @@ live engine searches far deeper than this benchmark. To re-tune after
 changing anything, run the harness and update the defaults in
 `asm/engine.ts`.
 
+### Search-core hot path
+
+The beam counter is the number of legal children considered. The optimized
+child path preserves the exact JS rules while avoiding redundant work:
+
+* enumeration retains each legal component's member cells, so selecting it
+  clears known cells instead of flood-filling the same group again;
+* generic removal clears a cell as soon as it enters the flood stack, using
+  the zero as its visited mark;
+* removal accumulates a touched-column mask. Vertical gravity scans only
+  those columns, and horizontal compaction runs only if one became empty;
+* each beam node carries its remaining count. With nonnegative evaluation
+  weights, `childRemaining` is a cheap evaluation lower bound; once the heap
+  is full, children that cannot enter it or improve a terminal root score are
+  rejected before board copy/removal/evaluation.
+
+`npm run bench:engine` runs a fixed beam corpus plus medium exact-proof
+positions. Keep node counts, proof values and replay validation stable when
+changing this path; wall-clock comparisons should use several runs on an
+otherwise idle machine.
+
 ## 6. Exact solver
+
+Before any enumeration, each root child gets a permanent-color lower bound:
+the number of colors whose post-move total is exactly one. Color counts can
+only decrease, so those cells can never belong to a legal group. Every stored
+score is a constructive upper bound; equality of the two bounds proves that
+move immediately. Thus a replayable score 0 is self-proving. Proven roots are
+removed from subsequent beam, CPU-playout and GPU-playout work.
 
 Budgeted branch & bound DFS (`exactBegin`/`exactStep`/`exactMerge`):
 
 * upper bound: best line already known from the beams (start value);
 * lower bound (admissible): number of colors with exactly one cell —
   subtrees whose bound reaches the incumbent are cut;
-* transposition table: 2^20-entry visited set keyed by Zobrist hash
-  (a fully explored board never re-explores; sound for minimization because
-  the incumbent only decreases);
+* transposition table: 2^20 entries in four-way buckets, keyed by Zobrist
+  hash (replacement can cause re-expansion but never an invalid prune);
+* child boards are generated directly in the next explicit-stack frame, and
+  remaining count, lower bound and hash are fused into one board scan;
 * explicit stack, budget-limited and resumable in chunks, so it never
-  blocks the worker loop; budgets escalate ×4 per retry without a cap.
+  blocks the worker loop.
 
 Entry points sharing the machinery:
 
@@ -246,27 +297,31 @@ Entry points sharing the machinery:
   *after* root move `k`, seeded with that move's best-known line as the
   upper bound;
 * `exactChildSeek(k, budget, target)` — like the child solve but with a
-  *known* target value: everything that cannot reach `target` is pruned,
-  which makes recovering the optimal line after a value solve cheap.
+  *known* target value. It stops at the first matching terminal witness; the
+  target was already proven by the value solver, so a second proof is waste.
 
-### Value solver (`vsBegin` / `vsStep`) — the anti-cycling memo
+### Value solver (`vsBegin` / `vsStep` / `vsBuildLine`)
 
 The B&B solvers prune by bound, which makes their transposition entries
 context-dependent — fine for one proof, wasteful for many. The **value
-solver** instead runs a *full enumeration with memoization*: no alpha
-pruning, every reached board's exact value is stored in a persistent
-2^21-entry memo (`VTT`). Because entries are context-free they are shared
+solver** instead computes context-free minimax values with memoization. A
+frame normally evaluates every child, but finalizes early when a resolved
+child reaches that board's admissible lower bound: no remaining child can do
+better, so the stored value is still exact. Values and a best move are stored
+in a persistent, four-way 2^21-entry memo (`VTT`). Entries are shared
 
-* across the root moves of one position (sibling subtrees overlap almost
-  entirely — proving all ~20 endgame moves costs little more than one),
-* across budget escalations (a retry replays memo hits and continues at the
-  old frontier — work is never repeated),
+* across root moves and budget escalations,
+* across later analysis positions in the same worker — playing a move turns
+  the new board into a previously searched descendant,
+* with a retained DFS frontier on budget exhaustion, so a retry continues
+  the unfinished branch rather than walking down to it again.
 
-which is precisely the "record of positions already analysed" that stops
-the engine from cycling over a small board. The worker's ladder drives it
-value-first: `vsBegin(k)` → proven value → flag directly when the known
-line already achieves it, else `exactChildSeek` recovers the optimal line
-(keeping every displayed score replayable).
+The policy move stored with each value lets `vsBuildLine` reconstruct an
+optimal line in roughly one lookup per move. Table replacement is detected;
+`exactChildSeek` is the safe fallback. The live ladder tries a 2 M-node B&B
+first because a good constructive incumbent often makes it orders of
+magnitude cheaper than full values, then uses VTT only after that attempt
+exhausts.
 
 The gates: full-speed proving at `remaining ≤ 56`, a background trickle
 (one chunk per cycle) up to `remaining ≤ 88`. For the heuristic beams above
@@ -284,8 +339,8 @@ boards), including line replayability throughout.
 
 ## 7. WebGPU playout accelerator
 
-`gpu.js` runs the *identical* tabu-color playout as the WASM core, one
-thread per playout, one dispatch row per candidate move (≤ 72 children ×
+`gpu.js` runs the hard-tabu member of the WASM playout portfolio identically,
+one thread per playout and one dispatch row per candidate move (≤ 72 children ×
 512–1024 playouts per batch):
 
 * WGSL kernel = line-by-line twin of `playoutRun()` in `asm/engine.ts`:
@@ -368,40 +423,51 @@ in sync.
 ## 10. Build, test, develop
 
 ```
-npm install               # once: AssemblyScript + puppeteer-core (dev only)
+npm ci                    # reproducible AssemblyScript + browser tools
 npm run build:engine      # asm/engine.ts → src/scripts/engine/engine.wasm
 npm run test:engine       # build + full Node suite (rules, search, exact, bench)
+npm run bench:engine      # fixed beam-throughput and exact-proof corpus
 npm run tune:engine       # evaluation weight grid search
 npm run serve             # http://localhost:8123 (any static server works)
 node tools/engine.e2e.mjs [--shot]   # headless end-to-end against the served game
 ```
 
-The compiled `engine.wasm` (~8 KB) is committed, so *playing* needs no
+The compiled `engine.wasm` (~12 KB) is committed, so *playing* needs no
 toolchain — only engine development does. The game itself remains
 dependency-free at runtime.
 
-Current reference numbers (this machine, single core, 2026-07-11):
-~1.8 M child evaluations/s in the beam; width-512 pass over a full board in
-~120 ms; full widening schedule ~180 ms/board; 55/60 random boards cleared
-with mean 0.20 remaining under the short validation schedule (the live
-engine searches much deeper); example boards 1 and 3 solved to 0 within
-~0.4 M nodes.
+Current reference numbers (this machine, single core, 2026-07-12):
+~1.9–2.0 M considered children/s in the fixed width-512 beam corpus, versus
+~1.68–1.73 M before the hot-path changes. The medium proof corpus has three
+clear roots proven directly from bound equality (0 enumeration nodes), a
+positive score-1 root proven in ~1.11 M B&B nodes, and a score-3 root in
+~0.20 M nodes. Memo-policy line recovery adds no search nodes. The short
+quality snapshot remains 8/10 full boards cleared with mean 0.2 left.
 
 ## 11. Limitations and future directions
 
-* **Cross-move reuse is line-level, not tree-level**: the warm-start cache
-  carries best lines and proofs across positions, but the beam's explored
-  frontier is rebuilt. True pondering (searching the expected child while
-  the player thinks) is the next step up.
+* **Exact tables use 64-bit Zobrist identity**: a hash match is treated as a
+  board match. The collision probability is negligible for game analysis but
+  not mathematically zero; formal proof certificates would require a second
+  independent fingerprint or full-board verification on TT hits.
+* **Beam cross-move reuse is line-level**: the warm-start cache carries best
+  lines and proofs across positions, while the beam frontier is rebuilt.
+  Exact VTT values do persist across positions. True beam pondering
+  (searching the expected child while the player thinks) is the next step up.
 * **Single-threaded WASM**: SharedArrayBuffer + N worker beams (different
   noise seeds) would scale nearly linearly, at the cost of COOP/COEP
   headers.
-* **Exact lower bound is weak** (dead colors only — the sound subset of the
-  hopeless-node ideas): a connectivity-aware bound (colors whose components
-  can never touch under *any* gravity future) would let the solver reach
-  40+ cells, but proving "can never touch" soundly is the hard part —
-  unsound shortcuts would corrupt the ✓ flags. The heuristic side already
-  uses the unsound-but-useful version (frozen colors, Section 5).
+* **Exact lower bound is deliberately conservative** (dead colors only — the
+  sound subset of the hopeless-node ideas). Two promising next reductions are
+  fixed-point permanent-column barriers and exact decomposition at a column
+  cut whose left/right color sets are disjoint. Any connectivity-aware bound
+  must be proved under every future gravity/column-close sequence; unsound
+  shortcuts would corrupt ✓. The heuristic side already uses the
+  unsound-but-useful frozen-color feature (Section 5).
+* **Symmetry canonicalization is unexploited**: color renaming and reversal of
+  the contiguous occupied columns preserve exact value. They may improve VTT
+  reuse, but normalization overhead and mirrored policy coordinates should be
+  instrumented before adding them to the exact hot path.
 * **Beam eval is local**: no notion of "which color to farm" beyond
   fragmentation penalties; a color-plan feature (dominant-color
   connectivity potential) is the most promising strength gain.

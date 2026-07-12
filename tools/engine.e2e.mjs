@@ -169,12 +169,35 @@ try {
     await new Promise((r) => setTimeout(r, 6000));
     const nodesB = await nodesOf();
     const statusB = await page.$eval("#engineStatus", (s) => s.textContent);
-    check(nodesB > nodesA && nodesA > 0, "analysis keeps running (nodes increasing)", { nodesA, nodesB });
-    check(/analyzing…/.test(statusB), "status stays analyzing on a large board", { statusB });
+    const terminal = /proven ✓|settled/.test(statusB);
+    check(nodesA > 0 && (nodesB > nodesA || terminal),
+        "analysis either progresses or reaches a valid terminal state", { nodesA, nodesB, statusB });
+    check(/analyzing…|proven ✓|settled/.test(statusB),
+        "status remains a valid engine state", { statusB });
 
     // toggle off cleans up
     await page.click("#engineButton");
     check(await page.$eval("#engineSection", (s) => s.hidden), "engine panel hides on toggle-off");
+
+    // Regression: a shared global beam used to starve the only clearing
+    // corridors in this position and eventually settle at 1. Root-private
+    // widening must now find (and intrinsically prove) a clean board.
+    const starvationCase = "?v=5&g=Bp-rtMfMUUaxsQwaoLBDFQp4_m1oPxZc7RzdEmIsH6ErajTAL9v9H5JAlMB";
+    await page.goto("http://localhost:8123/" + starvationCase, { waitUntil: "networkidle0" });
+    if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
+    await page.waitForFunction(
+        () => parseInt(document.querySelector("#engineList .engineScore")?.textContent ?? "9999", 10) === 0,
+        { timeout: 30000 });
+    const starvationResult = await page.evaluate(() => ({
+        score: parseInt(document.querySelector("#engineList .engineScore").textContent, 10),
+        exact: document.querySelector("#engineList .engineExact")?.textContent,
+        status: document.getElementById("engineStatus").textContent,
+    }));
+    check(starvationResult.score === 0 && starvationResult.exact === "✓",
+        "root-private widening clears the starvation counterexample", starvationResult);
+    await page.click("#engineButton");
 
     // endgame proving: rewind a recorded game to 10 moves before its end —
     // 32 remaining cells, the size class that used to cycle under the old

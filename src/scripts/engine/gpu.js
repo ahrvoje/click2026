@@ -211,13 +211,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (n == 0u) { break; }
 
-        // prefer non-tabu groups; fall back to all groups
+        // Prefer non-tabu groups; the worker supplements this exploitation
+        // batch with full-support CPU samples.
+        var pick = 0u;
         var cand = 0u;
         for (var g = 0u; g < n; g += 1u) {
             if (cols[g] != tabu) { cand += 1u; }
         }
-
-        var pick = 0u;
         if (cand > 0u) {
             var skip = rngNext() % cand;
             for (var g = 0u; g < n; g += 1u) {

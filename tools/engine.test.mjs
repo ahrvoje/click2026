@@ -27,6 +27,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const { SIZE, clonePosition, extractGroup, removeGroup, enumerateGroups } =
     await import("../src/scripts/board.js");
 const { Game } = await import("../src/scripts/game.js");
+const { createSearchProgress, recordSearchPass, settlementReady } =
+    await import("../src/scripts/engine/schedule.js");
 
 // --- wasm setup -------------------------------------------------------------
 
@@ -294,6 +296,38 @@ suite("playouts: deterministic, legal, lines replay", () => {
         check(r.best <= before[k], "playoutRoot made a score worse", { k });
         check(replayLine(position, r.line) === r.best, "playoutRoot line broken", { k, best: r.best });
     });
+
+    // The soft portfolio member is supplemental: it must preserve every hard
+    // result and any newly adopted line must remain constructive.
+    for (let k = 0; k < after.length; k++) eng.playoutRootSoft(k, 8, 5000 + 100 * k);
+    const afterSoft = collectResults().roots;
+    afterSoft.forEach((r, k) => {
+        check(r.best <= after[k].best, "playoutRootSoft made a score worse", { k });
+        check(replayLine(position, r.line) === r.best,
+            "playoutRootSoft line broken", { k, best: r.best });
+    });
+});
+
+suite("playouts: tabu is a bias, not a hard action mask", () => {
+    const position = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    position[0][0] = position[0][1] = 1;
+    position[1][0] = position[1][1] = 1; // dominant color, one group of four
+    position[2][0] = position[2][1] = 2; // non-tabu alternative
+
+    let sawTabuFirst = false, sawAlternativeFirst = false;
+    for (let seed = 1; seed <= 256 && !(sawTabuFirst && sawAlternativeFirst); seed++) {
+        setIOBoard(position);
+        eng.testPlayoutSoft(seed);
+        const len = mem()[IO + 256];
+        const first = mem()[IO + 257];
+        check(len === 2, "two-group playout has wrong length", { seed, len });
+        const color = position[Math.floor(first / SIZE)][first % SIZE];
+        if (color === 1) sawTabuFirst = true;
+        if (color === 2) sawAlternativeFirst = true;
+    }
+    check(sawTabuFirst && sawAlternativeFirst,
+        "soft tabu did not preserve support for every legal first move",
+        { sawTabuFirst, sawAlternativeFirst });
 });
 
 // --- 4b: warm starts and root-locked passes ------------------------------------
@@ -364,6 +398,40 @@ suite("warm start: lines and proofs transfer across positions", () => {
     }
 });
 
+suite("intrinsic proofs: terminal and lower-bound scores need no search", () => {
+    const board = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    board[0][0] = 1;
+    board[0][1] = 1;
+    board[0][2] = 2; // permanently single after the only legal move
+
+    setIOBoard(board);
+    check(eng.setBoard() === 1, "intrinsic proof fixture has wrong root count");
+    let { roots, stats } = collectResults();
+    check(eng.getRootLower(0) === 1, "exported root lower bound is wrong", {
+        lower: eng.getRootLower(0),
+    });
+    check(roots[0].best === 1 && roots[0].exact,
+        "score matching the singleton-color lower bound was not auto-proven", roots[0]);
+    check(replayLine(board, roots[0].line) === 1,
+        "auto-proven lower-bound line does not replay", roots[0]);
+
+    // Proven roots are not admitted into later heuristic passes.
+    eng.beamBegin(128, 0);
+    check(eng.beamStep(1000) === 1, "beam searched an already proven root");
+    ({ roots, stats } = collectResults());
+    check(stats.nodes === 0, "proven-root beam work changed the node counter", stats);
+
+    board[0][2] = 0;
+    setIOBoard(board);
+    eng.setBoard();
+    roots = collectResults().roots;
+    check(eng.getRootLower(0) === 0, "zero fixture has a nonzero root lower bound", {
+        lower: eng.getRootLower(0),
+    });
+    check(roots[0].best === 0 && roots[0].exact,
+        "constructive zero score was not auto-proven", roots[0]);
+});
+
 suite("value solver: exact per-move values from one shared enumeration", () => {
     const rnd = mulberry32(60451);
 
@@ -417,7 +485,10 @@ suite("value solver: exact per-move values from one shared enumeration", () => {
             check(value === expected, "value solver wrong", { iter, k, value, expected });
             if (value !== expected) continue;
 
-            if (eng.seedExactByCell(roots[k].rep, value) !== 1) {
+            const built = eng.vsBuildLine(k, value);
+            check(built === 1, "value memo failed to reconstruct an optimal line",
+                { iter, k, value });
+            if (built !== 1 && eng.seedExactByCell(roots[k].rep, value) !== 1) {
                 eng.exactChildSeek(k, 20_000_000, value);
                 let r = -1;
                 while (r === -1) r = eng.exactStep(200_000);
@@ -488,6 +559,70 @@ suite("root-locked passes improve only their move", () => {
     }
 });
 
+suite("counterexample: root-private beam width escalates past starvation", () => {
+    const game = new Game("?v=5&g=Bp-rtMfMUUaxsQwaoLBDFQp4_m1oPxZc7RzdEmIsH6ErajTAL9v9H5JAlMB");
+    const position = game.getStartPosition();
+    setIOBoard(position);
+    eng.setBoard();
+    const initial = collectResults().roots;
+    const k = initial.findIndex((root) => root.rep === 18);
+    check(k >= 0, "counterexample clearing root is missing");
+    if (k < 0) return;
+
+    eng.beamBeginRoot(k, 2048, 0);
+    while (eng.beamStep(400_000) === 0) { /* width below the known cliff */ }
+    const narrow = collectResults().roots[k];
+    check(replayLine(position, narrow.line) === narrow.best,
+        "narrow private-beam line does not replay", narrow);
+
+    // Today this fixture needs 4096. If a future evaluator clears at 2048,
+    // that is an improvement, not a regression; do not reject it.
+    if (narrow.best > 0) {
+        eng.beamBeginRoot(k, 4096, 0);
+        while (eng.beamStep(400_000) === 0) { /* private iterative widening */ }
+    }
+    const wide = collectResults().roots[k];
+    check(wide.best === 0 && wide.exact,
+        "widened private beam failed to recover the clearing corridor", wide);
+    check(replayLine(position, wide.line) === 0,
+        "counterexample clearing line does not replay", wide);
+});
+
+suite("scheduler: settlement counts only unchanged max-width global passes", () => {
+    const maxWidth = 16384;
+    let progress = createSearchProgress("top=2;tail=8", 2);
+
+    // Locked and submaximal work still advances the widening clock, but it
+    // cannot spend the settlement budget.
+    progress = recordSearchPass(progress, "top=2;tail=8", 2, 0, maxWidth);
+    progress = recordSearchPass(progress, "top=2;tail=8", 2, 8192, maxWidth);
+    check(progress.maxGlobalFruitless === 0 && progress.bestFruitless === 2,
+        "non-max passes corrupted scheduler counters", progress);
+
+    // Tail churn resets settlement, but must not reset objective widening.
+    progress = recordSearchPass(progress, "top=2;tail=7", 2, maxWidth, maxWidth);
+    check(progress.maxGlobalFruitless === 0 && progress.bestFruitless === 3,
+        "tail progress reset objective stagnation", progress);
+
+    for (let i = 0; i < 24; i++) {
+        progress = recordSearchPass(progress, "top=2;tail=7", 2, maxWidth, maxWidth);
+        // Interleaved private passes are deliberately not counted.
+        progress = recordSearchPass(progress, "top=2;tail=7", 2, 0, maxWidth);
+    }
+    check(progress.maxGlobalFruitless === 24,
+        "settlement did not count actual max-width globals", progress);
+    check(!settlementReady(progress, 24, 144, 56, 1),
+        "scheduler settled before private root coverage");
+    check(settlementReady(progress, 24, 144, 56, 0),
+        "scheduler did not settle after global and private exhaustion");
+    check(!settlementReady(progress, 24, 56, 56, 0),
+        "scheduler settled inside the exact-solving gate");
+
+    progress = recordSearchPass(progress, "top=1;tail=7", 1, 0, maxWidth);
+    check(progress.bestFruitless === 0 && progress.bestScore === 1,
+        "best-score improvement did not reset widening", progress);
+});
+
 // --- 5: exact solver vs brute force -------------------------------------------
 
 suite("exact solver agrees with brute force on small boards", () => {
@@ -548,7 +683,12 @@ suite("exact solver agrees with brute force on small boards", () => {
         const bestRoot = Math.min(...roots.map((r) => r.best));
         check(bestRoot === result, "exact merge did not surface the optimum", { iter, bestRoot, result });
         for (const r of roots.filter((x) => x.exact)) {
-            check(r.best === result, "exact flag on non-optimal root", { iter, r });
+            const childPos = clonePosition(position);
+            removeGroup(childPos, extractGroup(childPos, fieldOf(r.rep)));
+            const expectedMove = enumerateGroups(childPos).length === 0
+                ? remainingOf(childPos) : bruteForce(childPos);
+            check(r.best === expectedMove, "exact flag has wrong per-move value",
+                { iter, r, expectedMove });
         }
         solved++;
 
