@@ -53,8 +53,12 @@ try {
     // a fresh page has no position until NEW GAME generates one
     await page.click("#startButton");
 
-    // toggle the engine on
-    await page.click("#engineButton");
+    // The app currently starts analysis by default; keep the check valid if
+    // that preference changes by normalizing to "on" instead of blindly
+    // toggling the current state.
+    if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
     check(await page.$eval("#engineButton", (b) => b.classList.contains("active")), "engine button toggles active");
     check(await page.$eval("#engineSection", (s) => !s.hidden), "engine panel appears");
 
@@ -74,7 +78,7 @@ try {
     // play the engine's #1 suggestion by clicking its group cell on the canvas
     const target = await page.evaluate(async () => {
         // reach into the module graph via a dynamic import of the same URL
-        const { EngineUI } = await import("/scripts/engine-ui.js");
+        const { EngineUI } = await import("/scripts/engine-ui.js?build=20260712-proof2");
         return EngineUI.isOn();
     });
     check(target === true, "EngineUI singleton shared with page modules");
@@ -169,14 +173,18 @@ try {
     await new Promise((r) => setTimeout(r, 6000));
     const nodesB = await nodesOf();
     const statusB = await page.$eval("#engineStatus", (s) => s.textContent);
+    // `optimal` certifies the position score but deliberately keeps auditing
+    // alternative rows, so only the two actual stop states excuse no progress.
     const terminal = /proven ✓|settled/.test(statusB);
     check(nodesA > 0 && (nodesB > nodesA || terminal),
         "analysis either progresses or reaches a valid terminal state", { nodesA, nodesB, statusB });
-    check(/analyzing…|proven ✓|settled/.test(statusB),
+    check(/analyzing…|optimal ✓|proven ✓|settled/.test(statusB),
         "status remains a valid engine state", { statusB });
 
     // toggle off cleans up
-    await page.click("#engineButton");
+    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
     check(await page.$eval("#engineSection", (s) => s.hidden), "engine panel hides on toggle-off");
 
     // Regression: a shared global beam used to starve the only clearing
@@ -197,7 +205,36 @@ try {
     }));
     check(starvationResult.score === 0 && starvationResult.exact === "✓",
         "root-private widening clears the starvation counterexample", starvationResult);
-    await page.click("#engineButton");
+    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
+
+    // Regression: this full-board position has an easy-to-certify clearing
+    // move mixed with a much harder positive alternative. The position value
+    // must be reported as optimal without waiting for every row to be exact.
+    const positionProofCase = "?v=5&g=Bp90fqatzsB7kFTAXXPCEWyEfOe9QpfTxpzrosY7GaqDbBs0gqCRIQnwnZa";
+    const positionProofStart = performance.now();
+    await page.goto("http://localhost:8123/" + positionProofCase, { waitUntil: "networkidle0" });
+    if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
+    await page.waitForFunction(
+        () => /optimal ✓/.test(document.getElementById("engineStatus").textContent),
+        { timeout: 20000 });
+    const positionProofElapsedMs = Math.round(performance.now() - positionProofStart);
+    const positionProofResult = await page.evaluate(() => ({
+        score: parseInt(document.querySelector("#engineList .engineScore")?.textContent ?? "9999", 10),
+        exact: document.querySelector("#engineList .engineExact")?.textContent,
+        status: document.getElementById("engineStatus").textContent,
+    }));
+    positionProofResult.elapsedMs = positionProofElapsedMs;
+    check(positionProofResult.score === 0 && positionProofResult.exact === "✓" &&
+        /optimal ✓/.test(positionProofResult.status),
+    "full-board mixed-complexity position reaches a certified optimum",
+    positionProofResult);
+    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
 
     // Regression: move 25 of this recording needs a temporarily fragmented
     // corridor. The bounded permanent-only portfolio must resolve FC to a
@@ -254,13 +291,17 @@ try {
             canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
         }
     });
-    await page.click("#engineButton");
+    if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
     await page.waitForFunction(
         () => /proven ✓/.test(document.getElementById("engineStatus").textContent),
         { timeout: 90000 });
     const proven = await page.$$eval("#engineList .engineExact", (els) => els.map((e) => e.textContent));
     check(proven.length > 0 && proven.every((t) => t === "✓"), "endgame rows all proven", { proven });
-    await page.click("#engineButton");
+    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
+        await page.click("#engineButton");
+    }
 
     if (shot) {
         await page.click("#engineButton");

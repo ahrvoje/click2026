@@ -24,10 +24,30 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+const assetSourcePaths = {
+    index: "src/index.html",
+    main: "src/scripts/main.js",
+    click: "src/scripts/click.js",
+    ui: "src/scripts/engine-ui.js",
+    worker: "src/scripts/engine/worker.js",
+    e2e: "tools/engine.e2e.mjs",
+};
+const assetSources = Object.fromEntries(await Promise.all(
+    Object.entries(assetSourcePaths).map(async ([name, path]) =>
+        [name, await readFile(join(root, path), "utf8")])),
+);
+
 const { SIZE, clonePosition, extractGroup, removeGroup, enumerateGroups } =
     await import("../src/scripts/board.js");
 const { Game } = await import("../src/scripts/game.js");
-const { createSearchProgress, recordSearchPass, settlementReady } =
+const {
+    createSearchProgress,
+    recordSearchPass,
+    settlementReady,
+    summarizePositionProof,
+    analysisState,
+    positionProofCandidates,
+} =
     await import("../src/scripts/engine/schedule.js");
 
 // --- wasm setup -------------------------------------------------------------
@@ -646,6 +666,15 @@ suite("value solver: exact per-move values from one shared enumeration", () => {
             check(value === expected, "value solver wrong", { iter, k, value, expected });
             if (value !== expected) continue;
 
+            // A fresh value traversal must preserve its improving terminal
+            // directly from the live DFS stack. Exact memo entries are a
+            // replaceable cache and cannot be the only copy of the witness.
+            if (iter === 0 && k === 0) {
+                const witnessed = collectResults().roots[k];
+                check(witnessed.best === value && replayLine(position, witnessed.line) === value,
+                    "value solver did not retain its terminal witness", { value, witnessed });
+            }
+
             const built = eng.vsBuildLine(k, value);
             check(built === 1, "value memo failed to reconstruct an optimal line",
                 { iter, k, value });
@@ -839,6 +868,158 @@ suite("scheduler: settlement counts only unchanged max-width global passes", () 
     progress = recordSearchPass(progress, "top=1;tail=7", 1, 0, maxWidth);
     check(progress.bestFruitless === 0 && progress.bestScore === 1,
         "best-score improvement did not reset widening", progress);
+});
+
+suite("scheduler: position proof is distinct from an exact move table", () => {
+    // The first move's static bound is deliberately weak. Once that row is
+    // exact, its proved score is the effective lower bound and certifies the
+    // position even though a worse alternative remains unresolved.
+    const partlyExact = [
+        { k: 0, cell: 3, size: 2, score: 2, exact: true },
+        { k: 1, cell: 9, size: 4, score: 5, exact: false },
+    ];
+    const rawLower = new Map([[0, 0], [1, 4]]);
+    const lowerOf = (move) => rawLower.get(move.k);
+    const proof = summarizePositionProof(partlyExact, lowerOf);
+
+    check(proof.positionLower === 2 && proof.positionUpper === 2,
+        "exact row score did not strengthen the position lower bound", proof);
+    check(proof.positionExact && !proof.allMovesExact,
+        "partial move-table proof was classified incorrectly", proof);
+    check(analysisState(proof, false) === "optimal",
+        "running analysis hid a proved position value", analysisState(proof, false));
+
+    const allExact = partlyExact.map((move) => ({ ...move, exact: true }));
+    const complete = summarizePositionProof(allExact, lowerOf);
+    check(analysisState(complete, false) === "proven",
+        "exact move table was not classified as proven", complete);
+
+    const unresolved = summarizePositionProof([
+        { k: 0, cell: 3, size: 2, score: 2, exact: false },
+        { k: 1, cell: 9, size: 4, score: 5, exact: false },
+    ], lowerOf);
+    check(!unresolved.positionExact && analysisState(unresolved, true) === "settled",
+        "stopped unproved position was not classified as settled", unresolved);
+
+    const candidates = positionProofCandidates([
+        { k: 0, cell: 30, size: 2, score: 3, exact: false },
+        { k: 1, cell: 20, size: 2, score: 2, exact: false },
+        { k: 2, cell: 10, size: 5, score: 2, exact: false },
+        { k: 3, cell: 40, size: 3, score: 4, exact: true },
+    ], (move) => new Map([[0, 0], [1, 1], [2, 1], [3, 0]]).get(move.k));
+    check(JSON.stringify(candidates.map((move) => move.k)) === JSON.stringify([2, 1, 0]),
+        "position-proof probes are not ordered by tight gap and group size", candidates);
+});
+
+suite("worker asset graph uses one cache generation", () => {
+    const match = assetSources.ui.match(/ENGINE_ASSET_VERSION\s*=\s*"([^"]+)"/);
+    check(match !== null, "engine asset version is missing from the UI bootstrap");
+    if (!match) return;
+    const version = match[1];
+    const expected = {
+        index: `scripts/main.js?build=${version}`,
+        main: `./click.js?build=${version}`,
+        click: `./engine-ui.js?build=${version}`,
+        workerGpu: `./gpu.js?build=${version}`,
+        workerSchedule: `./schedule.js?build=${version}`,
+        workerWasm: `wasmURL.searchParams.set("build", "${version}")`,
+        e2e: `/scripts/engine-ui.js?build=${version}`,
+    };
+    for (const [name, token] of Object.entries(expected)) {
+        const source = name.startsWith("worker") ? assetSources.worker : assetSources[name];
+        check(source.includes(token), `cache generation mismatch in ${name}`, { version, token });
+    }
+});
+
+suite("supplied v5 position: bounded root proof certifies the global zero", () => {
+    const game = new Game("?v=5&g=Bp90fqatzsB7kFTAXXPCEWyEfOe9QpfTxpzrosY7GaqDbBs0gqCRIQnwnZa");
+    const position = game.getStartPosition();
+    check(remainingOf(position) === 144, "supplied proof fixture is not the full board", {
+        remaining: remainingOf(position),
+    });
+
+    setIOBoard(position);
+    const rootCount = eng.setBoard();
+    check(rootCount === 27, "supplied proof fixture has the wrong root count", { rootCount });
+
+    // Mirror the deterministic CPU portion of the worker's production setup.
+    let seed = 1;
+    for (let k = 0; k < rootCount; k++) {
+        eng.playoutRoot(k, 32, seed);
+        eng.playoutRootSoft(k, 4, seed);
+        seed += 32;
+    }
+    for (const width of [8, 32, 128, 512, 2048]) {
+        eng.beamBegin(width, 0);
+        while (eng.beamStep(400_000) === 0) { /* complete production pass */ }
+    }
+
+    const asMoves = () => collectResults().roots.map((root, k) => ({
+        ...root,
+        k,
+        cell: root.rep,
+        score: root.best,
+    }));
+    const lowerOf = (move) => eng.getRootLower(move.k);
+    let moves = asMoves();
+    let proof = summarizePositionProof(moves, lowerOf);
+    const candidates = positionProofCandidates(moves, lowerOf);
+    const beforeProbeNodes = collectResults().stats.nodes;
+    const budget = 2_000_000;
+    let attempts = 0;
+
+    // A budget-out may still have discovered a constructive zero. Commit the
+    // witness without claiming exhaustive per-move exactness, then recompute
+    // the global proof before trying the next threatening root.
+    for (const candidate of candidates) {
+        if (proof.positionExact || attempts >= 3) break;
+        attempts++;
+        eng.exactBeginChild(candidate.k, budget);
+        let result = -1;
+        while (result === -1) result = eng.exactStep(200_000);
+        if (result >= 0) eng.exactMergeChild(candidate.k);
+        else if (result === -2) eng.exactCommitChild(candidate.k);
+        moves = asMoves();
+        proof = summarizePositionProof(moves, lowerOf);
+    }
+
+    const after = collectResults();
+    const probeNodes = after.stats.nodes - beforeProbeNodes;
+    const winner = moves.find((move) => move.score === proof.positionUpper && move.exact);
+    check(proof.positionExact && proof.positionLower === 0 && proof.positionUpper === 0,
+        "bounded root probes did not certify the supplied position", { proof, attempts });
+    check(winner !== undefined && replayLine(position, winner.line) === 0,
+        "supplied position has no replayable exact clearing line", winner);
+    check(attempts > 0 && attempts <= 3 && probeNodes <= attempts * (budget + 1),
+        "supplied position proof exceeded its bounded probe envelope",
+        { attempts, probeNodes, budget });
+});
+
+suite("budgeted child proof keeps a witness without claiming exactness", () => {
+    const columns = [
+        "155541400000", "535500000000", "240000000000", "531240000000",
+        "513100000000", "251000000000", "553112100000", "334121000000",
+        "121531215000", "344323150000", "532435342530", "000000000000",
+    ];
+    const position = columns.map((column) => Array.from(column, Number));
+    setIOBoard(position);
+    eng.setBoard();
+
+    const before = collectResults().roots[0];
+    const lower = eng.getRootLower(0);
+    eng.exactBeginChild(0, 20_000);
+    let result = -1;
+    while (result === -1) result = eng.exactStep(10_000);
+    check(result === -2, "partial-witness fixture unexpectedly completed", { result, before });
+
+    const committed = eng.exactCommitChild(0);
+    const after = collectResults().roots[0];
+    check(committed === after.best && after.best < before.best,
+        "budget exhaustion discarded its constructive improvement", { before, after, committed });
+    check(after.best > lower && !after.exact,
+        "partial positive witness was unsafely marked exact", { lower, after });
+    check(replayLine(position, after.line) === after.best,
+        "committed partial witness does not replay", after);
 });
 
 // --- 5: exact solver vs brute force -------------------------------------------

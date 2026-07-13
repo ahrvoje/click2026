@@ -9,7 +9,7 @@
  *       Sat Jul 11, 2026 - modernized to ES module, zero dependencies
  */
 
-import * as Click from "./click.js";
+import * as Click from "./click.js?build=20260712-proof2";
 import { createTests } from "./tests.js";
 
 // module scripts are deferred, so the DOM is complete at this point

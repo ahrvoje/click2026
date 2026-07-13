@@ -16,6 +16,10 @@
 import { canonicalBlock, LETTERS } from "./board.js";
 
 const TOP_N = 5;
+// Keep the module worker, its static imports and the compiled WASM on one
+// cache generation. A stale dependency makes a module worker fail before any
+// of its error-reporting code can run, yielding only an opaque ErrorEvent.
+const ENGINE_ASSET_VERSION = "20260712-proof2";
 
 // rank accent colors, shared by the list rows and the board outlines; picked
 // to stay distinguishable from the five play colors and the replay highlight
@@ -72,11 +76,15 @@ function onWorkerMessage(event) {
 }
 
 function startWorker() {
-    worker = new Worker(new URL("./engine/worker.js", import.meta.url), { type: "module" });
+    const workerURL = new URL("./engine/worker.js", import.meta.url);
+    workerURL.searchParams.set("build", ENGINE_ASSET_VERSION);
+    worker = new Worker(workerURL, { type: "module" });
     worker.onmessage = onWorkerMessage;
     worker.onerror = (event) => {
         renderStatus("engine failed to start — see console");
-        console.error("engine worker:", event.message ?? event);
+        const location = event.filename
+            ? `${event.filename}:${event.lineno ?? 0}:${event.colno ?? 0}` : "unknown source";
+        console.error(`engine worker failed at ${location}:`, event.message || event);
     };
 }
 
@@ -166,7 +174,11 @@ function renderResult() {
 function renderStats() {
     const s = result.stats;
     el("engineStatus").replaceChildren(
-        span("engineStState", { proven: "proven ✓", settled: "settled" }[s.state] ?? "analyzing…"),
+        span("engineStState", {
+            optimal: "optimal ✓",
+            proven: "proven ✓",
+            settled: "settled",
+        }[s.state] ?? "analyzing…"),
         span("engineStDepth", `w${s.width} d${s.depth}`),
         span("engineStNodes", `${formatCount(s.nodes)} n`),
         span("engineStNps", `${formatCount(s.nps)} n/s`),

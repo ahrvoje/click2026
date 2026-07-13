@@ -15,11 +15,14 @@
  *   2. CPU playout portfolio       — strong tabu policy plus full-support samples
  *   3. widening beam passes        — deterministic, widths 8..2048
  *      with one bounded permanent-only late-game portfolio member
- *   4. continuous investigation    — alternating global beam passes (widths
+ *   4. position-proof portfolio    — bounded, fair B&B probes above the
+ *      persistent exact gate
+ *   5. continuous investigation    — alternating global beam passes (widths
  *      512..16384) and root-locked passes that widen independently per move,
  *      plus playout rounds biased to the current top moves
- *      (GPU-accelerated when WebGPU is available), interleaved with a
- *      hybrid B&B/value-memo proof ladder once the board is small enough
+ *      (GPU-accelerated when WebGPU is available); once the board is small
+ *      enough, a hybrid B&B/value-memo ladder takes priority until every
+ *      move is proved
  *
  * Analysis ends in exactly three ways: a new position arrives, EVERY move is
  * proven optimal ("proven"), or SETTLE_PASSES unchanged *global* max-width
@@ -42,22 +45,31 @@
  * Date: Sun Jul 12, 2026
  */
 
-import { createGpu, dominantColor } from "./gpu.js";
-import { createSearchProgress, recordSearchPass, settlementReady } from "./schedule.js";
+// These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
+// Versioning the complete module graph prevents a cached pre-change helper
+// from making the worker fail during static module linking.
+import { createGpu, dominantColor } from "./gpu.js?build=20260712-proof2";
+import {
+    analysisState, createSearchProgress, positionProofCandidates,
+    recordSearchPass, settlementReady, summarizePositionProof,
+} from "./schedule.js?build=20260712-proof2";
 
 const SIZE = 12;
 const CHUNK = 16000;            // beam expansions per slice, ~10 ms
 const EXACT_CHUNK = 60000;      // exact solver expansions per slice
-const EXACT_REMAINING = 56;     // full-speed exact proving at or below this many cells
-const EXACT_TRY_REMAINING = 88; // above 56 up to here: proving runs at half the full quantum
+const EXACT_REMAINING = 56;     // eight exact chunks per scheduler quantum at/below this size
+const EXACT_TRY_REMAINING = 88; // up to here: four-chunk quanta, still back-to-back prioritized
 const CLEAR_PORTFOLIO_REMAINING = 72; // late positions merit an orthogonal clear-focused beam
 const CLEAR_PORTFOLIO_WIDTH = 8192;
 const CLEAR_PORTFOLIO_SCORE = 5;
 const CLEAR_PORTFOLIO_ROOTS = 2;
+const BOUND_TRY_REMAINING = 64; // above this, the fixed B&B probe only delayed hard value proofs
 const BOUND_BUDGET = 2000000;   // one fast branch-and-bound attempt before full value solving
+const POSITION_PROBE_BUDGET = 2000000; // one fair threshold/proof turn per threatening large-board root
+const POSITION_PROBE_ROOTS = 16; // 32M-node board cap; remaining roots keep the normal fairness audit
 const EXACT_BUDGET = 8000000;   // first value-memo attempt; retries resume and escalate ×4
 const EXACT_BUDGET_MAX = 2000000000; // i32-safe budget per resumable attempt
-const LINE_BUDGET = 64000000;   // line seek is bound-directed, rarely needs much
+const LINE_BUDGET = 64000000;   // initial memo-guided line seek; rare retries escalate ×4
 const WIDEN_WIDTHS = [8, 32, 128, 512, 2048];
 const WIDTH_TIERS = [512, 1024, 2048, 4096, 8192, 16384]; // stagnation climbs this ladder
 const LOCKED_WIDTHS = [2048, 4096, 8192, 16384]; // each root gets private iterative widening
@@ -135,6 +147,7 @@ function collectResults() {
             size: bytes[at + 2],
             exact: bytes[at + 3] !== 0,
             score: view.getInt32(at + 4, true),
+            lower: eng.getRootLower(k),
         });
         at += 8;
     }
@@ -168,6 +181,7 @@ async function analyze(myJob, isStale) {
 
     const post = (settled) => {
         const { moves, nodes, depth, width, remaining } = collectResults();
+        const proof = summarizePositionProof(moves, (move) => move.lower);
 
         // remember this position for warm starts (LRU refresh on re-insert)
         resultCache.delete(key);
@@ -190,10 +204,14 @@ async function analyze(myJob, isStale) {
                 nps: nodes / Math.max(1, performance.now() - t0) * 1000,
                 gpu: gpuState,
                 settled: settled === true,
-                // "proven": every move optimal; "settled": stagnant at max
-                // width on a board too large to enumerate
-                state: settled !== true ? "analyzing"
-                    : moves.length > 0 && moves.every((m) => m.exact) ? "proven" : "settled",
+                positionLower: proof.positionLower,
+                positionUpper: proof.positionUpper,
+                positionExact: proof.positionExact,
+                allMovesExact: proof.allMovesExact,
+                // `optimal` certifies the position value while the worker
+                // keeps auditing alternatives; `proven` retains its stronger
+                // historical meaning that every move row is exact.
+                state: analysisState(proof, settled === true),
             },
         });
         lastPost = performance.now();
@@ -297,7 +315,18 @@ async function analyze(myJob, isStale) {
         }
     }
 
-    // 4. continuous investigation — runs until the position changes, every
+    // Full value enumeration is intentionally gated on compact endgames. On
+    // larger boards, give the 16 most promising roots that can still beat the
+    // incumbent one fair, bounded B&B turn instead. Easy constructive winners
+    // can certify the position without being starved behind a hard positive
+    // root; a budget miss is discarded as a proof but any terminal witness survives.
+    if (eng.getRemaining() > EXACT_TRY_REMAINING) {
+        moves = await runPositionProofPortfolio(moves, isStale, post, postIfDue);
+        if (isStale()) return;
+        if (moves.every((m) => m.exact)) { post(true); return; }
+    }
+
+    // 5. continuous investigation — runs until the position changes, every
     // move is PROVEN optimal, or nothing new has been found despite climbing
     // the whole width ladder (settled stop); scores only improve over time
     const ladder = createExactLadder(isStale);
@@ -328,6 +357,18 @@ async function analyze(myJob, isStale) {
             continue; // re-rank before spending beam time
         }
         if (isStale()) return;
+
+        // Once exact enumeration is active, complete it without interleaving
+        // ever-wider heuristic passes. Value solving is context-free: another
+        // beam cannot shrink its state space unless it happens to meet the
+        // root lower bound, while a width-16384 pass can delay the retained
+        // DFS frontier by seconds. The initial playout/beam schedule above has
+        // already supplied constructive incumbents; exact chunks still yield
+        // between slices, so position changes remain promptly preemptible.
+        if (ladder.shouldPrioritize(moves)) {
+            postIfDue();
+            continue;
+        }
 
         // Width answers one question: has the best attainable position score
         // improved? Tail-row changes must not hold the top search at width 512.
@@ -409,6 +450,42 @@ async function analyze(myJob, isStale) {
     }
 }
 
+// Above the full-enumeration gate, sequential unbounded proof work is a
+// starvation trap: a single hard no-clear root can hide easy winning siblings
+// indefinitely. Probe the most promising threatening roots once, in tight-
+// bound order, yielding between exact chunks. The board-wide cap prevents a
+// no-proof opening from delaying ordinary search; its max-width fairness audit
+// still covers the remaining roots. Stop as soon as the position bounds meet.
+async function runPositionProofPortfolio(moves, isStale, post, postIfDue) {
+    const candidates = positionProofCandidates(moves, (move) => move.lower)
+        .slice(0, POSITION_PROBE_ROOTS);
+    for (const candidate of candidates) {
+        if (isStale()) return moves;
+        const current = moves.find((move) => move.cell === candidate.cell);
+        if (!current || current.exact) continue;
+        const before = summarizePositionProof(moves, (move) => move.lower);
+        if (before.positionExact) break;
+        if (current.lower >= before.positionUpper) continue;
+
+        eng.exactBeginChild(current.k, POSITION_PROBE_BUDGET);
+        let result = -1;
+        while (result === -1) {
+            if (isStale()) return moves;
+            result = eng.exactStep(EXACT_CHUNK);
+            postIfDue();
+            await nextTick();
+        }
+
+        if (result >= 0) eng.exactMergeChild(current.k);
+        else eng.exactCommitChild(current.k); // constructive only; never asserts exactness
+        moves = post(false);
+
+        const proof = summarizePositionProof(moves, (move) => move.lower);
+        if (proof.positionExact || proof.allMovesExact) break;
+    }
+    return moves;
+}
+
 // moves worth extra attention because the player would rather click a bigger
 // group: larger than the best-scoring move's group, score not yet matching
 function biggerHopefuls(moves) {
@@ -476,7 +553,8 @@ function seedFromMemory(key) {
         const childKey = mem().slice(IO, IO + SIZE * SIZE).join(",");
         const childMoves = resultCache.get(childKey);
         if (!childMoves || childMoves.length === 0) continue;
-        const childPositionExact = childMoves.every((m) => m.exact);
+        const childPositionExact = summarizePositionProof(
+            childMoves, (move) => move.lower).positionExact;
         for (let rank = 0; rank < childMoves.length; rank++) {
             const child = childMoves[rank];
             if (child.line.length === 0) continue;
@@ -528,17 +606,22 @@ async function cpuSoftPlayoutRound(moves, seedBase, isStale) {
     }
 }
 
-// Exact-proof ladder: try incumbent-driven branch and bound first, then fall
-// back to the persistent value memo when that bounded attempt exhausts. The
-// memo is shared across roots, retries and later analysis positions. If a
-// value improves the known score, its stored policy normally reconstructs a
-// line directly; a witness-only DFS is the eviction-safe fallback.
+// Exact-proof ladder: compact endgames try incumbent-driven branch and bound
+// first; larger proving-gate positions start the persistent value memo
+// directly. The memo is shared across roots, retries and later analysis
+// positions. Improving terminals are retained as durable lines inside WASM;
+// a memo-guided witness DFS repairs any remaining policy-cache gap.
 function createExactLadder(isStale) {
     const exhausted = new Map(); // cell -> last value-solve budget tried
+    const lineExhausted = new Map(); // cell -> last guided witness budget tried
     const boundTried = new Set();
     let active = null; // { k, cell, mode: "bound" | "value" | "line", budget, target }
 
     return {
+        shouldPrioritize(moves) {
+            return moves.some((move) => !move.exact) && eng.getRemaining() <= EXACT_TRY_REMAINING;
+        },
+
         // runs a bounded slice; true if a proof finished (rankings may change)
         async advance(moves) {
             const remaining = eng.getRemaining();
@@ -555,14 +638,18 @@ function createExactLadder(isStale) {
             if (active && moves.find((m) => m.cell === active.cell)?.exact) active = null;
 
             if (!active) {
-                // Objective first. `moves` is already score-ascending and
-                // size-descending on ties, so this still prefers a bigger
-                // equal move without letting a worse hopeful monopolize the
-                // only retained exact frontier.
-                const next = moves.find((m) => !m.exact);
+                // Prove the broadest child first (smallest removed root
+                // group). Its exact traversal reaches the most shared
+                // descendants and warms the persistent value memo for the
+                // narrower siblings; score order is only the tie-breaker.
+                // On the hard corpus this changes all-root completion from
+                // repeated table-thrashing traversals into one broad solve
+                // followed by mostly memo-backed proofs.
+                const next = moves.filter((m) => !m.exact)
+                    .sort((a, b) => a.size - b.size || a.score - b.score || a.cell - b.cell)[0];
                 if (!next) return false; // everything proven
 
-                if (!boundTried.has(next.cell)) {
+                if (remaining <= BOUND_TRY_REMAINING && !boundTried.has(next.cell)) {
                     boundTried.add(next.cell);
                     active = { k: next.k, cell: next.cell, mode: "bound",
                         budget: BOUND_BUDGET, target: -1 };
@@ -590,7 +677,9 @@ function createExactLadder(isStale) {
                         return true;
                     }
                     const next = moves.find((m) => m.cell === active.cell);
+                    const improved = next ? eng.exactCommitChild(active.k) < next.score : false;
                     active = null;
+                    if (improved) return true; // re-collect: it may have met the lower bound
                     if (!next || next.exact) return false;
                     const started = this.startValue(next);
                     if (started !== null) return started;
@@ -612,7 +701,7 @@ function createExactLadder(isStale) {
                     active = null;
                     return true;
                 }
-                exhausted.set(active.cell, active.budget); // seek trouble — retry later
+                lineExhausted.set(active.cell, active.budget); // retry with a wider guided seek
                 active = null;
                 return false;
             }
@@ -643,9 +732,12 @@ function createExactLadder(isStale) {
                 active = null;
                 return true;
             }
-            eng.exactChildSeek(active.k, LINE_BUDGET, value);
+            const previous = lineExhausted.get(active.cell) ?? LINE_BUDGET / 4;
+            const budget = Math.min(EXACT_BUDGET_MAX, previous * 4);
+            eng.exactChildSeek(active.k, budget, value);
             active.mode = "line";
             active.target = value;
+            active.budget = budget;
             return false;
         },
     };
@@ -730,7 +822,10 @@ async function initGpu() {
 
 async function main() {
     const wasmURL = new URL("./engine.wasm", import.meta.url);
-    const bytes = await (await fetch(wasmURL)).arrayBuffer();
+    wasmURL.searchParams.set("build", "20260712-proof2");
+    const response = await fetch(wasmURL, { cache: "no-store" });
+    if (!response.ok) throw new Error(`engine.wasm HTTP ${response.status} ${response.statusText}`);
+    const bytes = await response.arrayBuffer();
     const { instance } = await WebAssembly.instantiate(bytes, {
         env: { abort: () => { throw new Error("wasm abort"); } },
     });

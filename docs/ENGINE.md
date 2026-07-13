@@ -115,6 +115,12 @@ means the score is proved optimal, either by equality with an admissible bound
 or by exact search. Scores only ever improve (decrease) while the engine keeps
 thinking, exactly like a chess engine deepening.
 
+The whole position has a constructive upper bound equal to the minimum root
+score. Its admissible lower bound is the minimum, over all roots, of the exact
+score for a proved row and that row's `lower` bound otherwise. Equality proves
+the position optimum even if some non-optimal alternatives remain unresolved;
+this is reported separately from proving every row.
+
 ## 4. Search pipeline (per position)
 
 Implemented in `worker.js::analyze()`; every stage refines the same per-root
@@ -164,15 +170,32 @@ result table inside the WASM module and posts a snapshot to the UI:
    preserves corridors that temporarily accumulate fragments/frozen colors
    immediately before a gravity merge, instead of asking random noise to
    overcome the same scalar bias in every beam.
-4. **Continuous investigation** — ends in exactly three ways: a new
+4. **Large-board position-proof portfolio**: after the initial width-2048
+   beam, a position above the `remaining ≤ 88` persistent-exact gate receives
+   a fair, bounded branch-and-bound pass. Up to 16 unresolved roots whose lower
+   bounds can beat the incumbent get at most 2 M nodes each (32 M nodes per
+   board) before the worker returns to ordinary search, preventing one
+   difficult positive-valued alternative from monopolizing proof work while
+   an easy optimal sibling waits. Remaining roots retain the continuous
+   max-width fairness audit. A completed child proof is merged normally.
+   If a budget expires, any better terminal witness found so far is still
+   retained as a constructive score/line improvement, but exhaustion alone
+   never sets the row's exact flag. The portfolio stops as soon as the global
+   lower and upper bounds meet; ordinary continuous investigation still audits
+   the unresolved alternatives.
+5. **Continuous investigation** — ends in exactly three ways: a new
    position arrives, every move is **proven**, or the search is **settled**
    (stagnant at the top of the width ladder on a board too large to
    enumerate) — never by an arbitrary timer:
    * **bigger-group priority**: moves whose group is *larger* than the best-
      scoring move's group but whose score has not yet matched it
       ("hopefuls") get first claim on locked passes and playout samples.
-      Exact work stays score-first (and therefore size-first on equal scores)
-      so a worse large group cannot monopolize its single retained frontier.
+      Exact work uses the opposite, proof-oriented order: the smallest root
+      group first. That child retains the most cells, so its traversal covers
+      the broadest descendant DAG and warms the shared exact-value memo for
+      narrower roots. With the same memo on `played-18-24`, display-score
+      order proved only 2/10 roots in 60 s; broadest-first proved 10/10 in
+      about 45 s.
       Rationale: the rating is time-based, and equal outcomes through
      bigger groups need fewer clicks — when the player sees a `0 ★` on a
      2-group, the engine actively investigates whether the big group
@@ -197,19 +220,28 @@ result table inside the WASM module and posts a snapshot to the UI:
      hopefuls (GPU batch of 1024 hard-tabu samples/root plus a small CPU
      soft-tabu supplement when available; otherwise CPU 48+6 samples for
      prioritized moves and 8+1 for the rest);
-   * the **exact-proof ladder** (Section 6): full speed once
-     `remaining ≤ 56`, and four chunks (half the full quantum) per cycle up to
-     `remaining ≤ 88`. It first tries a 2 M-node incumbent-driven branch and
-     bound; if that exhausts, it falls back to the persistent exact-value
-     memo. Value retries retain both the DFS frontier and completed entries.
-     Per-attempt budgets escalate ×4 up to the WASM-safe i32 limit, while
-     total progress remains unbounded. A finished proof marks the row ✓.
-   Terminal states: **`proven ✓`** — all moves proven, nothing can change,
-   compute stops. **`settled`** — 24 completed, unchanged *global*
-   width-16384 passes on a board above the proving gate, after the private
-   max-width audit described above; locked and submaximal passes do not
-   consume that budget. The engine stops honestly instead of cycling. Below
-   the gate it never settles:
+   * the **exact-proof ladder** (Section 6): after the initial playout and
+     widening schedule, positions with `remaining ≤ 88` prioritize exact
+     chunks back-to-back instead of interleaving full width-16384 beams with
+     a retained exact frontier. At `remaining ≤ 64` it first tries a 2 M-node
+     incumbent-driven branch and bound; larger positions go directly to the
+     persistent exact-value memo because the fixed probe was pure discarded
+     work on the collected tails. Value retries retain both the DFS frontier
+     and completed entries. Per-attempt budgets escalate ×4 up to the
+     WASM-safe i32 limit, while total progress remains unbounded. A finished
+     proof marks the row ✓.
+   Proof and terminal states are distinct. **`optimal ✓`** means the global
+   position bounds agree, so the best achievable score cannot change; the
+   worker nevertheless keeps the existing playout, locked-pass and max-width
+   fairness audit running for unresolved alternatives. **`proven ✓`** means
+   every move is exact, so nothing can change and compute stops. **`settled`**
+   means an as-yet-unproved position reached 24 completed, unchanged *global*
+   width-16384 passes above the proving gate, after the private max-width audit
+   described above; locked and submaximal passes do not consume that budget.
+   The engine stops honestly instead of cycling. An optimal position can also
+   finish that alternative audit without losing its `optimal` state; the
+   protocol's independent `settled` flag says whether compute has stopped.
+   Below the gate it never settles:
    proofs always land eventually. Scores are maintained as monotone minima,
    so the top list only ever gets more reliable with time; any player move
    restarts analysis on the new position (stale results discarded by id).
@@ -335,6 +367,15 @@ Entry points sharing the machinery:
   *known* target value. It stops at the first matching terminal witness; the
   target was already proven by the value solver, so a second proof is waste.
 
+Above the persistent-exact gate, the post-beam position-proof portfolio uses
+the same child B&B machinery with a hard 2 M-node budget per root. It is a
+prioritized witness/proof portfolio capped at 16 roots / 32 M nodes, not an
+attempt to enumerate the full opening:
+budget exhaustion preserves a better replayable terminal line but does not
+claim that root is exact. The portfolio terminates early when the minimum
+constructive score equals the minimum admissible root bound. Continuous beam
+and playout work then remains available to improve or prove the other rows.
+
 ### Value solver (`vsBegin` / `vsStep` / `vsBuildLine`)
 
 The B&B solvers prune by bound, which makes their transposition entries
@@ -342,8 +383,11 @@ context-dependent — fine for one proof, wasteful for many. The **value
 solver** instead computes context-free minimax values with memoization. A
 frame normally evaluates every child, but finalizes early when a resolved
 child reaches that board's admissible lower bound: no remaining child can do
-better, so the stored value is still exact. Values and a best move are stored
-in a persistent, four-way 2^21-entry memo (`VTT`). Entries are shared
+better, so the stored value is still exact. Values, a best move and the
+state's remaining count are stored in a persistent, four-way 2^23-entry memo
+(`VTT`, 96 MiB across keys/data/occupancy/depth). Full buckets evict the
+lowest-remaining state, retaining the larger sub-DAG that is more expensive
+to reconstruct. Entries are shared
 
 * across root moves and budget escalations,
 * across later analysis positions in the same worker — playing a move turns
@@ -352,11 +396,15 @@ in a persistent, four-way 2^21-entry memo (`VTT`). Entries are shared
   the unfinished branch rather than walking down to it again.
 
 The policy move stored with each value lets `vsBuildLine` reconstruct an
-optimal line in roughly one lookup per move. Table replacement is detected;
-`exactChildSeek` is the safe fallback. The live ladder tries a 2 M-node B&B
-first because a good constructive incumbent often makes it orders of
-magnitude cheaper than full values, then uses VTT only after that attempt
-exhausts.
+optimal line in roughly one lookup per move. Because a cache entry can still
+be replaced, every improving terminal is also copied directly from the live
+DFS stack into the root's durable replay line. If a later root is resolved
+mostly from shared memo hits and its policy chain has a gap,
+`exactChildSeek` follows surviving exact policy entries and searches only the
+missing segment. On the hard corpus this reduced line recovery from a
+potential second proof to tens or hundreds of nodes. The live ladder tries a
+2 M-node B&B first only at `remaining ≤ 64`; from 65 through 88 it starts the
+shared value traversal immediately.
 
 Once one sibling has exact value `m`, another child whose sound lower bound
 is already `≥ m` is skipped before board copy. A stronger post-materialization
@@ -366,9 +414,13 @@ Root separator bounds propagate monotonically. Recomputing the geometric
 fixed point at every node reduced nodes but increased time, so it is refreshed
 only once when a path first enters the final eight cells.
 
-The gates: full-speed proving at `remaining ≤ 56`, a half-quantum background
-run (four chunks per cycle) up to `remaining ≤ 88`. For the heuristic beams above
-that, a global seen-set is deliberately NOT used: stochastic passes revisit
+The persistent exact-value ladder remains gated at `remaining ≤ 88`.
+Positions at or below 56 run eight chunks per scheduler quantum; 57–88 run
+four, yielding more frequently but immediately receiving the next exact
+quantum. Above the gate, only the bounded per-root B&B portfolio attempts a
+position proof before continuous heuristic search. For those heuristic beams,
+a global seen-set is deliberately NOT used:
+stochastic passes revisit
 states *on purpose* with different noise and beam context — blocking
 revisits would break diversification, and no memory could come close to
 covering the ~10^60 opening space anyway. Below the gate, enumeration wins;
@@ -427,13 +479,19 @@ worker → main   {type:"ready", gpu}              // "on" | "off" | "failed"
 ```
 
 `moves` is the full sorted list (best first, ties to larger groups):
-`{k, cell, x, y, color(1-5), size, score, exact, cells:[[x,y]…], line:[cell…]}`
+`{k, cell, x, y, color(1-5), size, score, lower, exact, cells:[[x,y]…], line:[cell…]}`
 where `k` is the WASM enumeration index expected by `playoutRoot`/
 `exactBeginChild`/`childToIO`. `stats`:
-`{nodes, depth, width, elapsed, nps, gpu, settled, state}` — `state` is
-`"analyzing"` while running, `"proven"` when every move is proven optimal,
-`"settled"` when the search stopped on stagnation (both terminal states also
-set `settled: true`). The UI ignores
+`{nodes, depth, width, elapsed, nps, gpu, settled, state, positionLower,
+positionUpper, positionExact, allMovesExact}`. `positionUpper` is the minimum
+root score. `positionLower` is the minimum of each exact row's score and each
+unresolved row's admissible `lower`; equality sets `positionExact`.
+`allMovesExact` is true only when every row is exact. Accordingly, `state` is
+`"analyzing"` without a global proof, `"optimal"` when the position optimum is
+proved but alternative rows remain, `"proven"` when every move is proved, and
+`"settled"` when an unproved search stops on stagnation. `settled` is an
+independent indication that compute has stopped, so it may become true while
+`state` remains `"optimal"`. The UI ignores
 any result whose `id` differs from the current position id; ids increase on
 every real position change (identical re-posts are deduped by board key, so
 rewind→same-board does not restart analysis needlessly).
@@ -459,7 +517,7 @@ in sync.
   board click for the recording. Rows are only rebuilt when their content
   changes, so a click can never land on a row that was just swapped out by
   a telemetry update. The status line beneath is five fixed-width columns
-  that never wrap: state (`analyzing…` / `proven ✓` / `settled`),
+  that never wrap: state (`analyzing…` / `optimal ✓` / `proven ✓` / `settled`),
   `w<width> d<depth>`, nodes, nodes/s, and the compute backend.
 * **Board outlines**: each listed group's boundary is stroked in its rank
   color (`RANK_COLORS` in `engine-ui.js` — white, orange, magenta, silver,
@@ -479,14 +537,22 @@ npm ci                    # reproducible AssemblyScript + browser tools
 npm run build:engine      # asm/engine.ts → src/scripts/engine/engine.wasm
 npm run test:engine       # build + full Node suite (rules, search, exact, bench)
 npm run bench:engine      # fixed beam-throughput and exact-proof corpus
+npm run bench:engine:hard # deterministic >100 s baseline tails; all-root JSON results
 npm run tune:engine       # evaluation weight grid search
 npm run serve             # http://localhost:8123 (any static server works)
 node tools/engine.e2e.mjs [--shot]   # headless end-to-end against the served game
 ```
 
-The compiled `engine.wasm` (~14 KB) is committed, so *playing* needs no
+The compiled `engine.wasm` (~16 KB) is committed, so *playing* needs no
 toolchain — only engine development does. The game itself remains
 dependency-free at runtime.
+
+The page entry chain and the engine module graph carry the same explicit
+`build` query revision (`ENGINE_ASSET_VERSION` in `engine-ui.js`). Bump that
+revision in `index.html`, `main.js`, `click.js`, `engine-ui.js`, the worker's
+static imports/WASM URL, and the E2E singleton import whenever an engine graph
+interface changes. This prevents a long-lived browser cache from linking a
+new worker against an older helper module or WASM binary.
 
 Current reference numbers (this machine, single core, 2026-07-12):
 ~1.9–2.0 M considered children/s in the fixed width-512 beam corpus, versus
@@ -504,8 +570,36 @@ is proved clear by the complementary member in about 410k considered children
 and 120–130 ms; repeated tuned-policy beams had remained at score 2 beyond
 62 M children.
 
+The separate hard harness persists two full midgame boards discovered by a
+deterministic seed/depth screen and proves every root, not merely the best
+position value. With the pre-change WASM, `played-18-24` proved 0/10 roots in
+105 s and `played-15-24` proved only 4/12 in 150 s. The final production build
+proved 10/10 in 44.7–48.3 s and 12/12 in 67.0–74.9 s respectively on this
+machine: measured lower-bound speedups of >2.17× and >2.00× because both
+baselines were still unfinished. Profiling the first case showed 11.0 M VTT
+misses in 10 s,
+8.94 M occupied-bucket replacements, and only 70 frames reaching their
+admissible lower bound. This is why the retained changes target memo capacity,
+depth-preferred replacement, broad-root reuse and proof scheduling rather
+than another scalar beam-evaluation tweak.
+
+The supplied 144-cell mixed-complexity regression (`v5` payload beginning
+`Bp90fq…`) has 27 roots with static lower bound 0. The bounded portfolio
+certifies root BD as a clear in 1,461,960 B&B nodes; the deterministic Node
+test reaches the global proof in about 1.0–1.7 s and the full headless-
+browser workflow reports `optimal ✓` in about 1.4–2.0 s on the development
+machine. The old all-row interpretation was still analyzing after 200 s
+because a hard
+positive alternative could dominate the audit.
+
 ## 11. Limitations and future directions
 
+* **Exact-proof memory is deliberate**: the 2^23 value memo raises one
+  worker's initial WASM linear memory from about 74 MiB to 178 MiB. The hard
+  corpus showed a sharp cache-capacity cliff at 2^22 entries; a 6.3 M-entry
+  three-way experiment saved memory but slowed the 78-cell proof from about
+  45 s to 51.5 s. This engine favors the requested worst-case latency on a
+  desktop-class machine.
 * **Exact tables use 64-bit Zobrist identity**: a hash match is treated as a
   board match. The collision probability is negligible for game analysis but
   not mathematically zero; formal proof certificates would require a second

@@ -1371,6 +1371,7 @@ let exActive: bool = false;
 let exDepth: i32 = 0;
 let exBest: i32 = NO_SCORE;
 let exBestLen: i32 = 0;
+let exHasWitness: bool = false;
 let exNodes: i32 = 0;
 let exBudget: i32 = 0;
 let exComplete: bool = false;
@@ -1414,11 +1415,21 @@ function strengthenExactStats(bd: usize): void {
     statLower = permanentLower(bd);
 }
 
-function exPush(bd: usize): void {
+function exPush(bd: usize, forcedMove: i32): void {
     const frame = exDepth;
     const frameBd = pu8(EX_BOARDS) + <usize>(frame * CELLS);
     if (frameBd != bd) memory.copy(frameBd, bd, CELLS);
-    const n = enumerateGroups(frameBd);
+    let n = enumerateGroups(frameBd);
+    if (forcedMove >= 0 && forcedMove < CELLS) {
+        let forced = -1;
+        for (let g = 0; g < n; g++) {
+            if (<i32>unchecked(REPS[g]) == forcedMove) { forced = g; break; }
+        }
+        if (forced >= 0) {
+            unchecked(REPS[0] = unchecked(REPS[forced]));
+            n = 1;
+        }
+    }
     memory.copy(pu8(EX_REPS) + <usize>(frame * MAX_ROOTS), pu8(REPS), n);
     unchecked(EX_COUNT[frame] = n);
     unchecked(EX_CURSOR[frame] = 0);
@@ -1456,6 +1467,7 @@ export function exactBegin(budget: i32): void {
     exSeek = false;
     exBest = NO_SCORE;
     exBestLen = 0;
+    exHasWitness = false;
     exNodes = 0;
     exBudget = budget;
     exDepth = 0;
@@ -1470,7 +1482,7 @@ export function exactBegin(budget: i32): void {
 
     scanExactStats(pu8(ROOT_BOARD));
     strengthenExactStats(pu8(ROOT_BOARD));
-    exPush(pu8(ROOT_BOARD));
+    exPush(pu8(ROOT_BOARD), -1);
 }
 
 // runs up to `chunk` expansions; returns:
@@ -1497,6 +1509,7 @@ export function exactStep(chunk: i32): i32 {
             if (value < exBest) {
                 exBest = value;
                 exBestLen = frame;
+                exHasWitness = true;
                 for (let d = 0; d < frame; d++) {
                     unchecked(EX_LINE[d] = unchecked(EX_MOVE[d]));
                 }
@@ -1544,11 +1557,15 @@ export function exactStep(chunk: i32): i32 {
         if (statLower < inheritedLower) statLower = inheritedLower;
         if (statLower >= exBest) continue;
 
-        // transposition: skip boards already explored in this search
         const hash = statHash;
+        let forcedMove = -1;
+        if (exSeek) {
+            const memo = vttLookup(hash);
+            if (memo > exSeekTarget) continue;
+            if (memo == exSeekTarget && vttHitMove != 255) forcedMove = vttHitMove;
+        }
         if (ttSeen(hash)) continue;
-
-        exPush(child);
+        exPush(child, forcedMove);
     }
 
     return -1;
@@ -1567,6 +1584,7 @@ export function exactBeginChild(k: i32, budget: i32): i32 {
     exSeek = false;
     exBest = unchecked(ROOT_BEST[k]);
     exBestLen = 0;
+    exHasWitness = false;
     exNodes = 0;
     exBudget = budget;
     exDepth = 0;
@@ -1576,24 +1594,36 @@ export function exactBeginChild(k: i32, budget: i32): i32 {
     applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
     scanExactStats(pu8(PLAYOUT_BOARD));
     strengthenExactStats(pu8(PLAYOUT_BOARD));
-    exPush(pu8(PLAYOUT_BOARD));
+    exPush(pu8(PLAYOUT_BOARD), -1);
     return 1;
 }
 
-// merges a completed child search into root k: the score is now proven
-// optimal for that move (and improved if the proof found something better);
-// EX_LINE holds moves from the child position, so the root move is prepended
-export function exactMergeChild(k: i32): i32 {
-    if (!exComplete || k < 0 || k >= rootCount) return NO_SCORE;
+// Commits a constructive terminal found by the current child search. This is
+// safe even when the node budget was exhausted: the line is an upper bound,
+// never an exactness claim. EX_LINE starts in the child position, so prepend
+// the root move. Returns the root's resulting best score.
+export function exactCommitChild(k: i32): i32 {
+    if (k < 0 || k >= rootCount) return NO_SCORE;
 
-    if (exBest < unchecked(ROOT_BEST[k])) {
+    if (exHasWitness && exBest < unchecked(ROOT_BEST[k])) {
         unchecked(ROOT_BEST[k] = exBest);
         unchecked(ROOT_LINES[k * LINE_MAX] = unchecked(ROOT_REP[k]));
         for (let d = 0; d < exBestLen; d++) {
             unchecked(ROOT_LINES[k * LINE_MAX + 1 + d] = unchecked(EX_LINE[d]));
         }
         unchecked(ROOT_LINE_LEN[k] = <u8>(exBestLen + 1));
+        maybeMarkRootExact(k);
     }
+
+    return unchecked(ROOT_BEST[k]);
+}
+
+// Merges a completed child search into root k: exhaustive completion proves
+// the move's value in addition to committing any improved witness.
+export function exactMergeChild(k: i32): i32 {
+    if (!exComplete || k < 0 || k >= rootCount) return NO_SCORE;
+
+    exactCommitChild(k);
 
     unchecked(ROOT_EXACT[k] = 1);
     return exBest;
@@ -1614,6 +1644,7 @@ export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
     exSeekTarget = target;
     exBest = target + 1;
     exBestLen = 0;
+    exHasWitness = false;
     exNodes = 0;
     exBudget = budget;
     exDepth = 0;
@@ -1623,7 +1654,10 @@ export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
     applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
     scanExactStats(pu8(PLAYOUT_BOARD));
     strengthenExactStats(pu8(PLAYOUT_BOARD));
-    exPush(pu8(PLAYOUT_BOARD));
+    let forcedMove = -1;
+    const memo = vttLookup(statHash);
+    if (memo == target && vttHitMove != 255) forcedMove = vttHitMove;
+    exPush(pu8(PLAYOUT_BOARD), forcedMove);
     return 1;
 }
 
@@ -1666,13 +1700,18 @@ export function exactMerge(): i32 {
 // re-expansion; a retained DFS frontier avoids replaying unfinished ancestors.
 // ---------------------------------------------------------------------------
 
-const VTT_CAP: i32 = 1 << 21;       // value/policy memo (four-way set associative)
+// The hard-proof corpus exceeds the old 2^21 table by an order of magnitude:
+// it spent >80% of stores evicting another exact value and re-expanded for
+// more than 100 seconds. 2^23 entries use 96 MiB across these four arrays and
+// keep the pathological proofs below the browser's practical memory ceiling.
+const VTT_CAP: i32 = 1 << 23;       // value/policy memo (four-way set associative)
 const VTT_WAYS: i32 = 4;
 const VTT_SETS: i32 = VTT_CAP / VTT_WAYS;
 const VTT_SET_MASK: i32 = VTT_SETS - 1;
 const VTT_KEY = new StaticArray<u64>(VTT_CAP);
 const VTT_DATA = new StaticArray<u16>(VTT_CAP); // low byte value, high byte best move (255 terminal)
-const VTT_STAMP = new StaticArray<u32>(VTT_CAP);
+const VTT_STAMP = new StaticArray<u8>(VTT_CAP); // 0 empty, 1 occupied
+const VTT_REMAINING = new StaticArray<u8>(VTT_CAP);
 const EX_MIN = new StaticArray<i32>(EXACT_STACK);
 const EX_BEST_MOVE = new StaticArray<u8>(EXACT_STACK);
 const EX_HASH = new StaticArray<u64>(EXACT_STACK);
@@ -1684,14 +1723,13 @@ let vsPausedRoot: i32 = -1;
 let vsDepth: i32 = 0;
 let vsNodes: i32 = 0;
 let vsBudget: i32 = 0;
-let vttStamp: u32 = 1;
 let vttHitMove: i32 = -1;
 
 function vttLookup(hash: u64): i32 {
     const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
     for (let way = 0; way < VTT_WAYS; way++) {
         const at = base + way;
-        if (unchecked(VTT_STAMP[at]) == vttStamp && unchecked(VTT_KEY[at]) == hash) {
+        if (unchecked(VTT_STAMP[at]) != 0 && unchecked(VTT_KEY[at]) == hash) {
             const data = unchecked(VTT_DATA[at]);
             vttHitMove = <i32>(data >> 8);
             return <i32>(data & 255);
@@ -1700,20 +1738,35 @@ function vttLookup(hash: u64): i32 {
     return -1;
 }
 
-function vttStore(hash: u64, value: i32, move: i32): void {
+function vttStore(hash: u64, value: i32, move: i32, remaining: i32): void {
     const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
     let at = -1;
+    let victim = base;
+    let victimRemaining = 255;
     for (let way = 0; way < VTT_WAYS; way++) {
         const probe = base + way;
-        if (unchecked(VTT_STAMP[probe]) != vttStamp || unchecked(VTT_KEY[probe]) == hash) {
+        const stamp = unchecked(VTT_STAMP[probe]);
+        if (stamp == 0 || unchecked(VTT_KEY[probe]) == hash) {
             at = probe;
             break;
         }
+        const keptRemaining = <i32>unchecked(VTT_REMAINING[probe]);
+        if (keptRemaining < victimRemaining) {
+            victimRemaining = keptRemaining;
+            victim = probe;
+        }
     }
-    if (at < 0) at = base + <i32>((hash >> 48) & <u64>(VTT_WAYS - 1));
-    unchecked(VTT_STAMP[at] = vttStamp);
+    if (at < 0) {
+        // Retain the state with more cells: it roots a larger sub-DAG and is
+        // much more expensive to reconstruct. Random replacement at the same
+        // capacity proved only 1/10 hard roots in 60 s; depth preference
+        // proved all 10 in 45 s.
+        at = victim;
+    }
+    unchecked(VTT_STAMP[at] = 1);
     unchecked(VTT_KEY[at] = hash);
     unchecked(VTT_DATA[at] = <u16>(value | (move << 8)));
+    unchecked(VTT_REMAINING[at] = <u8>remaining);
 }
 
 // Pushes a board, resolves it immediately, or proves that it cannot improve
@@ -1738,7 +1791,21 @@ function vsPush(bd: usize, cutoff: i32, inheritedLower: i32, parentRemaining: i3
 
     if (n == 0) {
         const value = statRemaining;
-        vttStore(hash, value, 255);
+        // The exact memo is a cache, not durable policy storage. Record an
+        // improving terminal directly from the live DFS stack so later table
+        // replacement cannot erase the only constructive optimal witness.
+        const root = vsPausedRoot;
+        if (root >= 0 && root < rootCount && value < unchecked(ROOT_BEST[root]) &&
+            vsDepth + 1 <= LINE_MAX) {
+            unchecked(ROOT_BEST[root] = value);
+            unchecked(ROOT_LINES[root * LINE_MAX] = unchecked(ROOT_REP[root]));
+            for (let d = 0; d < vsDepth; d++) {
+                unchecked(ROOT_LINES[root * LINE_MAX + 1 + d] = unchecked(EX_MOVE[d]));
+            }
+            unchecked(ROOT_LINE_LEN[root] = <u8>(vsDepth + 1));
+            maybeMarkRootExact(root);
+        }
+        vttStore(hash, value, 255, statRemaining);
         return value;
     }
 
@@ -1788,6 +1855,7 @@ export function vsBegin(k: i32, budget: i32): i32 {
     vsNodes = 0;
     vsBudget = budget;
     vsDepth = 0;
+    vsPausedRoot = k;
 
     memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
     applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
@@ -1795,7 +1863,6 @@ export function vsBegin(k: i32, budget: i32): i32 {
     const immediate = vsPush(pu8(PLAYOUT_BOARD), NO_SCORE,
         <i32>unchecked(ROOT_LOWER[k]), 0);
     vsActive = immediate < 0;
-    vsPausedRoot = k;
     return immediate;
 }
 
@@ -1832,7 +1899,9 @@ export function vsStep(chunk: i32): i32 {
             }
             const child = pu8(EX_BOARDS) + <usize>(vsDepth * CELLS);
             memory.copy(child, pu8(EX_BOARDS) + <usize>(frame * CELLS), CELLS);
-            applyMove(child, <i32>unchecked(EX_REPS[frame * MAX_ROOTS + cursor]));
+            const move = unchecked(EX_REPS[frame * MAX_ROOTS + cursor]);
+            unchecked(EX_MOVE[frame] = move);
+            applyMove(child, <i32>move);
             vsNodes++;
             spent++;
             nodesExpanded++;
@@ -1846,7 +1915,8 @@ export function vsStep(chunk: i32): i32 {
         } else {
             // frame fully enumerated — memoize and merge into the parent
             const value = unchecked(EX_MIN[frame]);
-            vttStore(unchecked(EX_HASH[frame]), value, <i32>unchecked(EX_BEST_MOVE[frame]));
+            vttStore(unchecked(EX_HASH[frame]), value, <i32>unchecked(EX_BEST_MOVE[frame]),
+                <i32>unchecked(EX_REMAINING[frame]));
             vsDepth--;
 
             if (vsDepth == 0) {
