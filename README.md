@@ -15,11 +15,15 @@ Running
 The game is zero-dependency static HTML/CSS/JS, but it uses ES modules, so it must be served over HTTP rather than opened from the filesystem. Any static server will do, e.g.:
 
 ```
-cd src
-python -m http.server 8000    # or: npx serve
+npm run serve
+# or: python -m http.server 8000 --directory .
 ```
 
-then open http://localhost:8000/.
+Then open http://localhost:8123/ for the npm command (or
+http://localhost:8000/ for the Python command). Serve the repository root:
+its `index.html` redirects to `src/index.html` while preserving shared-link
+query parameters and hashes. The same relative redirect works when GitHub
+Pages publishes the repository from `/`.
 
 Game links
 ----------
@@ -54,6 +58,12 @@ route. It starts on the vertical main line; double-click any node to route repla
 or play a new branch to select that branch automatically. The mouse wheel and rewind controls
 step along this route. The panel shows five tree columns by default, expands into available
 window space for wider trees, then scrolls horizontally when necessary.
+
+The bottom-left **settings** button controls the move navigator and engine list.
+The moves slider sits below the board, defaults to visible on mobile devices,
+and can be shown or hidden explicitly. Engine suggestions can display the top
+five moves, the top five plus the first positive-score move, or every ranked
+legal move.
 
 The game clock is strict about what counts: it runs only while a fresh game is played purely
 on the board, and the moment any other control is used (buttons, wheel, engine or tree

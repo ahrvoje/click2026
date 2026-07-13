@@ -46,13 +46,20 @@ const {
     settlementReady,
     summarizePositionProof,
     analysisState,
+    canTransferExactSuffix,
+    mirrorClickedPrefixTasks,
     positionProofCandidates,
+    prefixTaskOwner,
+    remainingAfterMove,
+    roundRobinPrefixTasks,
+    shouldGpuCaretake,
 } =
     await import("../src/scripts/engine/schedule.js");
 
 // --- wasm setup -------------------------------------------------------------
 
-const wasmBytes = await readFile(join(root, "src/scripts/engine/engine.wasm"));
+const wasmAsset = process.env.ENGINE_TEST_WASM || "src/scripts/engine/engine.wasm";
+const wasmBytes = await readFile(join(root, wasmAsset));
 const { instance } = await WebAssembly.instantiate(wasmBytes, {
     env: { abort: () => { throw new Error("wasm abort"); } },
 });
@@ -167,6 +174,16 @@ function collectResults() {
         at += n;
     }
 
+    if (bytes.length >= at + 40 && view.getUint32(at, true) === 0x32544154) {
+        const u64 = (offset) => view.getUint32(offset, true) +
+            view.getUint32(offset + 4, true) * 2 ** 32;
+        stats.flags = view.getUint32(at + 4, true);
+        stats.beamPositions = u64(at + 8);
+        stats.exactPositions = u64(at + 16);
+        stats.playoutPositions = u64(at + 24);
+        stats.playouts = u64(at + 32);
+    }
+
     return { stats, roots };
 }
 
@@ -277,6 +294,507 @@ suite("beam search: every score replays to its claimed final", () => {
                 JSON.stringify(jsGroup.map(cellOf).sort((a, b) => a - b)),
                 "root group cells mismatch", { iter, rep: r.rep });
         }
+    }
+});
+
+suite("parallel beam partitions and GPU candidate bridge preserve the rules", () => {
+    const position = randomPosition(mulberry32(20260713));
+    const lanes = 4;
+
+    for (let lane = 0; lane < lanes; lane++) {
+        setIOBoard(position);
+        eng.setBoard();
+        const before = collectResults().roots;
+        eng.beamBeginPartition(128, lane + 1, lane, lanes);
+        while (eng.beamStep(100000) === 0) { /* run */ }
+        const { roots: after, stats } = collectResults();
+        for (let k = 0; k < after.length; k++) {
+            if (k % lanes === lane) continue;
+            check(after[k].best === before[k].best &&
+                JSON.stringify(after[k].line) === JSON.stringify(before[k].line),
+            "partition changed a root owned by another lane",
+            { lane, rep: before[k].rep, before: before[k].best, after: after[k].best });
+        }
+        check(stats.nodes === stats.beamPositions + stats.exactPositions + stats.playoutPositions,
+            "telemetry footer does not reconcile", stats);
+    }
+
+    // The bridge materializes exactly the JS root child and second-ply boards
+    // consumed by the heuristic-only GPU feature kernel.
+    setIOBoard(position);
+    eng.setBoard();
+    const roots = collectResults().roots;
+    for (let k = 0; k < Math.min(5, roots.length); k++) {
+        const rootChild = clonePosition(position);
+        removeGroup(rootChild, extractGroup(rootChild, fieldOf(roots[k].rep)));
+        const jsSeconds = enumerateGroups(rootChild);
+        const n = eng.childGroupsToIO(k);
+        const wasmSeconds = Array.from(mem().slice(IO + 256, IO + 256 + n));
+        const wasmSecondSizes = Array.from(mem().slice(IO + 512, IO + 512 + n));
+        check(JSON.stringify(wasmSeconds) === JSON.stringify(jsSeconds.map((group) => cellOf(group.rep))),
+            "GPU bridge second-ply enumeration mismatch", { k, wasmSeconds });
+        check(JSON.stringify(wasmSecondSizes) === JSON.stringify(jsSeconds.map((group) => group.cells.length)),
+            "GPU bridge second-ply size metadata mismatch", { k, wasmSecondSizes });
+        check(JSON.stringify(Array.from(mem().slice(IO, IO + 144))) ===
+            JSON.stringify(Array.from(positionToBytes(rootChild))),
+        "GPU bridge root-child board mismatch", { k });
+
+        for (let g = 0; g < Math.min(3, jsSeconds.length); g++) {
+            const grandchild = clonePosition(rootChild);
+            removeGroup(grandchild, jsSeconds[g].cells);
+            check(eng.grandchildToIO(k, cellOf(jsSeconds[g].rep)) === 1,
+                "GPU bridge rejected a legal second move", { k, g });
+            check(JSON.stringify(Array.from(mem().slice(IO, IO + 144))) ===
+                JSON.stringify(Array.from(positionToBytes(grandchild))),
+            "GPU bridge grandchild board mismatch", { k, g });
+        }
+    }
+});
+
+suite("explicit second-ply beams lift clicked-child clearing corridors", () => {
+    const game = new Game("?v=5&g=Bp-rtMfMUUaxsQwaoLBDFQp4_m1oPxZc7RzdEmIsH6ErajTAL9v9H5JAlMB");
+    const position = game.getStartPosition();
+    const lanes = 144; // one stable enumeration-ordinal partition per lane
+    const cases = [
+        { parent: 27, second: 89, width: 128, seed: 0 },
+        { parent: 86, second: 87, width: 512, seed: 0 },
+        { parent: 60, second: 1, width: 2048, seed: 2 },
+        { parent: 126, second: 1, width: 2048, seed: 0 },
+    ];
+
+    for (const spec of cases) {
+        setIOBoard(position);
+        eng.setBoard();
+        const before = collectResults().roots;
+        const k = before.findIndex((root) => root.rep === spec.parent);
+        check(k >= 0, "second-ply fixture lost its parent root", spec);
+        if (k < 0) continue;
+
+        eng.beamBeginRootChild(k, spec.second, spec.width, spec.seed);
+        while (eng.beamStep(400_000) === 0) { /* complete the single-prefix beam */ }
+
+        const after = collectResults().roots;
+        const result = after[k];
+        check(result.best === 0 && result.exact,
+            "single-prefix beam missed its clearing corridor", { spec, result });
+        check(result.line[0] === spec.parent && result.line[1] === spec.second,
+            "single-prefix beam lost a prefix edge", { spec, line: result.line });
+        check(replayLine(position, result.line) === 0,
+            "single-prefix beam line does not replay", { spec, result });
+
+        for (let i = 0; i < after.length; i++) {
+            if (i === k) continue;
+            check(after[i].best === before[i].best && after[i].exact === before[i].exact &&
+                JSON.stringify(after[i].line) === JSON.stringify(before[i].line),
+            "single-prefix beam modified an unrelated root",
+            { spec, i, before: before[i], after: after[i] });
+        }
+
+        // A proved parent is an inactive no-op, even if a scheduler submits a
+        // queued partition after receiving the proof.
+        const proved = JSON.stringify(after);
+        eng.beamBeginRootChild(k, spec.second, spec.width, spec.seed);
+        check(eng.beamStep(1) === 1,
+            "proved single-prefix beam remained active", spec);
+        check(JSON.stringify(collectResults().roots) === proved,
+            "proved single-prefix beam changed the table", spec);
+    }
+
+    // Invalid roots and lanes which own no second move must abandon any prior
+    // pass and leave the complete result table untouched.
+    setIOBoard(position);
+    eng.setBoard();
+    const before = collectResults().roots;
+    const beforeJSON = JSON.stringify(before);
+    eng.beamBeginRootChild(-1, 89, 128, 0);
+    check(eng.beamStep(1) === 1 && JSON.stringify(collectResults().roots) === beforeJSON,
+        "invalid single-prefix parent was not an inactive no-op");
+
+    const k = before.findIndex((root) => root.rep === 27);
+    eng.beamBeginRootChild(k, 255, 128, 0);
+    check(eng.beamStep(1) === 1 && JSON.stringify(collectResults().roots) === beforeJSON,
+        "illegal single-prefix second move was not an inactive no-op");
+    eng.beamBeginRootChild(k, 89, 0, 0);
+    check(eng.beamStep(1) === 1 && JSON.stringify(collectResults().roots) === beforeJSON,
+        "zero-width single-prefix beam was not an inactive no-op");
+
+    const secondCount = eng.childGroupsToIO(k);
+    const emptyLane = Array.from({ length: lanes }, (_, lane) => lane)
+        .find((lane) => lane >= secondCount);
+    check(emptyLane !== undefined, "fixture has no empty second-move partition");
+    if (emptyLane !== undefined) {
+        eng.beamBeginRootChildrenPartition(k, 128, 0, emptyLane, lanes);
+        check(eng.beamStep(1) === 1 && JSON.stringify(collectResults().roots) === beforeJSON,
+            "empty second-ply partition was not an inactive no-op", { emptyLane });
+    }
+});
+
+suite("forced-prefix target seeks cannot be starved by sibling branches", () => {
+    const game = new Game("?v=5&g=Bp-rtMfMUUaxsQwaoLBDFQp4_m1oPxZc7RzdEmIsH6ErajTAL9v9H5JAlMB");
+    const position = game.getStartPosition();
+    const cases = [
+        { parent: 60, second: 1, budget: 700_000 },
+        { parent: 86, second: 91, budget: 70_000 },
+        { parent: 126, second: 28, budget: 900_000 },
+    ];
+
+    for (const spec of cases) {
+        setIOBoard(position);
+        eng.setBoard();
+        const before = collectResults();
+        const k = before.roots.findIndex((root) => root.rep === spec.parent);
+        check(k >= 0, "forced-prefix fixture lost its parent root", spec);
+        if (k < 0) continue;
+
+        check(eng.exactBeginRootChildSeek(k, spec.second, spec.budget, 0) === 1,
+            "forced-prefix target seek rejected a legal prefix", spec);
+        let result = -1;
+        while (result === -1) result = eng.exactStep(60_000);
+        const searched = collectResults();
+        check(result === 0, "forced-prefix target seek missed zero", { spec, result });
+        check(searched.stats.nodes - before.stats.nodes <= spec.budget,
+            "forced-prefix target seek exceeded its deterministic budget",
+            { spec, nodes: searched.stats.nodes - before.stats.nodes });
+
+        // A caller cannot attach the live witness to a different second move.
+        const beforeMismatch = JSON.stringify(searched.roots);
+        check(eng.exactCommitRootChild(k, spec.second + 1) > SIZE * SIZE,
+            "mismatched forced-prefix commit was accepted", spec);
+        check(JSON.stringify(collectResults().roots) === beforeMismatch,
+            "mismatched forced-prefix commit changed the table", spec);
+
+        check(eng.exactCommitRootChild(k, spec.second) === 0,
+            "forced-prefix witness did not commit its score", spec);
+        const after = collectResults().roots;
+        check(after[k].best === 0 && after[k].exact,
+            "forced-prefix zero did not prove the parent bound", { spec, root: after[k] });
+        check(after[k].line[0] === spec.parent && after[k].line[1] === spec.second,
+            "forced-prefix exact line lost a prefix edge", { spec, line: after[k].line });
+        check(replayLine(position, after[k].line) === 0,
+            "forced-prefix exact line does not replay", { spec, root: after[k] });
+        for (let i = 0; i < after.length; i++) {
+            if (i === k) continue;
+            check(after[i].best === before.roots[i].best &&
+                after[i].exact === before.roots[i].exact &&
+                JSON.stringify(after[i].line) === JSON.stringify(before.roots[i].line),
+            "forced-prefix commit modified an unrelated root",
+            { spec, i, before: before.roots[i], after: after[i] });
+        }
+
+        const committed = JSON.stringify(after);
+        check(eng.exactMergeChild(k) > SIZE * SIZE && eng.exactMerge() > SIZE * SIZE,
+            "consumed forced-prefix state remained mergeable as a whole-child proof", spec);
+        const unrelated = after.findIndex((root, index) => index !== k && !root.exact);
+        if (unrelated >= 0) eng.exactCommitChild(unrelated);
+        check(JSON.stringify(collectResults().roots) === committed,
+            "consumed forced-prefix witness was reusable on an unrelated root", spec);
+        check(eng.exactCommitRootChild(k, spec.second) > SIZE * SIZE &&
+            JSON.stringify(collectResults().roots) === committed,
+        "stale forced-prefix commit was not a no-op", spec);
+    }
+
+    // Solving one positive second branch supplies an upper bound, not a proof
+    // of the parent child position: an unvisited sibling can still do better.
+    setIOBoard(position);
+    eng.setBoard();
+    let roots = collectResults().roots;
+    let k = roots.findIndex((root) => root.rep === 60);
+    check(eng.exactBeginRootChildSeek(k, 1, 700_000, 1) === 1,
+        "positive forced-prefix seek did not start");
+    let positive = -1;
+    while (positive === -1) positive = eng.exactStep(60_000);
+    check(positive === 1 && eng.exactCommitRootChild(k, 1) === 1,
+        "positive forced-prefix witness did not commit", { positive });
+    roots = collectResults().roots;
+    check(roots[k].best === 1 && !roots[k].exact && eng.getRootLower(k) === 0,
+        "one positive branch incorrectly proved its parent", roots[k]);
+    check(replayLine(position, roots[k].line) === 1,
+        "positive forced-prefix line does not replay", roots[k]);
+
+    // Exhausting a budget without a terminal witness is not evidence, and an
+    // illegal begin invalidates any earlier live prefix identity.
+    setIOBoard(position);
+    eng.setBoard();
+    const before = collectResults().roots;
+    const beforeJSON = JSON.stringify(before);
+    k = before.findIndex((root) => root.rep === 60);
+    check(eng.exactBeginRootChildSeek(k, 1, 0, 0) === 1,
+        "zero-budget forced-prefix seek did not start");
+    check(eng.exactStep(60_000) === -2,
+        "zero-budget forced-prefix seek did not exhaust");
+    check(eng.exactCommitRootChild(k, 1) > SIZE * SIZE &&
+        JSON.stringify(collectResults().roots) === beforeJSON,
+    "budget exhaustion without a witness changed the root table");
+
+    check(eng.exactBeginRootChildSeek(k, 1, 700_000, 0) === 1,
+        "stale-identity setup seek did not start");
+    check(eng.exactBeginRootChildSeek(k, 255, 700_000, 0) === 0,
+        "illegal forced-prefix second move was accepted");
+    check(eng.exactCommitRootChild(k, 1) > SIZE * SIZE &&
+        JSON.stringify(collectResults().roots) === beforeJSON,
+    "illegal begin left a stale committable prefix");
+});
+
+suite("arbitrary prefixes reproduce visible-board search semantics", () => {
+    const game = new Game("?v=5&g=c8_xC_qbkOmoL9PZI-OPrF1IvXT0gZS4-eB6ANOq1WKyA6e1WMZK-_U0qw4HFOrYA0HyOF3Gd0XWMZZfgVegxTEykEHwefiPh");
+    let node = game.getRoot();
+    for (const child of [0, 0, 0, 0, 0, 1]) node = node.children[child];
+    game.focusNode(node);
+    const position = game.getCurrentPosition();
+
+    const positionAfter = (line) => {
+        const next = clonePosition(position);
+        for (const cell of line) {
+            const group = extractGroup(next, fieldOf(cell));
+            check(group.length >= 2, "arbitrary-prefix fixture contains an illegal move",
+                { line, cell });
+            if (group.length < 2) break;
+            removeGroup(next, group);
+        }
+        return next;
+    };
+
+    setIOBoard(position);
+    eng.setBoard();
+    let roots = collectResults().roots;
+    const fa = roots.findIndex((root) => root.rep === 60);
+    check(fa >= 0, "arbitrary-prefix fixture lost FA");
+    if (fa < 0) return;
+
+    // Enumeration writes the fully materialized board and the next-root table
+    // while retaining the IO prefix long enough to replay-validate it.
+    const faAc = positionAfter([60, 2]);
+    const jsNext = enumerateGroups(faAc);
+    mem().set(Uint8Array.from([2]), IO);
+    const count = eng.prefixGroupsToIO(fa, 1);
+    check(count === jsNext.length, "prefix next-group count differs from visible board",
+        { count, expected: jsNext.length });
+    check(JSON.stringify(Array.from(mem().slice(IO, IO + SIZE * SIZE))) ===
+        JSON.stringify(Array.from(positionToBytes(faAc))),
+    "prefix bridge materialized the wrong board");
+    check(JSON.stringify(Array.from(mem().slice(IO + 256, IO + 256 + count))) ===
+        JSON.stringify(jsNext.map((group) => cellOf(group.rep))) &&
+        JSON.stringify(Array.from(mem().slice(IO + 512, IO + 512 + count))) ===
+        JSON.stringify(jsNext.map((group) => group.cells.length)),
+    "prefix bridge next-group metadata differs from visible roots");
+
+    // Its one-ply greedy lift must equal setBoard's root baselines on that
+    // visible virtual board, modulo a better line already known elsewhere
+    // below FA. Only FA may change.
+    setIOBoard(faAc);
+    eng.setBoard();
+    const visibleBest = Math.min(...collectResults().roots.map((root) => root.best));
+    setIOBoard(position);
+    eng.setBoard();
+    const beforeGreedy = collectResults().roots;
+    mem().set(Uint8Array.from([2]), IO);
+    const greedy = eng.probeRootPrefixTable(fa, 1);
+    const afterGreedy = collectResults().roots;
+    check(greedy === Math.min(beforeGreedy[fa].best, visibleBest),
+        "prefix greedy table differs from visible-board baselines",
+        { greedy, parent: beforeGreedy[fa].best, visibleBest });
+    check(replayLine(position, afterGreedy[fa].line) === afterGreedy[fa].best,
+        "prefix greedy lift produced a non-replayable line", afterGreedy[fa]);
+    if (afterGreedy[fa].best < beforeGreedy[fa].best) {
+        check(afterGreedy[fa].line[0] === 60 && afterGreedy[fa].line[1] === 2,
+            "prefix greedy lift lost its fixed moves", afterGreedy[fa]);
+    }
+    for (let i = 0; i < afterGreedy.length; i++) {
+        if (i === fa) continue;
+        check(JSON.stringify(afterGreedy[i]) === JSON.stringify(beforeGreedy[i]),
+            "prefix greedy lift modified an unrelated root", { i });
+    }
+
+    // Hard and soft playouts must use the tabu color of the board after the
+    // complete prefix. Compare their final result directly with the standalone
+    // visible-board twins for the same seeds.
+    const tail = [2, 36];
+    const faAcDa = positionAfter([60, ...tail]);
+    for (const [soft, seed] of [[false, 0x12345678], [true, 0x13579BDF]]) {
+        setIOBoard(faAcDa);
+        const expected = soft ? eng.testPlayoutSoft(seed) : eng.testPlayout(seed);
+
+        setIOBoard(position);
+        eng.setBoard();
+        const before = collectResults().roots;
+        mem().set(Uint8Array.from(tail), IO);
+        const actual = soft
+            ? eng.playoutRootPrefixSoft(fa, tail.length, 1, seed)
+            : eng.playoutRootPrefix(fa, tail.length, 1, seed);
+        const after = collectResults().roots;
+        check(actual === expected, "prefix playout differs from visible-board tabu semantics",
+            { soft, seed, actual, expected });
+        check(replayLine(position, after[fa].line) === after[fa].best,
+            "prefix playout left a non-replayable root line", { soft, root: after[fa] });
+        if (after[fa].best < before[fa].best) {
+            check(JSON.stringify(after[fa].line.slice(0, 3)) === JSON.stringify([60, 2, 36]),
+                "prefix playout lost its fixed moves", { soft, line: after[fa].line });
+        }
+        for (let i = 0; i < after.length; i++) {
+            if (i === fa) continue;
+            check(JSON.stringify(after[i]) === JSON.stringify(before[i]),
+                "prefix playout modified an unrelated root", { soft, i });
+        }
+    }
+
+    setIOBoard(position);
+    eng.setBoard();
+    const unchanged = JSON.stringify(collectResults().roots);
+    mem().set(Uint8Array.from([255]), IO);
+    const badGroups = eng.prefixGroupsToIO(fa, 1);
+    mem().set(Uint8Array.from([255]), IO);
+    const badGreedy = eng.probeRootPrefixTable(fa, 1);
+    const currentBest = collectResults().roots[fa].best;
+    mem().set(Uint8Array.from([255]), IO);
+    const badPlayout = eng.playoutRootPrefix(fa, 1, 1, 1);
+    check(badGroups === -1 && badGreedy === currentBest && badPlayout > SIZE * SIZE &&
+        JSON.stringify(collectResults().roots) === unchanged,
+    "illegal arbitrary prefix changed the result table");
+});
+
+suite("arbitrary-prefix beam and target search preserve full parent lines", () => {
+    const game = new Game("?v=5&g=c8_xC_qbkOmoL9PZI-OPrF1IvXT0gZS4-eB6ANOq1WKyA6e1WMZK-_U0qw4HFOrYA0HyOF3Gd0XWMZZfgVegxTEykEHwefiPh");
+    let node = game.getRoot();
+    for (const child of [0, 0, 0, 0, 0, 1]) node = node.children[child];
+    game.focusNode(node);
+    const position = game.getCurrentPosition();
+
+    // FA -> AC -> DA: the visible child finds this exact target in about 218k
+    // nodes. A generation token prevents an abandoned begin from stealing or
+    // consuming the next begin's witness, and the prefix survives IO reuse.
+    setIOBoard(position);
+    eng.setBoard();
+    let before = collectResults();
+    let k = before.roots.findIndex((root) => root.rep === 60);
+    const faTail = [2, 36];
+    mem().set(Uint8Array.from(faTail), IO);
+    const staleToken = eng.exactBeginRootPrefixSeek(k, faTail.length, 1_000_000, 0);
+    mem().set(Uint8Array.from(faTail), IO);
+    const token = eng.exactBeginRootPrefixSeek(k, faTail.length, 1_000_000, 0);
+    check(staleToken > 0 && token > 0 && token !== staleToken,
+        "prefix exact begin did not issue distinct generation tokens",
+        { staleToken, token });
+    check(eng.exactCommitRootPrefix(staleToken) > SIZE * SIZE,
+        "stale prefix token consumed the newer search");
+    let result = -1;
+    while (result === -1) result = eng.exactStep(60_000);
+    check(result === 0, "FA -> AC -> DA target seek missed zero", { result });
+    const searched = collectResults();
+    check(searched.stats.nodes - before.stats.nodes <= 1_000_001,
+        "arbitrary-prefix exact seek exceeded its budget",
+        { nodes: searched.stats.nodes - before.stats.nodes });
+    mem().fill(255, IO, IO + 32); // commit must use its durable saved prefix
+    check(eng.exactCommitRootPrefix(token) === 0,
+        "arbitrary-prefix exact witness did not commit");
+    let after = collectResults().roots;
+    check(after[k].best === 0 && after[k].exact &&
+        JSON.stringify(after[k].line.slice(0, 3)) === JSON.stringify([60, 2, 36]) &&
+        replayLine(position, after[k].line) === 0,
+    "FA arbitrary-prefix proof lost soundness or its full prefix", after[k]);
+    for (let i = 0; i < after.length; i++) {
+        if (i === k) continue;
+        check(JSON.stringify(after[i]) === JSON.stringify(before.roots[i]),
+            "FA arbitrary-prefix proof modified an unrelated root", { i });
+    }
+    const committed = JSON.stringify(after);
+    check(eng.exactCommitRootPrefix(token) > SIZE * SIZE &&
+        JSON.stringify(collectResults().roots) === committed,
+    "consumed arbitrary-prefix token remained reusable");
+
+    // An invalid begin invalidates the earlier live token without changing any
+    // row. Budget misses and malformed queued work cannot become evidence.
+    setIOBoard(position);
+    eng.setBoard();
+    before = collectResults();
+    k = before.roots.findIndex((root) => root.rep === 60);
+    mem().set(Uint8Array.from(faTail), IO);
+    const abandoned = eng.exactBeginRootPrefixSeek(k, faTail.length, 1_000_000, 0);
+    mem().set(Uint8Array.from([255, 36]), IO);
+    check(eng.exactBeginRootPrefixSeek(k, 2, 1_000_000, 0) === 0 &&
+        eng.exactCommitRootPrefix(abandoned) > SIZE * SIZE &&
+        JSON.stringify(collectResults().roots) === JSON.stringify(before.roots),
+    "illegal prefix left stale exact evidence");
+
+    // DC -> GD -> DB is the second clicked-child discontinuity. A private
+    // width-2048 seed-1 beam clears it directly when the complete prefix owns
+    // its heap; all unrelated parent rows remain isolated.
+    setIOBoard(position);
+    eng.setBoard();
+    before = collectResults();
+    k = before.roots.findIndex((root) => root.rep === 38);
+    const dcTail = [75, 37];
+    mem().set(Uint8Array.from(dcTail), IO);
+    check(eng.beamBeginRootPrefix(k, dcTail.length, 2048, 1) === 1,
+        "DC arbitrary-prefix beam rejected its legal corridor");
+    while (eng.beamStep(400_000) === 0) { /* complete private prefix pass */ }
+    after = collectResults().roots;
+    check(after[k].best === 0 && after[k].exact &&
+        JSON.stringify(after[k].line.slice(0, 3)) === JSON.stringify([38, 75, 37]) &&
+        replayLine(position, after[k].line) === 0,
+    "DC arbitrary-prefix beam missed or lost its clearing corridor", after[k]);
+    for (let i = 0; i < after.length; i++) {
+        if (i === k) continue;
+        check(JSON.stringify(after[i]) === JSON.stringify(before.roots[i]),
+            "DC arbitrary-prefix beam modified an unrelated root", { i });
+    }
+
+    setIOBoard(position);
+    eng.setBoard();
+    before = collectResults();
+    k = before.roots.findIndex((root) => root.rep === 38);
+    mem().set(Uint8Array.from(dcTail), IO);
+    check(eng.beamBeginRootPrefix(k, 2, 2048, 1) === 1,
+        "invalid-beam setup rejected its legal prefix");
+    mem().set(Uint8Array.from([75, 255]), IO);
+    check(eng.beamBeginRootPrefix(k, 2, 2048, 1) === 0 && eng.beamStep(1) === 1 &&
+        JSON.stringify(collectResults().roots) === JSON.stringify(before.roots),
+    "illegal prefix did not cancel a queued beam safely");
+
+    // A positive target is a constructive upper bound for one fixed branch,
+    // never a proof of siblings that were not searched.
+    const oldGame = new Game("?v=5&g=Bp-rtMfMUUaxsQwaoLBDFQp4_m1oPxZc7RzdEmIsH6ErajTAL9v9H5JAlMB");
+    const oldPosition = oldGame.getStartPosition();
+    setIOBoard(oldPosition);
+    eng.setBoard();
+    before = collectResults();
+    k = before.roots.findIndex((root) => root.rep === 60);
+    mem().set(Uint8Array.from([1]), IO);
+    const positiveToken = eng.exactBeginRootPrefixSeek(k, 1, 700_000, 1);
+    result = -1;
+    while (result === -1) result = eng.exactStep(60_000);
+    check(positiveToken > 0 && result === 1 &&
+        eng.exactCommitRootPrefix(positiveToken) === 1,
+    "positive arbitrary-prefix witness did not commit", { positiveToken, result });
+    after = collectResults().roots;
+    check(after[k].best === 1 && !after[k].exact && eng.getRootLower(k) === 0 &&
+        replayLine(oldPosition, after[k].line) === 1,
+    "positive arbitrary-prefix witness unsafely proved its parent", after[k]);
+
+    // The second reported game has a deterministic zero corridor beginning
+    // GL -> FH -> AF. Its remaining suffix is below the 100k target budget.
+    const startGame = new Game("?v=5&g=G7hGDfQ_u8-RuUiNwlBPWQYGCitOqgY9Zi1Z-F0sf3WHSpfuQsGhchAYNCVsfRfGbplq37oZTqDrFgFqovNPzrBidRg_D");
+    const start = startGame.getStartPosition();
+    setIOBoard(start);
+    eng.setBoard();
+    before = collectResults();
+    k = before.roots.findIndex((root) => root.rep === 83);
+    const startTail = [67, 5];
+    mem().set(Uint8Array.from(startTail), IO);
+    const startToken = eng.exactBeginRootPrefixSeek(k, startTail.length, 100_000, 0);
+    result = -1;
+    while (result === -1) result = eng.exactStep(20_000);
+    check(startToken > 0 && result === 0 && eng.exactCommitRootPrefix(startToken) === 0,
+        "GL -> FH -> AF target seek missed its deterministic zero",
+        { startToken, result });
+    after = collectResults().roots;
+    check(after[k].exact && after[k].best === 0 &&
+        JSON.stringify(after[k].line.slice(0, 3)) === JSON.stringify([83, 67, 5]) &&
+        replayLine(start, after[k].line) === 0,
+    "start-position arbitrary-prefix line is not a replayable zero", after[k]);
+    for (let i = 0; i < after.length; i++) {
+        if (i === k) continue;
+        check(JSON.stringify(after[i]) === JSON.stringify(before.roots[i]),
+            "start-position arbitrary prefix modified an unrelated root", { i });
     }
 });
 
@@ -418,6 +936,56 @@ suite("warm start: lines and proofs transfer across positions", () => {
     }
 });
 
+suite("child table lifts an instant child clear into its parent root", () => {
+    const boardBytes = Uint8Array.from([
+        5,2,4,4,4,1,2,2,1,2,2,3, 3,2,4,2,4,2,5,3,5,4,1,5,
+        3,3,2,3,5,1,2,5,5,3,2,5, 2,5,5,5,4,1,4,3,1,3,3,3,
+        1,1,1,5,3,3,4,1,1,1,1,5, 1,1,4,3,4,1,5,2,3,5,3,3,
+        5,4,4,5,1,5,3,1,4,1,1,5, 4,4,1,5,5,1,2,4,5,4,3,2,
+        2,3,2,5,5,5,1,2,3,3,2,4, 3,5,1,3,5,2,3,3,2,4,1,4,
+        1,3,2,2,1,5,1,4,5,1,1,2, 3,1,1,5,2,1,2,4,4,1,3,3,
+    ]);
+    const position = bytesToPosition(boardBytes);
+    setIOBoard(position);
+    eng.setBoard();
+    const initial = collectResults().roots;
+    const initialK = initial.findIndex((root) => root.rep === 37);
+    check(initialK >= 0, "parent fixture lost target root");
+    check(initial[initialK].best === 3 && !initial[initialK].exact,
+        "parent fixture no longer exposes the missed tactic", initial[initialK]);
+
+    // Entering the child exposes every second move as a root. Its ordinary
+    // setBoard baseline therefore discovers and proves the clear immediately.
+    const child = clonePosition(position);
+    removeGroup(child, extractGroup(child, fieldOf(37)));
+    setIOBoard(child);
+    eng.setBoard();
+    const childClear = collectResults().roots.find((root) => root.rep === 122);
+    check(childClear?.best === 0 && childClear.exact,
+        "child baseline did not prove its immediate clear", childClear);
+    check(replayLine(child, childClear?.line ?? []) === 0,
+        "child clear line does not replay", childClear);
+
+    // The parent probe must perform that same child-root table without making
+    // the user click first, and it must not alter unrelated root rows.
+    setIOBoard(position);
+    eng.setBoard();
+    const before = collectResults().roots;
+    const k = before.findIndex((root) => root.rep === 37);
+    check(eng.probeRootChildTable(k) === 0, "parent child-table probe missed the clear");
+    const after = collectResults().roots;
+    check(after[k].best === 0 && after[k].exact,
+        "lifted parent root was not proved zero", after[k]);
+    check(replayLine(position, after[k].line) === 0,
+        "lifted parent line does not replay", after[k]);
+    for (let i = 0; i < after.length; i++) {
+        if (i === k) continue;
+        check(after[i].best === before[i].best && after[i].exact === before[i].exact &&
+            JSON.stringify(after[i].line) === JSON.stringify(before[i].line),
+        "child-table probe modified an unrelated root", { i, before: before[i], after: after[i] });
+    }
+});
+
 suite("intrinsic proofs: terminal and lower-bound scores need no search", () => {
     const board = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
     board[0][0] = 1;
@@ -556,6 +1124,23 @@ suite("permanent separators: fixed-point lower bound is sound", () => {
     check(roots.length === 1 && roots[0].best === 0 && roots[0].exact,
         "vertical mergeable counterexample no longer clears", roots);
 
+    // No color is globally singleton and the separator fixed point therefore
+    // has no seed. Nevertheless, after the only legal 1-pair is removed the
+    // remaining 2-1-2 column is immutable. The delete relaxation proves all
+    // three leftovers without mistaking either removable 1 for permanent.
+    const relaxedTrap = empty();
+    relaxedTrap[0][0] = 1;
+    for (const [row, color] of [1, 2, 1, 2].entries()) {
+        relaxedTrap[1][row] = color;
+    }
+    setIOBoard(relaxedTrap);
+    check(eng.testLowerBound() === 0,
+        "delete-relaxation fixture was already covered by the old bound");
+    check(eng.testPotentialLowerBound() === 3,
+        "delete relaxation missed the forced 2-1-2 tail", {
+            potential: eng.testPotentialLowerBound(),
+        });
+
     // Exhaust every normalized board up to 3x3 with three colors. A shared
     // brute-force memo covers the entire reachable state family cheaply.
     const columns = [];
@@ -592,8 +1177,9 @@ suite("permanent separators: fixed-point lower bound is sound", () => {
 
     let checked = 0;
     let violation = null;
+    let potentialViolation = null;
     const enumerateBoards = (chosen, width) => {
-        if (violation) return;
+        if (violation || potentialViolation) return;
         if (chosen.length === width) {
             const position = empty();
             for (let col = 0; col < width; col++) {
@@ -601,9 +1187,13 @@ suite("permanent separators: fixed-point lower bound is sound", () => {
             }
             setIOBoard(position);
             const lower = eng.testLowerBound();
+            const potential = eng.testPotentialLowerBound();
             const optimum = brute(position);
             checked++;
             if (lower > optimum) violation = { chosen, lower, optimum };
+            if (potential > optimum) {
+                potentialViolation = { chosen, potential, optimum };
+            }
             return;
         }
         for (const column of columns) enumerateBoards([...chosen, column], width);
@@ -611,6 +1201,8 @@ suite("permanent separators: fixed-point lower bound is sound", () => {
     for (let width = 0; width <= 3; width++) enumerateBoards([], width);
     check(checked === 60_880, "separator exhaustive corpus incomplete", { checked });
     check(violation === null, "separator lower bound exceeded exact optimum", violation);
+    check(potentialViolation === null,
+        "delete-relaxation lower bound exceeded exact optimum", potentialViolation);
 });
 
 suite("value solver: exact per-move values from one shared enumeration", () => {
@@ -766,6 +1358,35 @@ suite("permanent-only portfolio crosses temporary fragmentation", () => {
     check(k >= 0, "move-25 clearing root FC is missing");
     if (k < 0) return;
 
+    // Reproduce the 16-lane owner's real history. Ordinary partitioned beams
+    // improve FC to a nonzero incumbent first; the complementary pass must be
+    // invariant to that improvement. Incumbent-dependent beam pruning used to
+    // change the bounded heap trajectory and lose the clearing corridor here.
+    const lane = k % 16;
+    let localSeed = 1;
+    for (let root = 0; root < roots.length; root++) {
+        if (root % 16 !== lane) continue;
+        eng.playoutRoot(root, 32, localSeed);
+        eng.playoutRootSoft(root, 4, localSeed);
+        localSeed += 32;
+    }
+    for (const width of [8, 32, 128, 512]) {
+        eng.beamBeginPartition(width, 0, lane, 16);
+        while (eng.beamStep(400_000) === 0) { /* complete pass */ }
+    }
+    roots = collectResults().roots;
+    check(roots[k].best > 0 && roots[k].best <= 5,
+        "partitioned worker history did not establish the incumbent trap", roots[k]);
+    eng.beamBeginRootPermanent(k, 8192);
+    while (eng.beamStep(400_000) === 0) { /* run complementary pass */ }
+    roots = collectResults().roots;
+    check(roots[k].best === 0 && roots[k].exact,
+        "better incumbent changed the complementary beam's clearing result", roots[k]);
+
+    setIOBoard(position);
+    eng.setBoard();
+    roots = collectResults().roots;
+
     // Mirror the worker stages up through width 512, then its bounded
     // score-ordered portfolio audit.
     let seed = 1;
@@ -870,6 +1491,78 @@ suite("scheduler: settlement counts only unchanged max-width global passes", () 
         "best-score improvement did not reset widening", progress);
 });
 
+suite("scheduler: child gates and prefix budgets are parent-fair", () => {
+    check(remainingAfterMove(89, { size: 2 }) === 87,
+        "child exact gate ignored the first move");
+    check(remainingAfterMove(72, { size: 5 }) === 67 &&
+        remainingAfterMove(3, { size: 9 }) === 0,
+    "child remaining count was not clamped correctly");
+
+    const parents = [
+        { cell: 10, seconds: [1, 2, 3] },
+        { cell: 20, seconds: [4] },
+        { cell: 30, seconds: [5, 6] },
+    ];
+    const tasks = roundRobinPrefixTasks(parents);
+    check(JSON.stringify(tasks) === JSON.stringify([
+        { cell: 10, second: 1 }, { cell: 20, second: 4 }, { cell: 30, second: 5 },
+        { cell: 10, second: 2 }, { cell: 30, second: 6 },
+        { cell: 10, second: 3 },
+    ]), "prefix task order let a long child list starve another parent", tasks);
+    check(JSON.stringify(parents) === JSON.stringify([
+        { cell: 10, seconds: [1, 2, 3] },
+        { cell: 20, seconds: [4] },
+        { cell: 30, seconds: [5, 6] },
+    ]), "prefix task ordering mutated its input", parents);
+
+    const clickedBranches = [
+        { tasks: [{ prefix: [2, 36] }, { prefix: [2, 48] }] },
+        { tasks: [{ prefix: [14, 50] }] },
+        { tasks: [{ prefix: [75, 37] }, { prefix: [75, 49] }] },
+    ];
+    const mirrored = mirrorClickedPrefixTasks(clickedBranches, 4);
+    check(JSON.stringify(mirrored) === JSON.stringify([
+        { prefix: [2, 36], postClickOrdinal: 0 },
+        { prefix: [14, 50], postClickOrdinal: 2 },
+        { prefix: [75, 37], postClickOrdinal: 3 },
+        { prefix: [2, 48], postClickOrdinal: 1 },
+    ]), "parent recursion changed post-click order or lane identity", mirrored);
+    check(JSON.stringify(clickedBranches) === JSON.stringify([
+        { tasks: [{ prefix: [2, 36] }, { prefix: [2, 48] }] },
+        { tasks: [{ prefix: [14, 50] }] },
+        { tasks: [{ prefix: [75, 37] }, { prefix: [75, 49] }] },
+    ]), "post-click mirroring mutated its input", clickedBranches);
+
+    const contexts = [
+        { cell: 38, prefix: [75, 37] },
+        { cell: 60, prefix: [2, 36] },
+        { cell: 83, prefix: [67, 5, 51] },
+    ];
+    for (let lanes = 1; lanes <= 16; lanes++) {
+        for (const context of contexts) {
+            const owner = prefixTaskOwner(context.cell, context.prefix, lanes);
+            check(owner >= 0 && owner < lanes &&
+                Array.from({ length: lanes }, (_, lane) => lane === owner)
+                    .filter(Boolean).length === 1,
+            "fixed prefix did not have exactly one stable lane owner",
+            { lanes, context, owner });
+            check(prefixTaskOwner(context.cell, context.prefix, lanes) === owner,
+                "fixed-prefix ownership was not deterministic", { lanes, context, owner });
+        }
+    }
+});
+
+suite("scheduler: exact suffix transfer requires the actual child board", () => {
+    const previous = { childKeys: new Map([[60, "actual-child"]]) };
+    const exactMove = { cell: 60, exact: true };
+    check(canTransferExactSuffix(previous, exactMove, "actual-child"),
+        "exact suffix was not retained for its actual child");
+    check(!canTransferExactSuffix(previous, exactMove, "unrelated-board") &&
+        !canTransferExactSuffix(previous, { ...exactMove, exact: false }, "actual-child") &&
+        !canTransferExactSuffix({ childKeys: new Map() }, exactMove, "actual-child"),
+    "constructive suffix was promoted to an exact proof on an unrelated board");
+});
+
 suite("scheduler: position proof is distinct from an exact move table", () => {
     // The first move's static bound is deliberately weak. Once that row is
     // exact, its proved score is the effective lower bound and certifies the
@@ -911,6 +1604,21 @@ suite("scheduler: position proof is distinct from an exact move table", () => {
         "position-proof probes are not ordered by tight gap and group size", candidates);
 });
 
+suite("scheduler: GPU owner survives local CPU completion until the global proof", () => {
+    const unresolvedPeer = [
+        { cell: 8, exact: true },
+        { cell: 9, exact: false },
+    ];
+    check(shouldGpuCaretake(unresolvedPeer, 0, "on"),
+        "GPU owner stopped while a peer-owned root was unresolved");
+    check(!shouldGpuCaretake(unresolvedPeer, 1, "on"),
+        "CPU-only satellite incorrectly entered GPU caretaker mode");
+    check(!shouldGpuCaretake(unresolvedPeer, 0, "failed"),
+        "failed GPU kept its worker alive");
+    check(!shouldGpuCaretake(unresolvedPeer.map((move) => ({ ...move, exact: true })), 0, "on"),
+        "GPU caretaker survived a true all-moves proof");
+});
+
 suite("worker asset graph uses one cache generation", () => {
     const match = assetSources.ui.match(/ENGINE_ASSET_VERSION\s*=\s*"([^"]+)"/);
     check(match !== null, "engine asset version is missing from the UI bootstrap");
@@ -922,13 +1630,17 @@ suite("worker asset graph uses one cache generation", () => {
         click: `./engine-ui.js?build=${version}`,
         workerGpu: `./gpu.js?build=${version}`,
         workerSchedule: `./schedule.js?build=${version}`,
+        workerPool: `./pool.js?build=${version}`,
         workerWasm: `wasmURL.searchParams.set("build", "${version}")`,
-        e2e: `/scripts/engine-ui.js?build=${version}`,
+        e2e: `/src/scripts/engine-ui.js?build=${version}`,
     };
     for (const [name, token] of Object.entries(expected)) {
         const source = name.startsWith("worker") ? assetSources.worker : assetSources[name];
         check(source.includes(token), `cache generation mismatch in ${name}`, { version, token });
     }
+    const cssToken = `css/click2026.css?build=${version}`;
+    check(assetSources.index.includes(cssToken), "cache generation mismatch in engine CSS",
+        { version, token: cssToken });
 });
 
 suite("supplied v5 position: bounded root proof certifies the global zero", () => {
@@ -1020,6 +1732,309 @@ suite("budgeted child proof keeps a witness without claiming exactness", () => {
         "partial positive witness was unsafely marked exact", { lower, after });
     check(replayLine(position, after.line) === after.best,
         "committed partial witness does not replay", after);
+});
+
+suite("whole-position exact proof raises every root lower bound", () => {
+    const position = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    for (const [x, column] of ["231", "123", "223", "132"].entries()) {
+        for (let y = 0; y < column.length; y++) position[x][y] = Number(column[y]);
+    }
+
+    setIOBoard(position);
+    eng.setBoard();
+    const before = collectResults().roots;
+    check(before.length === 2 && before.every((_, k) => eng.getRootLower(k) === 0) &&
+        before.some((root) => root.best === 5 && !root.exact),
+    "positive-optimum fixture no longer has weak per-root bounds", before);
+
+    eng.exactBegin(10_000);
+    let result = -1;
+    while (result === -1) result = eng.exactStep(1_000);
+    check(result === 5 && eng.exactMerge() === 5,
+        "whole-position fixture did not prove its positive optimum", { result });
+
+    const after = collectResults().roots;
+    check(after.every((_, k) => eng.getRootLower(k) >= 5),
+        "global proof did not propagate its lower bound to every root",
+        after.map((root, k) => ({ root, lower: eng.getRootLower(k) })));
+    check(after.filter((root) => root.best === 5).every((root) => root.exact) &&
+        after.filter((root) => root.best > 5).every((root) => !root.exact),
+    "global lower bound marked the wrong parent rows exact", after);
+    for (const root of after) {
+        check(replayLine(position, root.line) === root.best,
+            "positive-optimum merge damaged a constructive line", root);
+    }
+
+    // Whole-position B&B borrows the primary value table's key/stamp arrays
+    // as a larger transient seen set. Its generation stamps must never be
+    // interpreted as memoized values when the per-root solver starts next.
+    // The exact child values are deliberately positive: accepting an empty
+    // seen slot's zero-initialized policy word would fail deterministically.
+    for (const [k, expected] of [7, 5].entries()) {
+        let value = eng.vsBegin(k, 100_000);
+        while (value === -1) value = eng.vsStep(1_000);
+        check(value === expected,
+            "transient whole-position stamp leaked into the value memo",
+            { k, value, expected });
+    }
+});
+
+suite("fixed-prefix threshold decisions isolate branch proofs", () => {
+    // Root 0 has three legal second moves on this compact fixture. Their
+    // exact values are: second 1 -> 2, second 24 -> 1, second 27 -> 4.
+    // Its initial constructive score is 2 and its static lower bound is 0,
+    // so both witness and no-target behavior are observable independently.
+    const position = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    const columns = [
+        [1, 1, 1, 2, 3],
+        [3, 3, 3, 2, 3],
+        [2, 2, 2, 1, 1],
+        [1, 2, 3, 2, 3],
+    ];
+    for (let x = 0; x < columns.length; x++) {
+        for (let y = 0; y < columns[x].length; y++) position[x][y] = columns[x][y];
+    }
+
+    const reset = () => {
+        setIOBoard(position);
+        eng.setBoard();
+        const roots = collectResults().roots;
+        const k = roots.findIndex((root) => root.rep === 0);
+        check(k >= 0 && roots[k].best === 2 && eng.getRootLower(k) === 0,
+            "fixed-prefix fixture lost its weak root", { k, roots });
+        return k;
+    };
+    const begin = (k, prefix, target, budget) => {
+        mem().set(Uint8Array.from(prefix), IO);
+        return eng.thresholdBeginRootPrefix(k, prefix.length, target, budget);
+    };
+    const finish = (k, prefix, target, budget = 1) => {
+        let result = begin(k, prefix, target, budget);
+        let turns = 0;
+        while (result < 0 && turns++ < 100_000) {
+            result = result === -2
+                ? begin(k, prefix, target, budget)
+                : eng.thresholdStep(1);
+        }
+        check(turns < 100_000, "fixed-prefix threshold did not terminate",
+            { prefix, target, result, turns });
+        return result;
+    };
+
+    // Pause second=1 before expanding a node, then begin second=24 with the
+    // same root, target and prefix length. Resuming by shape alone would keep
+    // the old board and return the former branch's miss (2); byte-identity
+    // must restart on second=24 and recover its score-1 witness instead.
+    let k = reset();
+    check(begin(k, [1], 1, 0) === -1 && eng.thresholdStep(1) === -2,
+        "fixed-prefix resume fixture did not retain a paused frontier");
+    const witness = finish(k, [24], 1);
+    check(witness === 1 && eng.thresholdMerge() === 1,
+        "a different same-length prefix resumed the stale branch", { witness });
+    let after = collectResults().roots;
+    check(after[k].best === 1 && after[k].line[0] === 0 && after[k].line[1] === 24 &&
+        replayLine(position, after[k].line) === 1,
+    "fixed-prefix witness did not prepend root and saved prefix", after[k]);
+
+    // Exhausting second=1 proves only that fixed branch is above target 1.
+    // It is not a lower bound for the parent, because sibling second=24 has a
+    // score-1 witness. Neither that root nor any unrelated root may change.
+    k = reset();
+    const before = collectResults().roots;
+    const lowers = before.map((_, root) => eng.getRootLower(root));
+    const miss = finish(k, [1], 1);
+    check(miss === 2 && eng.thresholdMerge() === 2,
+        "fixed-prefix miss returned the wrong threshold certificate", { miss });
+    after = collectResults().roots;
+    check(after.every((entry, index) =>
+        eng.getRootLower(index) === lowers[index] &&
+        JSON.stringify(entry) === JSON.stringify(before[index])),
+    "one fixed-prefix miss raised or otherwise changed a parent row", {
+        before,
+        after,
+        lowers,
+        afterLowers: after.map((_, root) => eng.getRootLower(root)),
+    });
+
+    // A new begin consumes the old completed decision before it starts. Until
+    // the new prefix completes, thresholdMerge must not expose the stale miss.
+    check(begin(k, [24], 1, 0) === -1 && eng.thresholdMerge() > SIZE * SIZE,
+        "a stale fixed-prefix completion remained mergeable after a new begin");
+    eng.thresholdCancel();
+
+    // The pool-facing lower bridge is monotonic and interval-checked. It may
+    // mark a row exact only when complete manifest coverage meets the already
+    // replayable constructive score.
+    k = reset();
+    const rootCell = collectResults().roots[k].rep;
+    check(eng.seedRootLowerByCell(rootCell, 1) === 1 &&
+        eng.getRootLower(k) === 1 && !collectResults().roots[k].exact,
+    "partial certified lower did not preserve the root interval");
+    check(eng.seedRootLowerByCell(rootCell, 3) === 0 && eng.getRootLower(k) === 1,
+        "caller-composed lower crossed the constructive upper bound");
+    check(eng.seedRootLowerByCell(rootCell, 2) === 1 &&
+        eng.getRootLower(k) === 2 && collectResults().roots[k].exact,
+    "complete certified lower did not close the exact root interval");
+});
+
+suite("threshold solver persists and composes completed no-target proofs", () => {
+    const position = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    for (const [x, column] of ["231", "123", "223", "132"].entries()) {
+        for (let y = 0; y < column.length; y++) position[x][y] = Number(column[y]);
+    }
+    const childPosition = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    for (const [x, column] of ["23122", "2213", "113313", "23"].entries()) {
+        for (let y = 0; y < column.length; y++) childPosition[x][y] = Number(column[y]);
+    }
+
+    const finishWhole = (target, budget = 1) => {
+        let result = eng.thresholdBegin(target, budget);
+        let turns = 0;
+        while (result < 0 && turns++ < 1_000_000) {
+            result = result === -2
+                ? eng.thresholdBegin(target, budget)
+                : eng.thresholdStep(1);
+        }
+        check(turns < 1_000_000, "resumable whole threshold did not terminate",
+            { target, result, turns });
+        return result;
+    };
+    const finishChild = (k, target, budget = 1) => {
+        let result = eng.thresholdBeginChild(k, target, budget);
+        let turns = 0;
+        while (result < 0 && turns++ < 1_000_000) {
+            result = result === -2
+                ? eng.thresholdBeginChild(k, target, budget)
+                : eng.thresholdStep(1);
+        }
+        check(turns < 1_000_000, "resumable child threshold did not terminate",
+            { k, target, result, turns });
+        return result;
+    };
+
+    setIOBoard(position);
+    eng.setBoard();
+    const before = collectResults().roots;
+    check(before.some((root) => root.best === 5),
+        "threshold fixture lost its constructive score-5 incumbent", before);
+    check(finishWhole(4) === 5 && eng.thresholdMerge() === 5,
+        "completed below-five decision did not merge lower bound 5");
+    let after = collectResults().roots;
+    check(after.every((_, k) => eng.getRootLower(k) >= 5) &&
+        after.filter((root) => root.best === 5).every((root) => root.exact),
+    "whole threshold miss did not compose into the positive optimum", after);
+
+    // The completed root-board certificate is persistent and monotone: a
+    // no-zero proof answers target 0 immediately, but it cannot answer the
+    // stronger target 1 query. That query must return a replayable witness.
+    check(eng.thresholdBegin(4, 0) === 5 && eng.thresholdMerge() === 5,
+        "completed threshold certificate was not reused");
+    const witness = finishWhole(5, 1);
+    check(witness <= 5 && eng.thresholdMerge() <= 5,
+        "weaker certificate incorrectly pruned a target-5 witness", { witness });
+    after = collectResults().roots;
+    const winning = after.find((root) => root.best <= 5);
+    check(winning && replayLine(position, winning.line) === winning.best,
+        "threshold witness did not leave a replayable line", winning);
+
+    // Child completion raises exactly one row. A partial prefix/child result
+    // can never manufacture a lower bound for its siblings.
+    setIOBoard(childPosition);
+    eng.setBoard();
+    const childBefore = collectResults().roots;
+    const childLowersBefore = childBefore.map((_, k) => eng.getRootLower(k));
+    const ac = childBefore.findIndex((root) => root.rep === 2);
+    check(ac >= 0 && finishChild(ac, 0) === 1 && eng.thresholdMerge() === 1,
+        "AC child threshold did not prove value above zero", { ac });
+    const childAfter = collectResults().roots;
+    check(eng.getRootLower(ac) === 1 && !childAfter[ac].exact &&
+        childAfter.every((root, k) => k === ac ||
+            eng.getRootLower(k) === childLowersBefore[k]),
+    "child threshold changed an unsearched sibling", {
+        ac,
+        before: childLowersBefore,
+        after: childAfter.map((_, k) => eng.getRootLower(k)),
+        roots: childAfter,
+    });
+
+    // Every solver/context change consumes the previous completion token.
+    setIOBoard(position);
+    eng.setBoard();
+    check(finishWhole(4, 1000) === 5, "stale-merge setup did not finish");
+    check(eng.thresholdBeginChild(999, 0, 1) === -2 &&
+        eng.thresholdMerge() > SIZE * SIZE,
+    "invalid threshold begin left an old proof mergeable");
+    check(finishWhole(4, 1000) === 5, "setBoard stale-merge setup did not finish");
+    setIOBoard(position);
+    eng.setBoard();
+    check(eng.thresholdMerge() > SIZE * SIZE,
+        "setBoard left an old threshold proof mergeable");
+});
+
+suite("threshold decisions agree with exhaustive small-board values", () => {
+    const memo = new Map();
+    const brute = (position) => {
+        const key = position.flat().join("");
+        if (memo.has(key)) return memo.get(key);
+        const groups = enumerateGroups(position);
+        if (groups.length === 0) {
+            const value = remainingOf(position);
+            memo.set(key, value);
+            return value;
+        }
+        let value = SIZE * SIZE;
+        for (const group of groups) {
+            const child = clonePosition(position);
+            removeGroup(child, group.cells);
+            value = Math.min(value, brute(child));
+        }
+        memo.set(key, value);
+        return value;
+    };
+    const finish = (target) => {
+        let result = eng.thresholdBegin(target, 1);
+        let turns = 0;
+        while (result < 0 && turns++ < 1_000_000) {
+            result = result === -2
+                ? eng.thresholdBegin(target, 1)
+                : eng.thresholdStep(1);
+        }
+        check(turns < 1_000_000, "one-node threshold resumes did not terminate",
+            { target, result, turns });
+        return result;
+    };
+
+    const rnd = mulberry32(0x7A12E501);
+    for (let sample = 0; sample < 24; sample++) {
+        const position = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+        const columns = 2 + Math.floor(rnd() * 3);
+        for (let x = 0; x < columns; x++) {
+            const height = 2 + Math.floor(rnd() * 4);
+            for (let y = 0; y < height; y++) position[x][y] = 1 + Math.floor(rnd() * 3);
+        }
+        if (enumerateGroups(position).length === 0) continue;
+        const value = brute(position);
+        for (const target of new Set([Math.max(0, value - 1), value, value + 1])) {
+            setIOBoard(position);
+            eng.setBoard();
+            const result = finish(target);
+            const merged = eng.thresholdMerge();
+            check(result === merged && (value <= target ? result <= target : result === target + 1),
+                "threshold decision disagrees with brute force",
+                { sample, target, value, result, merged });
+            const roots = collectResults().roots;
+            if (value <= target) {
+                check(roots.some((root) => root.best <= target &&
+                    replayLine(position, root.line) === root.best),
+                "threshold witness did not replay to its claimed terminal",
+                { sample, target, value, roots });
+            } else {
+                check(roots.every((_, k) => eng.getRootLower(k) >= target + 1),
+                    "threshold miss did not raise every root safely",
+                    { sample, target, value, roots });
+            }
+        }
+    }
 });
 
 // --- 5: exact solver vs brute force -------------------------------------------

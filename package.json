@@ -7,13 +7,18 @@
     "type": "module",
     "private": true,
     "scripts": {
-        "build:engine": "asc asm/engine.ts --outFile src/scripts/engine/engine.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert",
-        "test:engine": "npm run build:engine && node tools/engine.test.mjs",
+        "build:engine:primary": "asc asm/engine.ts --outFile src/scripts/engine/engine.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert --enable simd --use ENGINE_LITE=0 && asc asm/engine.ts --outFile src/scripts/engine/engine-scalar.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert --use ENGINE_LITE=0",
+        "build:engine:lanes": "asc asm/engine.ts --outFile src/scripts/engine/engine-lane.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert --enable simd --use ENGINE_LITE=1 && asc asm/engine.ts --outFile src/scripts/engine/engine-lane-scalar.wasm --runtime stub --optimizeLevel 3 --shrinkLevel 0 --noAssert --use ENGINE_LITE=1",
+        "build:engine": "npm run build:engine:primary && npm run build:engine:lanes",
+        "test:engine": "npm run build:engine && node tools/engine.pool.test.mjs && node tools/gpu.test.mjs && node tools/settings.test.mjs && node tools/engine.test.mjs",
+        "test:gpu": "node tools/gpu.test.mjs",
+        "test:pool": "node tools/engine.pool.test.mjs",
+        "test:settings": "node tools/settings.test.mjs",
         "test:tree": "node tools/tree.test.mjs",
         "bench:engine": "npm run build:engine && node tools/engine.bench.mjs",
         "bench:engine:hard": "npm run build:engine && node tools/engine.hard.mjs",
         "tune:engine": "npm run build:engine && node tools/engine.tune.mjs",
-        "serve": "py -m http.server 8123 -d src"
+        "serve": "py -m http.server 8123 -d ."
     },
     "devDependencies": {
         "assemblyscript": "^0.28.9",

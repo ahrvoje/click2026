@@ -9,8 +9,9 @@
  *       Sat Jul 11, 2026 - modernized to ES module, zero dependencies
  */
 
-import * as Click from "./click.js?build=20260712-proof2";
+import * as Click from "./click.js?build=20260713-proof13";
 import { createTests } from "./tests.js";
+import { Settings } from "./settings.js?build=20260713-proof13";
 
 // module scripts are deferred, so the DOM is complete at this point
 const el = (id) => document.getElementById(id);
@@ -28,6 +29,8 @@ el("linkButton").addEventListener("click", Click.promptGameLink);
 el("replayButton").addEventListener("click", Click.replayStartPosition);
 el("engineButton").addEventListener("click", Click.toggleEngine);
 el("markersButton").addEventListener("click", Click.toggleEngineMarkers);
+el("movesSlider").addEventListener("input", (event) =>
+    Click.showMoveFromSlider(Number(event.currentTarget.value)));
 
 for (const exampleIndex of [0, 1, 2]) {
     el(`example${exampleIndex}`).addEventListener("click", () => {
@@ -44,3 +47,8 @@ el("runTests").addEventListener("click", () => createTests().run());
 el("mail").addEventListener("click", () => window.prompt("Contact mail:", "ahrvoje@gmail.com"));
 
 Click.init();
+Settings.init({
+    onOpen: Click.onSettingsOpened,
+    onMovesSliderChange: Click.setMovesSliderVisible,
+    onSuggestedMovesChange: Click.setSuggestedMovesMode,
+});

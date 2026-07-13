@@ -12,12 +12,16 @@
  * Analysis schedule per position (each stage refines the previous one, a
  * result is posted after every stage):
  *   1. greedy baselines            — instant score for every root move
- *   2. CPU playout portfolio       — strong tabu policy plus full-support samples
- *   3. widening beam passes        — deterministic, widths 8..2048
+ *   2. one-ply child tables        — every second move gets the child's cheap baseline
+ *   3. CPU playout portfolio       — strong tabu policy plus full-support samples
+ *   4. GPU second-ply assist       — heuristic ranking, CPU/WASM replay boundary
+ *   5. widening beam passes        — deterministic, widths 8..2048
  *      with one bounded permanent-only late-game portfolio member
- *   4. position-proof portfolio    — bounded, fair B&B probes above the
+ *   6. virtual-child portfolio     — second moves receive the same lane-
+ *      partitioned beam heaps they would get after the first move is played
+ *   7. position-proof portfolio    — bounded, fair B&B probes above the
  *      persistent exact gate
- *   5. continuous investigation    — alternating global beam passes (widths
+ *   8. continuous investigation    — alternating global beam passes (widths
  *      512..16384) and root-locked passes that widen independently per move,
  *      plus playout rounds biased to the current top moves
  *      (GPU-accelerated when WebGPU is available); once the board is small
@@ -48,11 +52,19 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260712-proof2";
+import { createGpu, dominantColor } from "./gpu.js?build=20260713-proof13";
 import {
-    analysisState, createSearchProgress, positionProofCandidates,
-    recordSearchPass, settlementReady, summarizePositionProof,
-} from "./schedule.js?build=20260712-proof2";
+    analysisState, canTransferExactSuffix, createSearchProgress, mirrorClickedPrefixTasks,
+    positionProofCandidates, recordSearchPass, remainingAfterMove, roundRobinPrefixTasks, settlementReady,
+    shouldGpuCaretake, summarizePositionProof,
+} from "./schedule.js?build=20260713-proof13";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260713-proof13";
+
+const workerParams = new URL(self.location.href).searchParams;
+const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
+const LANE = Math.min(LANES - 1,
+    Math.max(0, Number.parseInt(workerParams.get("lane") ?? "0", 10) || 0));
+const GPU_ALLOWED = workerParams.get("gpu") !== "0";
 
 const SIZE = 12;
 const CHUNK = 16000;            // beam expansions per slice, ~10 ms
@@ -69,15 +81,38 @@ const POSITION_PROBE_BUDGET = 2000000; // one fair threshold/proof turn per thre
 const POSITION_PROBE_ROOTS = 16; // 32M-node board cap; remaining roots keep the normal fairness audit
 const EXACT_BUDGET = 8000000;   // first value-memo attempt; retries resume and escalate ×4
 const EXACT_BUDGET_MAX = 2000000000; // i32-safe budget per resumable attempt
+const COORDINATED_PREFIX_BUDGET = 250000; // one resumable proof quantum
+const COORDINATED_PREFIX_BUDGET_MAX = 8000000;
+const COORDINATED_MAX_SPLIT_PREFIX = 3; // deeper tasks rotate over a board-deduplicated frontier
 const LINE_BUDGET = 64000000;   // initial memo-guided line seek; rare retries escalate ×4
 const WIDEN_WIDTHS = [8, 32, 128, 512, 2048];
+// A clicked child receives deterministic lane-partitioned beams, then private
+// diversified retries. Mirror that bounded early allocation inside each
+// unresolved parent row so its second moves do not compete in one giant heap.
+const VIRTUAL_CHILD_PASSES = [
+    [128, 0], [512, 0], [2048, 0], [2048, 1], [2048, 2],
+];
+const VIRTUAL_CHILD_PROOF_BUDGETS = [100000, 1000000];
+const PREFIX_CONTEXT_PLAYOUTS = 32;
+const PREFIX_CONTEXT_SOFT_PLAYOUTS = 4;
+// The cheap nested tier audits every root. Expensive retries remain focused
+// on rows already close to their sound bound, which is where a click can turn
+// an apparently difficult tail into an immediate proof.
+const NESTED_PREFIX_STRONG_GAP = 5;
+// Receding-horizon repair is a bounded fair frontier, not the Cartesian
+// product of a whole move tree. These first contexts include the reported
+// third-ply cliffs while keeping the pre-continuous allocation finite.
+const NESTED_PREFIX_CONTEXTS_PER_PARENT = 256;
+const NESTED_PREFIX_PASSES = [[128, 0], [2048, 1]];
 const WIDTH_TIERS = [512, 1024, 2048, 4096, 8192, 16384]; // stagnation climbs this ladder
 const LOCKED_WIDTHS = [2048, 4096, 8192, 16384]; // each root gets private iterative widening
 const SOFT_PLAYOUT_DIVISOR = 8; // supplement hard tabu without replacing its samples
-const TOP_RANKS = 5;            // moves shown in the UI — get the focused compute
+const TOP_RANKS = 5;            // core top-five plus the first positive row get focused compute
 const SETTLE_PASSES = 24;       // unchanged max-width global passes before settlement
 const CACHE_MAX = 64;           // remembered positions for warm starts
 const POST_INTERVAL_MS = 150;
+const GPU_BEAM_ASSIST_PER_ROOT = 2;
+const GPU_BEAM_ASSIST_MAX_BOARDS = 4096;
 
 let eng = null;
 let IO = 0;
@@ -94,6 +129,8 @@ const jobChangeWaiters = new Set();
 // insertion order doubles as LRU order
 const resultCache = new Map();
 let prevAnalysis = null; // { key, moves } of the most recently analyzed position
+let caretakerStopJob = null;
+let thresholdPlan = null; // pool-coordinated complete second-move coverage
 
 // fast macrotask yield — setTimeout(0) clamps, a MessageChannel does not
 const tickChannel = new MessageChannel();
@@ -105,11 +142,20 @@ const nextTick = () => new Promise((resolve) => {
 });
 
 const mem = () => new Uint8Array(eng.memory.buffer);
+// `k` is WASM's deterministic ascending-representative enumeration index. It
+// remains attached to a row when collectResults() sorts rows for display, and
+// unlike representative-cell modulo it balances root counts across the pool.
+const owns = (move) => laneOwnsRoot(move.k, LANE, LANES);
+const ownedMoves = (moves) => moves.filter(owns);
+const ownedComplete = (moves) => ownedMoves(moves).every((move) => move.exact);
+const childRemaining = (move) => remainingAfterMove(eng.getRemaining(), move);
 
 self.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "analyze") {
         job = msg;
+        caretakerStopJob = null;
+        thresholdPlan = null;
         jobVersion++;
         for (const wake of jobChangeWaiters) wake();
         jobChangeWaiters.clear();
@@ -117,6 +163,54 @@ self.onmessage = (event) => {
             kickWaiter();
             kickWaiter = null;
         }
+    } else if (msg.type === "merge" && eng && job && msg.id === job.id) {
+        // Share only replayable constructive lines and independently proven
+        // flags. seedLine validates every move inside WASM before accepting
+        // it, so a stale or malformed peer result cannot corrupt this lane.
+        for (const seed of msg.seeds ?? []) {
+            if (!Array.isArray(seed.line) || seed.line.length === 0 || seed.line.length > 80) continue;
+            mem().set(Uint8Array.from(seed.line), IO);
+            const final = eng.seedLine(seed.line.length);
+            if (seed.exact && final === seed.score) {
+                eng.seedExactByCell(seed.line[0], seed.score);
+            }
+        }
+    } else if (msg.type === "stop-caretaker" && job && msg.id === job.id) {
+        // Every CPU-only peer has reached a terminal snapshot. A lane-zero
+        // GPU playout loop cannot turn their unresolved positive bounds into
+        // proofs, so let the pool settle instead of reporting fictitious
+        // perpetual work.
+        caretakerStopJob = msg.id;
+    } else if (msg.type === "threshold-plan" && job && msg.id === job.id) {
+        thresholdPlan = {
+            id: msg.id,
+            epoch: msg.epoch,
+            target: msg.target,
+            roots: Array.isArray(msg.roots) ? msg.roots.slice() : [],
+            round: -1,
+            tasks: null,
+        };
+    } else if (msg.type === "threshold-frontier" && thresholdPlan &&
+        msg.id === thresholdPlan.id && msg.epoch === thresholdPlan.epoch &&
+        msg.target === thresholdPlan.target) {
+        eng?.thresholdCancel();
+        thresholdPlan = {
+            ...thresholdPlan,
+            round: msg.round,
+            tasks: Array.isArray(msg.tasks) ? msg.tasks.map((task) => ({
+                rootCell: task.rootCell,
+                prefix: Array.isArray(task.prefix) ? task.prefix.slice() : [],
+            })) : [],
+        };
+    } else if (msg.type === "threshold-cancel" && thresholdPlan &&
+        msg.id === thresholdPlan.id && msg.epoch === thresholdPlan.epoch) {
+        thresholdPlan = null;
+        eng?.thresholdCancel();
+    } else if (msg.type === "threshold-root-bound" && eng && job && msg.id === job.id) {
+        // A pool certificate for root A is independent of a live threshold
+        // search for root B. Cancelling here destroyed unrelated distributed
+        // work whenever one row completed ahead of its peers.
+        eng.seedRootLowerByCell(msg.rootCell, msg.lower);
     }
 };
 
@@ -162,10 +256,34 @@ function collectResults() {
         at += n;
     }
 
+    // Optional accounting footer. Keeping it after the variable-length move
+    // data preserves compatibility with scalar/older engine binaries.
+    const cpu = {
+        positions: nodes,
+        beamPositions: nodes,
+        exactPositions: 0,
+        playoutPositions: 0,
+        playouts: 0,
+        simd: false,
+        compact: LANE > 0,
+    };
+    if (bytes.length >= at + 40 && view.getUint32(at, true) === 0x32544154) {
+        const flags = view.getUint32(at + 4, true);
+        const u64 = (offset) => view.getUint32(offset, true) +
+            view.getUint32(offset + 4, true) * 2 ** 32;
+        cpu.beamPositions = u64(at + 8);
+        cpu.exactPositions = u64(at + 16);
+        cpu.playoutPositions = u64(at + 24);
+        cpu.playouts = u64(at + 32);
+        cpu.positions = cpu.beamPositions + cpu.exactPositions + cpu.playoutPositions;
+        cpu.simd = (flags & 1) !== 0;
+        cpu.compact = (flags & 2) !== 0;
+    }
+
     // chess-engine ordering: best score first, then bigger groups
     moves.sort((a, b) => a.score - b.score || b.size - a.size || a.cell - b.cell);
 
-    return { moves, nodes, depth, width, remaining };
+    return { moves, nodes: cpu.positions, depth, width, remaining, cpu };
 }
 
 // --- analysis ----------------------------------------------------------------
@@ -173,15 +291,71 @@ function collectResults() {
 async function analyze(myJob, isStale) {
     const t0 = performance.now();
     let lastPost = 0;
+    let latestGpuMoves = [];
+    // Even a satellite whose first-move roots finish early is useful to a
+    // clicked child: it would own some of that child's second moves. Keep all
+    // lanes alive through the bounded virtual-child audit below.
+    let virtualChildAuditComplete = false;
     const key = myJob.board.join(",");
+    // A batch submitted by the replaced position still updates lifetime
+    // counters when it completes. Let this position start its CPU baseline
+    // immediately, but hold its GPU counter baseline until that old bounded
+    // dispatch drains. Until then posts report zero new GPU work.
+    const inheritedGpu = pendingGpu;
+    let gpuStart = inheritedGpu === null ? (gpu?.getStats?.() ?? {}) : null;
+    const gpuBaselineReady = inheritedGpu === null ? Promise.resolve() :
+        inheritedGpu.catch(() => { /* disableGpu handles failures */ }).then(() => {
+            gpuStart = gpu?.getStats?.() ?? {};
+        });
 
     mem().set(myJob.board, IO);
     eng.setBoard();
+    // Capture the exact one-ply relation before any search mutates IO. It is
+    // the proof boundary for carrying an exact parent result into the next
+    // displayed position; replaying a legal suffix alone proves only an upper
+    // bound on an unrelated board.
+    const analysisChildKeys = new Map();
+    for (const root of collectResults().moves) {
+        if (eng.childToIO(root.k) === 1) {
+            analysisChildKeys.set(root.cell,
+                mem().slice(IO, IO + SIZE * SIZE).join(","));
+        }
+    }
     seedFromMemory(key);
 
     const post = (settled) => {
-        const { moves, nodes, depth, width, remaining } = collectResults();
+        const { moves, nodes, depth, width, remaining, cpu } = collectResults();
+        latestGpuMoves = moves;
         const proof = summarizePositionProof(moves, (move) => move.lower);
+        const elapsed = performance.now() - t0;
+        const rawGpu = gpu?.getStats?.() ?? {};
+        const gpuBaseline = gpuStart ?? rawGpu;
+        const gpuPositions = Math.max(0,
+            (rawGpu.positionsProcessed ?? 0) - (gpuBaseline.positionsProcessed ?? 0) +
+            (rawGpu.evaluationBoardsGpu ?? 0) - (gpuBaseline.evaluationBoardsGpu ?? 0));
+        const gpuPlayouts = Math.max(0,
+            (rawGpu.playoutsCompleted ?? 0) - (gpuBaseline.playoutsCompleted ?? 0));
+        const gpuBatches = Math.max(0,
+            (rawGpu.dispatchesCompleted ?? 0) - (gpuBaseline.dispatchesCompleted ?? 0) +
+            (rawGpu.evaluationDispatches ?? 0) - (gpuBaseline.evaluationDispatches ?? 0));
+        // Wall-activity counters are interval unions, so overlapping striped
+        // dispatches count once. Summed timestamp-query durations are useful
+        // diagnostics but can be 2-3x wall time on a pooled discrete GPU and
+        // must not be displayed as duty time or used as its throughput base.
+        const gpuActiveMs = Math.max(0,
+            ((rawGpu.dispatchWallMs ?? rawGpu.gpuTimeMs) ?? 0) -
+            ((gpuBaseline.dispatchWallMs ?? gpuBaseline.gpuTimeMs) ?? 0) +
+            ((rawGpu.evaluationWallMs ?? rawGpu.evaluationGpuTimeMs) ?? 0) -
+            ((gpuBaseline.evaluationWallMs ?? gpuBaseline.evaluationGpuTimeMs) ?? 0));
+        const gpuStats = {
+            positions: gpuPositions,
+            pps: gpuPositions / Math.max(1, gpuActiveMs) * 1000,
+            playouts: gpuPlayouts,
+            batches: gpuBatches,
+            activeMs: gpuActiveMs,
+            profile: rawGpu.profile ?? null,
+            adapter: gpu?.getCapabilities?.().adapter ?? null,
+        };
 
         // remember this position for warm starts (LRU refresh on re-insert)
         resultCache.delete(key);
@@ -189,7 +363,7 @@ async function analyze(myJob, isStale) {
         if (resultCache.size > CACHE_MAX) {
             resultCache.delete(resultCache.keys().next().value);
         }
-        prevAnalysis = { key, moves };
+        prevAnalysis = { key, moves, childKeys: analysisChildKeys };
 
         self.postMessage({
             type: "result",
@@ -200,10 +374,25 @@ async function analyze(myJob, isStale) {
                 nodes,
                 depth,
                 width,
-                elapsed: performance.now() - t0,
-                nps: nodes / Math.max(1, performance.now() - t0) * 1000,
+                elapsed,
+                nps: nodes / Math.max(1, elapsed) * 1000,
                 gpu: gpuState,
                 settled: settled === true,
+                lane: LANE,
+                lanes: LANES,
+                totalPositions: nodes + gpuStats.positions,
+                cpu: {
+                    workers: 1,
+                    positions: cpu.positions,
+                    pps: cpu.positions / Math.max(1, elapsed) * 1000,
+                    beamPositions: cpu.beamPositions,
+                    exactPositions: cpu.exactPositions,
+                    playoutPositions: cpu.playoutPositions,
+                    playouts: cpu.playouts,
+                    simd: cpu.simd,
+                    compact: cpu.compact,
+                },
+                gpuStats,
                 positionLower: proof.positionLower,
                 positionUpper: proof.positionUpper,
                 positionExact: proof.positionExact,
@@ -225,20 +414,55 @@ async function analyze(myJob, isStale) {
     // 1. greedy baselines are already in (setBoard), show them immediately
     let moves = post(false);
     if (moves.length === 0) return; // terminal position — nothing to analyze
-    if (moves.every((m) => m.exact)) { post(true); return; }
 
-    let seedBase = 1;
-    const launchGpu = (snapshot, samples, seed) => {
+    let seedBase = laneSeed(1, LANE, 0);
+    let gpuSeedBase = laneSeed(0x47505531 ^ (Number(myJob.id) || 0), LANE, 2);
+    let gpuPumpEnabled = false;
+    let gpuPumpFallback = 512;
+    const gpuSamplesFor = (snapshot, fallback) => gpu?.recommendPlayouts?.(
+        snapshot.filter((move) => !move.exact).length) ?? fallback;
+
+    // Keep one logical batch (internally striped over the GPU resource slots)
+    // continuously queued.  Batch preparation and replay verification execute
+    // only at ordinary JavaScript task boundaries, never concurrently with a
+    // WASM call.  The GPU owns copies of its boards after submission, so the
+    // CPU remains free to advance beam/exact chunks in the meantime.
+    const launchGpuBatch = () => {
         if (pendingGpu !== null || gpuState !== "on") return false;
+        const snapshot = latestGpuMoves;
+        if (!gpuPumpEnabled || isStale() || !snapshot.some((move) => !move.exact)) return false;
+        const samples = gpuSamplesFor(snapshot, gpuPumpFallback);
+        const seed = gpuSeedBase;
+        gpuSeedBase = (gpuSeedBase + samples) >>> 0;
         let pending;
         pending = gpuRound(snapshot, samples, seed, isStale)
             .catch(() => disableGpu())
+            .then(() => {
+                // A verified playout may have completed a root. Refresh the
+                // next batch before requeueing so proved rows consume no more
+                // device time. collectResults() is a synchronous WASM call at
+                // this task boundary, so it cannot race a beam/exact step.
+                if (!isStale() && eng) latestGpuMoves = collectResults().moves;
+            })
             .finally(() => {
                 if (pendingGpu === pending) pendingGpu = null;
+                if (gpuPumpEnabled && !isStale() && gpuState === "on" &&
+                    latestGpuMoves.some((move) => !move.exact)) {
+                    // Use a macrotask rather than an unbounded microtask chain:
+                    // position-change messages stay promptly preemptive even
+                    // with a mock/driver that resolves a batch immediately.
+                    void nextTick().then(() => launchGpuBatch());
+                }
             });
         pendingGpu = pending;
         return true;
     };
+    const startGpuPump = (fallback = gpuPumpFallback) => {
+        gpuPumpFallback = fallback;
+        gpuPumpEnabled = true;
+        return launchGpuBatch();
+    };
+    const stopGpuPump = () => { gpuPumpEnabled = false; };
     const drainGpu = async () => {
         const pending = pendingGpu;
         if (pending === null) return;
@@ -255,10 +479,85 @@ async function analyze(myJob, isStale) {
         }
     };
 
-    // 2. quick CPU playout round: 32 playouts per root move
+    // CPU root ownership is disjoint, but WebGPU can cheaply sample every
+    // root.  Lane zero therefore remains as a GPU caretaker after its own CPU
+    // roots finish, consuming replay-validated proof/line seeds broadcast by
+    // the pool until the global table is exact.  This is the case that used to
+    // leave the GPU idle after roughly one second in a multi-lane analysis.
+    const coordinatedProofPending = (snapshot) => {
+        const proof = summarizePositionProof(snapshot, (move) => move.lower);
+        return proof.positionUpper > 0 && !proof.positionExact &&
+            snapshot.some((move) => !move.exact &&
+                move.lower < proof.positionUpper &&
+                childRemaining(move) <= EXACT_TRY_REMAINING);
+    };
+
+    const finishLaneIfComplete = async (snapshot) => {
+        if (!ownedComplete(snapshot)) return false;
+        if (!virtualChildAuditComplete) return false;
+        if (coordinatedProofPending(snapshot)) {
+            // The pool may assign this otherwise-idle lane a fixed-prefix
+            // certificate from another lane's root. Returning here would make
+            // complete cross-lane coverage impossible.
+            return false;
+        }
+        if (caretakerStopJob === myJob.id) {
+            stopGpuPump();
+            post(true);
+            return true;
+        }
+        if (!shouldGpuCaretake(snapshot, LANE, gpuState)) {
+            stopGpuPump();
+            post(true);
+            return true;
+        }
+
+        await gpuBaselineReady;
+        if (isStale()) { stopGpuPump(); return true; }
+        latestGpuMoves = snapshot;
+        startGpuPump(1024);
+        for (;;) {
+            if (isStale()) { stopGpuPump(); return true; }
+            if (caretakerStopJob === myJob.id) {
+                stopGpuPump();
+                post(true);
+                return true;
+            }
+            if (pendingGpu === null) launchGpuBatch();
+            await drainGpu();
+            if (isStale()) { stopGpuPump(); return true; }
+
+            let current = collectResults().moves;
+            latestGpuMoves = current;
+            if (current.every((move) => move.exact) || gpuState !== "on") {
+                stopGpuPump();
+                post(true);
+                return true;
+            }
+            if (performance.now() - lastPost > POST_INTERVAL_MS) current = post(false);
+            latestGpuMoves = current;
+        }
+    };
+
+    // The child position gives every possible second move an independent
+    // greedy baseline. Lift that cheap table into each owned parent root now,
+    // instead of forcing a difficult alternative to wait for a max-width beam
+    // before discovering the same two-ply tactic after the user clicks it.
+    for (const move of moves) {
+        if (isStale()) return;
+        if (move.exact || !owns(move)) continue;
+        eng.probeRootChildTable(move.k);
+        if ((move.k & 7) === 7) await nextTick();
+    }
+    moves = post(false);
+
+    if (await finishLaneIfComplete(moves)) return;
+
+    // 3. quick CPU playout round: 32 playouts per root move
     for (let k = 0; k < moves.length; k++) {
         if (isStale()) return;
-        if (moves.find((m) => m.k === k)?.exact) continue;
+        const move = moves.find((candidate) => candidate.k === k);
+        if (!move || move.exact || !owns(move)) continue;
         eng.playoutRoot(k, 32, seedBase);
         eng.playoutRootSoft(k, 32 / SOFT_PLAYOUT_DIVISOR, seedBase);
         seedBase += 32;
@@ -268,36 +567,47 @@ async function analyze(myJob, isStale) {
         }
     }
     moves = post(false);
-    if (moves.every((m) => m.exact)) { post(true); return; }
+    if (await finishLaneIfComplete(moves)) return;
 
-    // 3. deterministic widening beam passes — always the full ladder, even
+    await gpuBaselineReady;
+    if (isStale()) return;
+
+    // GPU-ranked second-ply portfolio. Feature scores are heuristic only;
+    // selected candidates are completed and replay-validated by WASM before
+    // they can update a root result.
+    seedBase = await gpuBeamAssist(moves, seedBase, isStale);
+    if (isStale()) return;
+    moves = post(false);
+    if (await finishLaneIfComplete(moves)) return;
+
+    // From here until a stale job, a failed GPU, settlement or a complete
+    // proof, completed batches immediately enqueue their successor.  This
+    // spans beam passes, proof portfolios and exact-only quanta instead of
+    // tying GPU duty cycle to the much slower outer CPU stages.
+    startGpuPump(512);
+
+    // 5. deterministic widening beam passes — always the full ladder, even
     // when a clear shows up early: the other top moves still need refining
     for (const width of WIDEN_WIDTHS) {
-        // GPU playout state is independent once submitted. Let it run while
-        // the CPU expands the beam instead of idling through map/readback.
-        const gpuLaunched = launchGpu(moves, 512, seedBase);
-        if (gpuLaunched) seedBase += 512;
-        eng.beamBegin(width, 0);
+        eng.beamBeginPartition(width, 0, LANE, LANES);
         for (;;) {
-            // The submitted batch owns only GPU buffers now. A stale job can
-            // return immediately; the next job uses the CPU until it clears.
             if (isStale()) return;
             if (eng.beamStep(CHUNK) === 1) break;
             postIfDue();
             await nextTick();
         }
-        if (gpuLaunched) await drainGpu();
         if (isStale()) return;
         moves = post(false);
-        if (moves.every((m) => m.exact)) { post(true); return; }
+        if (await finishLaneIfComplete(moves)) return;
 
         // Every normal beam shares the tuned fragmentation heuristic. Near
         // the end, add a bounded orthogonal member before the widest default
         // pass: it keeps only progress + proved-permanent penalties, rescuing
         // solutions that must look temporarily fragmented for a move or two.
-        if (width === 512 && eng.getRemaining() <= CLEAR_PORTFOLIO_REMAINING &&
-            moves[0].score <= CLEAR_PORTFOLIO_SCORE) {
-            const candidates = moves.filter((m) => !m.exact &&
+        if (width === 512) {
+            const candidates = moves.filter((m) => owns(m) && !m.exact &&
+                childRemaining(m) <= CLEAR_PORTFOLIO_REMAINING &&
+                m.score <= CLEAR_PORTFOLIO_SCORE &&
                 eng.getRootLower(m.k) === 0).slice(0, CLEAR_PORTFOLIO_ROOTS);
             for (const candidate of candidates) {
                 if (isStale()) return;
@@ -309,13 +619,26 @@ async function analyze(myJob, isStale) {
                     await nextTick();
                 }
                 moves = post(false);
-                if (moves.every((m) => m.exact)) break;
+                if (ownedComplete(moves)) break;
             }
-            if (moves.every((m) => m.exact)) { post(true); return; }
+            if (await finishLaneIfComplete(moves)) return;
         }
     }
 
-    // Full value enumeration is intentionally gated on compact endgames. On
+    // Compact children already qualify for the persistent exact ladder below.
+    // Do not make them wait behind a potentially billion-node heuristic
+    // emulation of the position reached after a click. Larger children still
+    // receive the bounded virtual allocation before continuous search.
+    if (moves.some((move) => !move.exact &&
+        childRemaining(move) > EXACT_TRY_REMAINING)) {
+        moves = await runVirtualChildPortfolio(moves, isStale, post, postIfDue);
+        if (isStale()) return;
+    }
+    virtualChildAuditComplete = true;
+    moves = post(false);
+    if (await finishLaneIfComplete(moves)) return;
+
+    // Full value enumeration is intentionally gated on compact children. On
     // larger boards, give the 16 most promising roots that can still beat the
     // incumbent one fair, bounded B&B turn instead. Easy constructive winners
     // can certify the position without being starved behind a hard positive
@@ -323,26 +646,32 @@ async function analyze(myJob, isStale) {
     if (eng.getRemaining() > EXACT_TRY_REMAINING) {
         moves = await runPositionProofPortfolio(moves, isStale, post, postIfDue);
         if (isStale()) return;
-        if (moves.every((m) => m.exact)) { post(true); return; }
+        if (await finishLaneIfComplete(moves)) return;
     }
 
-    // 5. continuous investigation — runs until the position changes, every
+    // 8. continuous investigation — runs until the position changes, every
     // move is PROVEN optimal, or nothing new has been found despite climbing
     // the whole width ladder (settled stop); scores only improve over time
+    const coordinatedLadder = createCoordinatedThresholdLadder(isStale, postIfDue);
     const ladder = createExactLadder(isStale);
     let progress = createSearchProgress(
         moves.map((m) => `${m.cell}:${m.score}:${m.exact ? 1 : 0}`).join("|"),
         moves[0].score);
-    let globalSeed = 1;
+    let globalSeed = laneSeed(1, LANE, 1);
     const lockedAttempts = new Map(); // cell -> private passes already run
     const lockedMaxWidths = new Map(); // cell -> widest private pass already run
     for (let s = 1; ; s++) {
         if (isStale()) return;
 
-        if (moves.length > 0 && moves.every((m) => m.exact)) {
-            post(true); // proven: the position is fully understood
-            return;
+        const coordinated = await coordinatedLadder.advance(moves);
+        if (coordinated.active) {
+            if (coordinated.changed || performance.now() - lastPost > POST_INTERVAL_MS) {
+                moves = post(false);
+            }
+            continue;
         }
+
+        if (moves.length > 0 && await finishLaneIfComplete(moves)) return;
 
         // exact-proof ladder: a bounded quantum per cycle, objective first
         if (await ladder.advance(moves)) {
@@ -380,7 +709,7 @@ async function analyze(myJob, isStale) {
         // seed makes every pass explore a different corridor
         let lockedMove = null;
         if (s % 2 === 1) {
-            const preferred = lockCandidates(moves);
+            const preferred = lockCandidates(ownedMoves(moves));
             if (tier === WIDTH_TIERS.length - 1) {
                 // Before settlement, audit every root that can still beat the
                 // incumbent with its own max-width heap. Preserve the normal
@@ -396,8 +725,6 @@ async function analyze(myJob, isStale) {
         }
         let globalWidth = 0;
         const playoutSeed = seedBase;
-        const gpuLaunched = s % 2 === 0 && launchGpu(moves, 1024, playoutSeed);
-        if (gpuLaunched) seedBase += 1024;
         if (lockedMove !== null) {
             const move = lockedMove;
             const attempt = lockedAttempts.get(move.cell) ?? 0;
@@ -408,7 +735,7 @@ async function analyze(myJob, isStale) {
             lockedMaxWidths.set(move.cell, Math.max(lockedMaxWidths.get(move.cell) ?? 0, width));
         } else {
             globalWidth = WIDTH_TIERS[tier];
-            eng.beamBegin(globalWidth, globalSeed++);
+            eng.beamBeginPartition(globalWidth, globalSeed++, LANE, LANES);
         }
         for (;;) {
             if (isStale()) return;
@@ -420,16 +747,23 @@ async function analyze(myJob, isStale) {
 
         // playout refinement, biased to the moves the player actually sees
         if (s % 2 === 0) {
-            if (gpuLaunched) {
+            if (gpuPumpEnabled && gpuState === "on") {
                 await cpuSoftPlayoutRound(moves, playoutSeed, isStale);
                 if (isStale()) return;
-                await drainGpu();
+                seedBase = (seedBase + 64) >>> 0;
             } else {
                 seedBase = await cpuPlayoutRound(moves, seedBase, isStale);
             }
             if (isStale()) return;
             moves = post(false);
+            if (await finishLaneIfComplete(moves)) return;
         }
+
+        // A lane with no ordinal-owned roots can otherwise complete an empty
+        // beam/playout cycle without a single task boundary. Yield once so a
+        // newly issued cross-root frontier arrives before settlement logic.
+        await nextTick();
+        if (isStale()) return;
 
         // Separate objective progress from whole-list activity. The former
         // widens search; the latter decides whether there is truly nothing
@@ -442,12 +776,299 @@ async function analyze(myJob, isStale) {
         // the board is too large to enumerate — below the proving gate the
         // engine never stops early, proofs always land eventually
         const uncoveredPrivate = uncoveredPrivateCandidates(moves, lockedMaxWidths).length;
-        if (settlementReady(progress, SETTLE_PASSES, eng.getRemaining(),
-            EXACT_REMAINING, uncoveredPrivate)) {
+        const uncoveredExact = moves.filter((move) => owns(move) && !move.exact &&
+            childRemaining(move) <= EXACT_TRY_REMAINING).length;
+        if (!coordinatedProofPending(moves) &&
+            settlementReady(progress, SETTLE_PASSES, eng.getRemaining(),
+            EXACT_REMAINING, uncoveredPrivate + uncoveredExact)) {
+            stopGpuPump();
             post(true);
             return;
         }
     }
+}
+
+// Reproduce the clicked child's bounded beam allocation without abandoning the
+// parent position. All lanes intentionally build the same stable pair list;
+// its ordinal assignment is exhaustive, disjoint and balanced even when the
+// legal cell representatives cluster badly modulo the lane count.
+async function runVirtualChildPortfolio(moves, isStale, post, postIfDue) {
+    const parents = moves.filter((move) => childRemaining(move) > EXACT_TRY_REMAINING)
+        .sort((a, b) => a.k - b.k);
+    const byParent = [];
+    const allPairs = [];
+    for (const parent of parents) {
+        const count = eng.childGroupsToIO(parent.k);
+        const reps = mem().slice(IO + 256, IO + 256 + count);
+        const sizes = mem().slice(IO + 512, IO + 512 + count);
+        const entries = Array.from(reps, (second, index) => ({
+            second,
+            size: sizes[index],
+        }))
+            .sort((a, b) => b.size - a.size || a.second - b.second);
+        const seconds = entries.map((entry) => {
+            const task = {
+                cell: parent.cell,
+                second: entry.second,
+                ordinal: allPairs.length,
+            };
+            allPairs.push(task);
+            return task;
+        });
+        byParent.push({ cell: parent.cell, seconds });
+    }
+
+    // Keep two finite orders: round-robin for the cheap discovery tier, so a
+    // wide child cannot delay every other parent's first turn; parent-major
+    // for stronger retries, so each virtual child receives the same bounded
+    // serial allocation it would receive after its parent is clicked.
+    const tasks = roundRobinPrefixTasks(byParent)
+        .map((entry) => entry.second)
+        .filter((task) => task.ordinal % LANES === LANE);
+    const parentTasks = allPairs.filter((task) => task.ordinal % LANES === LANE);
+
+    // A freshly clicked child first gives each of its roots a one-ply greedy
+    // table and independent hard/soft playouts, with tabu recomputed after the
+    // selected second move. Lift exactly those constructive phases before the
+    // more expensive proof/beam portfolio. The arbitrary-prefix WASM entry
+    // points keep the original first move in every recorded line.
+    let contextTurns = 0;
+    for (const task of tasks) {
+        if (isStale()) return moves;
+        const current = moves.find((move) => move.cell === task.cell);
+        if (!current || current.exact || current.lower >= current.score) continue;
+
+        mem().set(Uint8Array.of(task.second), IO);
+        eng.probeRootPrefixTable(current.k, 1);
+        const prefixSeed = laneSeed(1 + task.ordinal * PREFIX_CONTEXT_PLAYOUTS,
+            LANE, 5);
+        mem().set(Uint8Array.of(task.second), IO);
+        eng.playoutRootPrefix(current.k, 1, PREFIX_CONTEXT_PLAYOUTS, prefixSeed);
+        mem().set(Uint8Array.of(task.second), IO);
+        eng.playoutRootPrefixSoft(
+            current.k, 1, PREFIX_CONTEXT_SOFT_PLAYOUTS, prefixSeed);
+        contextTurns++;
+        if ((contextTurns & 7) === 0) {
+            moves = collectResults().moves;
+            postIfDue();
+            await nextTick();
+        }
+    }
+    moves = post(false);
+
+    // The clicked child gives every second move an independent bounded proof
+    // turn. Reproduce that allocation first, in fair geometric budget tiers,
+    // targeting the parent's sound lower bound. A target witness is enough to
+    // prove the parent; a miss proves nothing and cannot poison later work.
+    for (let tier = 0; tier < VIRTUAL_CHILD_PROOF_BUDGETS.length; tier++) {
+        const budget = VIRTUAL_CHILD_PROOF_BUDGETS[tier];
+        // Rotate parents at every tier. A strong retry is precisely where a
+        // later parent used to wait behind every second move of earlier
+        // parents, even though the same row solved almost immediately after
+        // it was clicked. Diagonal order gives every visible parent one
+        // comparable post-click turn before any parent receives a second.
+        const tierTasks = tasks;
+        for (const task of tierTasks) {
+            if (isStale()) return moves;
+            const current = moves.find((move) => move.cell === task.cell);
+            if (!current || current.exact || current.lower >= current.score) continue;
+            const target = current.lower;
+            if (eng.exactBeginRootChildSeek(
+                current.k, task.second, budget, target) !== 1) continue;
+
+            let result = -1;
+            while (result === -1) {
+                if (isStale()) return moves;
+                result = eng.exactStep(EXACT_CHUNK);
+                postIfDue();
+                await nextTick();
+            }
+            // Matching no-witness commits only cancel the live prefix; a real
+            // target hit prepends both moves and may meet ROOT_LOWER exactly.
+            eng.exactCommitRootChild(current.k, task.second);
+            const currentMoves = collectResults().moves;
+            const updated = currentMoves.find((move) => move.cell === task.cell);
+            if (updated && (updated.exact || updated.score < current.score)) {
+                moves = post(false);
+            } else {
+                moves = currentMoves;
+                postIfDue();
+            }
+        }
+        moves = post(false);
+
+        // After the cheap 100k pass, descend one more ply before spending the
+        // 1M retry and all wide second-move beams. This mirrors what happens
+        // when the player enters a child: its newly exposed roots receive a
+        // fair turn promptly. Keeping the receding-horizon audit behind every
+        // expensive second-ply retry was the remaining source of the supplied
+        // FA/DC parent-versus-click latency inversion.
+        if (tier === 0) {
+            moves = await runNestedPrefixPortfolio(
+                moves, parents, isStale, post, postIfDue);
+            if (isStale()) return moves;
+        }
+    }
+
+    for (const [width, seed] of VIRTUAL_CHILD_PASSES) {
+        for (const task of parentTasks) {
+            if (isStale()) return moves;
+            const current = moves.find((move) => move.cell === task.cell);
+            if (!current || current.exact || current.lower >= current.score) continue;
+
+            eng.beamBeginRootChild(current.k, task.second, width, seed);
+            for (;;) {
+                if (isStale()) return moves;
+                if (eng.beamStep(CHUNK) === 1) break;
+                postIfDue();
+                await nextTick();
+            }
+            const currentMoves = collectResults().moves;
+            const updated = currentMoves.find((move) => move.cell === task.cell);
+            if (updated && (updated.exact || updated.score < current.score)) {
+                moves = post(false);
+            } else {
+                moves = currentMoves;
+                postIfDue();
+            }
+        }
+        moves = post(false);
+    }
+
+    return moves;
+}
+
+async function runNestedPrefixPortfolio(moves, parents, isStale, post, postIfDue) {
+    const liveCells = new Set(moves
+        .filter((move) => !move.exact && move.lower < move.score)
+        .map((move) => move.cell));
+    const byParent = [];
+    let buildTurns = 0;
+
+    // Only rows still unresolved at this frontier need a deeper allocation.
+    // Each parent's local ordinals are rebuilt exactly as they are after that
+    // parent is clicked, so omitting an already-proved sibling cannot renumber
+    // or orphan any of this parent's work.
+    for (const parent of parents) {
+        if (!liveCells.has(parent.cell)) continue;
+        const secondCount = eng.childGroupsToIO(parent.k);
+        const secondReps = mem().slice(IO + 256, IO + 256 + secondCount);
+        const secondSizes = mem().slice(IO + 512, IO + 512 + secondCount);
+        // childGroupsToIO is already in the clicked board's stable root-index
+        // order. Do not re-sort these roots by size: runVirtualChildPortfolio
+        // sorts only the moves below each root, and that distinction controls
+        // both its fair order and its lane ownership.
+        const seconds = Array.from(secondReps, (second, index) => ({
+            second,
+            size: secondSizes[index],
+        }));
+
+        const branches = [];
+        for (const entry of seconds) {
+            if (isStale()) return moves;
+            mem().set(Uint8Array.of(entry.second), IO);
+            const thirdCount = eng.prefixGroupsToIO(parent.k, 1);
+            if (thirdCount < 0) continue;
+            const thirdReps = mem().slice(IO + 256, IO + 256 + thirdCount);
+            const thirdSizes = mem().slice(IO + 512, IO + 512 + thirdCount);
+            const thirds = Array.from(thirdReps, (third, index) => ({
+                third,
+                size: thirdSizes[index],
+            })).sort((a, b) => b.size - a.size || a.third - b.third);
+            const tasks = thirds.map(({ third }) => ({
+                cell: parent.cell,
+                prefix: [entry.second, third],
+            }));
+            branches.push({
+                second: entry.second,
+                tasks,
+            });
+            buildTurns++;
+            if ((buildTurns & 7) === 0) await nextTick();
+        }
+
+        // Diagonal order is the parent-side analogue of giving every visible
+        // child root one turn. Bound the initial frontier: an exhaustive
+        // first×second×third Cartesian portfolio was itself the source of
+        // multi-billion-node stalls and merely moved the cliff one ply.
+        const parentTasks = mirrorClickedPrefixTasks(
+            branches, NESTED_PREFIX_CONTEXTS_PER_PARENT);
+        byParent.push({ cell: parent.cell, seconds: parentTasks });
+    }
+
+    const fairTasks = roundRobinPrefixTasks(byParent)
+        .map((entry) => entry.second)
+        .filter((task) => task.postClickOrdinal % LANES === LANE);
+
+    // Discovery phase: one small exact target probe plus two complementary
+    // heaps per context. Running the complete mini-portfolio context-by-
+    // context lets a decisive third move land immediately instead of waiting
+    // behind the same pass for every unrelated triple.
+    for (const task of fairTasks) {
+        if (isStale()) return moves;
+        let current = moves.find((move) => move.cell === task.cell);
+        if (!current || current.exact || current.lower >= current.score) continue;
+
+        mem().set(Uint8Array.from(task.prefix), IO);
+        const token = eng.exactBeginRootPrefixSeek(
+            current.k, task.prefix.length, VIRTUAL_CHILD_PROOF_BUDGETS[0], current.lower);
+        if (token !== 0) {
+            let result = -1;
+            while (result === -1) {
+                if (isStale()) return moves;
+                result = eng.exactStep(EXACT_CHUNK);
+                postIfDue();
+                await nextTick();
+            }
+            eng.exactCommitRootPrefix(token);
+            moves = collectResults().moves;
+            current = moves.find((move) => move.cell === task.cell);
+        }
+
+        for (const [width, seed] of NESTED_PREFIX_PASSES) {
+            if (!current || current.exact || current.lower >= current.score ||
+                current.score - current.lower > NESTED_PREFIX_STRONG_GAP) break;
+            mem().set(Uint8Array.from(task.prefix), IO);
+            if (eng.beamBeginRootPrefix(
+                current.k, task.prefix.length, width, seed) !== 1) continue;
+            for (;;) {
+                if (isStale()) return moves;
+                if (eng.beamStep(CHUNK) === 1) break;
+                postIfDue();
+                await nextTick();
+            }
+            moves = collectResults().moves;
+            current = moves.find((move) => move.cell === task.cell);
+        }
+        postIfDue();
+    }
+    moves = post(false);
+
+    // Strong target probes are a second fair round. By now a beam-resolvable
+    // context such as DC→GD→DB has already returned; the 1M-node allocation
+    // is retained for exact-only corridors such as FA→AC→DA.
+    for (const task of fairTasks) {
+        if (isStale()) return moves;
+        const current = moves.find((move) => move.cell === task.cell);
+        if (!current || current.exact || current.lower >= current.score ||
+            current.score - current.lower > NESTED_PREFIX_STRONG_GAP) continue;
+        mem().set(Uint8Array.from(task.prefix), IO);
+        const token = eng.exactBeginRootPrefixSeek(
+            current.k, task.prefix.length, VIRTUAL_CHILD_PROOF_BUDGETS[1], current.lower);
+        if (token === 0) continue;
+        let result = -1;
+        while (result === -1) {
+            if (isStale()) return moves;
+            result = eng.exactStep(EXACT_CHUNK);
+            postIfDue();
+            await nextTick();
+        }
+        eng.exactCommitRootPrefix(token);
+        moves = collectResults().moves;
+        postIfDue();
+    }
+    moves = post(false);
+    return moves;
 }
 
 // Above the full-enumeration gate, sequential unbounded proof work is a
@@ -458,7 +1079,8 @@ async function analyze(myJob, isStale) {
 // still covers the remaining roots. Stop as soon as the position bounds meet.
 async function runPositionProofPortfolio(moves, isStale, post, postIfDue) {
     const candidates = positionProofCandidates(moves, (move) => move.lower)
-        .slice(0, POSITION_PROBE_ROOTS);
+        .filter((move) => owns(move) && childRemaining(move) > EXACT_TRY_REMAINING)
+        .slice(0, Math.max(1, Math.ceil(POSITION_PROBE_ROOTS / LANES)));
     for (const candidate of candidates) {
         if (isStale()) return moves;
         const current = moves.find((move) => move.cell === candidate.cell);
@@ -499,12 +1121,16 @@ function biggerHopefuls(moves) {
 }
 
 // Fast-path root-locked targets: bigger-group hopefuls first, then unproven
-// top-five moves. A separate max-tier audit below guarantees tail fairness.
+// top-five moves and the first positive-score alternative. The latter matches
+// the optional UI mode and prevents its sixth displayed row from waiting for
+// the late max-tier audit. A separate max-tier audit guarantees tail fairness.
 function lockCandidates(moves) {
     const hopefuls = biggerHopefuls(moves);
     const seen = new Set(hopefuls.map((m) => m.cell));
     const top = moves.slice(0, TOP_RANKS).filter((m) => !m.exact && !seen.has(m.cell));
-    return [...hopefuls, ...top];
+    for (const move of top) seen.add(move.cell);
+    const firstPositive = moves.find((m) => m.score > 0 && !m.exact && !seen.has(m.cell));
+    return [...hopefuls, ...top, ...(firstPositive ? [firstPositive] : [])];
 }
 
 function uncoveredPrivateCandidates(moves, maxWidths) {
@@ -512,6 +1138,7 @@ function uncoveredPrivateCandidates(moves, maxWidths) {
     const incumbent = moves[0].score;
     const maxWidth = LOCKED_WIDTHS[LOCKED_WIDTHS.length - 1];
     return moves.filter((m) => {
+        if (!owns(m)) return false;
         const lower = eng.getRootLower(m.k);
         const canImprove = lower < incumbent;
         const canAlsoClear = incumbent === 0 && m.score > 0 && lower === 0;
@@ -538,7 +1165,13 @@ function seedFromMemory(key) {
 
     if (prevAnalysis && prevAnalysis.key !== key) {
         for (const m of prevAnalysis.moves) {
-            if (m.line.length > 1) seeds.push({ line: m.line.slice(1) });
+            if (m.line.length > 1) {
+                seeds.push({
+                    line: m.line.slice(1),
+                    exact: canTransferExactSuffix(prevAnalysis, m, key),
+                    score: m.score,
+                });
+            }
         }
     }
 
@@ -582,7 +1215,7 @@ async function cpuPlayoutRound(moves, seedBase, isStale) {
     const priority = new Set(biggerHopefuls(moves).map((m) => m.cell));
     for (let rank = 0; rank < moves.length; rank++) {
         if (isStale()) return seedBase;
-        if (moves[rank].exact) continue;
+        if (moves[rank].exact || !owns(moves[rank])) continue;
         const n = rank < 8 || priority.has(moves[rank].cell) ? 48 : 8;
         eng.playoutRoot(moves[rank].k, n, seedBase);
         eng.playoutRootSoft(moves[rank].k, Math.max(1, Math.floor(n / SOFT_PLAYOUT_DIVISOR)), seedBase);
@@ -599,11 +1232,251 @@ async function cpuSoftPlayoutRound(moves, seedBase, isStale) {
     const priority = new Set(biggerHopefuls(moves).map((m) => m.cell));
     for (let rank = 0; rank < moves.length; rank++) {
         if (isStale()) return;
-        if (moves[rank].exact) continue;
+        if (moves[rank].exact || !owns(moves[rank])) continue;
         const n = rank < 8 || priority.has(moves[rank].cell) ? 8 : 2;
         eng.playoutRootSoft(moves[rank].k, n, seedBase);
         if (rank % 6 === 5) await nextTick();
     }
+}
+
+async function gpuBeamAssist(moves, seedBase, isStale) {
+    if (!gpu || gpuState !== "on" || typeof gpu.evaluateBoards !== "function") return seedBase;
+
+    const candidates = [];
+    for (const root of moves) {
+        if (root.exact || candidates.length >= GPU_BEAM_ASSIST_MAX_BOARDS) continue;
+        const count = eng.childGroupsToIO(root.k);
+        const seconds = Array.from(mem().slice(IO + 256, IO + 256 + count));
+        for (const second of seconds) {
+            if (candidates.length >= GPU_BEAM_ASSIST_MAX_BOARDS) break;
+            if (eng.grandchildToIO(root.k, second) !== 1) continue;
+            candidates.push({
+                root,
+                second,
+                board: mem().slice(IO, IO + SIZE * SIZE),
+            });
+        }
+    }
+    if (candidates.length === 0) return seedBase;
+
+    const features = await gpu.evaluateBoards(candidates.map((candidate) => candidate.board));
+    if (isStale()) return seedBase;
+
+    // A compact, deliberately non-proof score: progress first, then boards
+    // with more immediate connectivity and fewer surviving colors. Keep a
+    // small portfolio per root so one superficially attractive root cannot
+    // consume the whole assist.
+    const byRoot = new Map();
+    for (let i = 0; i < candidates.length; i++) {
+        const feature = features[i];
+        const candidate = candidates[i];
+        candidate.rank = feature.remaining + feature.colorCount * 0.75 -
+            feature.adjacentPairs * 0.2 - feature.dominantCount * 0.05;
+        const list = byRoot.get(candidate.root.cell) ?? [];
+        list.push(candidate);
+        byRoot.set(candidate.root.cell, list);
+    }
+
+    for (const list of byRoot.values()) {
+        list.sort((a, b) => a.rank - b.rank || a.second - b.second);
+        for (const candidate of list.slice(0, GPU_BEAM_ASSIST_PER_ROOT)) {
+            if (isStale()) return seedBase;
+            mem().set(candidate.board, IO);
+            const final = eng.testPlayout(seedBase++);
+            const tailLength = mem()[IO + 256];
+            const line = [candidate.root.cell, candidate.second,
+                ...mem().slice(IO + 257, IO + 257 + tailLength)];
+            if (line.length > 80) continue;
+            mem().set(Uint8Array.from(line), IO);
+            // Full replay from the original position is the trust boundary.
+            // The feature kernel can only choose what to try, never what to
+            // believe or prove.
+            if (eng.seedLine(line.length) !== final) continue;
+        }
+    }
+    return seedBase;
+}
+
+// The pool composes a positive proof from a complete partition of one root
+// child's legal second moves. Each lane keeps one assigned prefix's threshold
+// DFS resident until it either finds a better line or certifies that entire
+// prefix above the target. A single miss never changes the parent bound.
+function createCoordinatedThresholdLadder(isStale, postIfDue) {
+    let state = null;
+
+    const samePlan = (plan) => state && plan && state.id === plan.id &&
+        state.epoch === plan.epoch && state.target === plan.target &&
+        state.round === plan.round;
+
+    const cancel = () => {
+        if (state?.running) eng.thresholdCancel();
+        state = null;
+    };
+
+    const sync = (moves) => {
+        const plan = thresholdPlan;
+        if (!plan) {
+            cancel();
+            return false;
+        }
+        if (plan.tasks === null) {
+            if (!samePlan(plan)) {
+                cancel();
+                state = { ...plan, tasks: [], at: 0, running: false };
+            }
+            return true;
+        }
+        if (samePlan(plan)) return true;
+        cancel();
+        const tasks = [];
+        for (let ordinal = 0; ordinal < plan.tasks.length; ordinal++) {
+            if (ordinal % LANES !== LANE) continue;
+            const source = plan.tasks[ordinal];
+            const row = moves.find((move) => move.cell === source.rootCell);
+            if (!row || !Array.isArray(source.prefix) || source.prefix.length >= 80) {
+                throw new Error(`invalid coordinated threshold task ${source.rootCell}/${source.prefix}`);
+            }
+            tasks.push({
+                rootCell: source.rootCell,
+                prefix: source.prefix.slice(),
+                k: row.k,
+                attempts: 0,
+            });
+        }
+        state = {
+            ...plan,
+            tasks,
+            at: 0,
+            running: false,
+        };
+        return true;
+    };
+
+    const postOutcome = (type, task, children = undefined) => {
+        self.postMessage({
+            type,
+            id: state.id,
+            epoch: state.epoch,
+            target: state.target,
+            round: state.round,
+            rootCell: task.rootCell,
+            prefix: task.prefix,
+            ...(children === undefined ? {} : { children }),
+        });
+        state.tasks.splice(state.at, 1);
+        if (state.at >= state.tasks.length) state.at = 0;
+        state.running = false;
+    };
+
+    const finish = (result, task) => {
+        const plan = state;
+        const merged = eng.thresholdMerge();
+        state.running = false;
+        if (result <= plan.target) {
+            // The prefixed constructive line is already in the root table.
+            // Retire this lane's plan locally before posting: an immediate
+            // memo-backed witness could otherwise restart in a tight loop
+            // before the pool's cancel message gets a task turn.
+            state.tasks.length = 0;
+            state.at = 0;
+            return { active: true, changed: merged >= 0 };
+        }
+        if (result !== plan.target + 1 || merged !== result) {
+            throw new Error(`invalid coordinated threshold result ${result}/${merged}`);
+        }
+        postOutcome("threshold-prefix-miss", task);
+        return { active: true, changed: false };
+    };
+
+    return {
+        async advance(moves) {
+            if (!sync(moves)) return { active: false, changed: false };
+            if (!state || state.at >= state.tasks.length) {
+                await nextTick();
+                return { active: true, changed: false };
+            }
+
+            const task = state.tasks[state.at];
+            if (!state.running) {
+                mem().set(Uint8Array.from(task.prefix), IO);
+                const budget = Math.min(COORDINATED_PREFIX_BUDGET_MAX,
+                    COORDINATED_PREFIX_BUDGET * 2 ** Math.min(task.attempts, 5));
+                const begun = eng.thresholdBeginRootPrefix(
+                    task.k, task.prefix.length, state.target, budget);
+                if (begun === -2) {
+                    throw new Error(`invalid coordinated threshold prefix ${task.rootCell}/${task.prefix}`);
+                }
+                if (begun >= 0) {
+                    const completed = finish(begun, task);
+                    await nextTick();
+                    return completed;
+                }
+                state.running = true;
+            }
+
+            for (let slice = 0; slice < 4; slice++) {
+                if (isStale()) return { active: true, changed: false };
+                const result = eng.thresholdStep(EXACT_CHUNK);
+                if (result === -1) {
+                    postIfDue();
+                    await nextTick();
+                    if (!samePlan(thresholdPlan)) return { active: true, changed: false };
+                    continue;
+                }
+                if (result === -2) {
+                    state.running = false;
+                    if (task.prefix.length >= COORDINATED_MAX_SPLIT_PREFIX) {
+                        // Keep every completed VTT certificate, but rotate the
+                        // unfinished state so one hard prefix cannot hold all
+                        // later roots behind it. The budget escalates on every
+                        // return to this stable task/lane, limiting deterministic
+                        // retracing while preserving cross-task transpositions.
+                        task.attempts++;
+                        if (state.tasks.length > 1) {
+                            eng.thresholdCancel();
+                            state.tasks.splice(state.at, 1);
+                            state.tasks.push(task);
+                            if (state.at >= state.tasks.length) state.at = 0;
+                        }
+                        postIfDue();
+                        await nextTick();
+                        return { active: true, changed: false };
+                    }
+
+                    // Split a root exactly once into its complete legal
+                    // second-move manifest. Every fixed child then remains a
+                    // resumable DFS until it returns a witness or certificate.
+                    eng.thresholdCancel();
+                    mem().set(Uint8Array.from(task.prefix), IO);
+                    const count = eng.prefixGroupsToIO(task.k, task.prefix.length);
+                    if (count <= 0) {
+                        throw new Error(`coordinated threshold cannot split ${task.rootCell}/${task.prefix}`);
+                    }
+                    const children = Array.from(mem().slice(IO + 256, IO + 256 + count))
+                        .sort((a, b) => a - b);
+                    const childStates = [];
+                    for (const child of children) {
+                        const extended = [...task.prefix, child];
+                        mem().set(Uint8Array.from(extended), IO);
+                        if (eng.prefixGroupsToIO(task.k, extended.length) < 0) {
+                            throw new Error(`coordinated threshold child is invalid ${task.rootCell}/${extended}`);
+                        }
+                        childStates.push({
+                            cell: child,
+                            board: mem().slice(IO, IO + SIZE * SIZE),
+                        });
+                    }
+                    postOutcome("threshold-prefix-split", task, childStates);
+                    await nextTick();
+                    return { active: true, changed: false };
+                }
+                const completed = finish(result, task);
+                await nextTick();
+                return completed;
+            }
+            return { active: true, changed: false };
+        },
+    };
 }
 
 // Exact-proof ladder: compact endgames try incumbent-driven branch and bound
@@ -613,31 +1486,66 @@ async function cpuSoftPlayoutRound(moves, seedBase, isStale) {
 // a memo-guided witness DFS repairs any remaining policy-cache gap.
 function createExactLadder(isStale) {
     const exhausted = new Map(); // cell -> last value-solve budget tried
+    const thresholdExhausted = new Map(); // cell:target -> last retained threshold budget
     const lineExhausted = new Map(); // cell -> last guided witness budget tried
     const boundTried = new Set();
-    let active = null; // { k, cell, mode: "bound" | "value" | "line", budget, target }
+    let active = null; // { k, cell, mode: "threshold" | "bound" | "value" | "line", ... }
 
     return {
         shouldPrioritize(moves) {
-            return moves.some((move) => !move.exact) && eng.getRemaining() <= EXACT_TRY_REMAINING;
+            if (active?.mode === "threshold") return true;
+            const unresolved = moves.filter((move) => owns(move) && !move.exact);
+            // When every owned child is under the exact gate, finish the
+            // retained value frontier back-to-back. On mixed boards, give the
+            // eligible children one bounded quantum per cycle without letting
+            // one threshold-crossing root starve heuristic work for the rest.
+            return unresolved.length > 0 &&
+                unresolved.every((move) => childRemaining(move) <= EXACT_TRY_REMAINING);
         },
 
         // runs a bounded slice; true if a proof finished (rankings may change)
         async advance(moves) {
-            const remaining = eng.getRemaining();
-            if (moves.length === 0 || remaining > EXACT_TRY_REMAINING) return false;
-
-            // Full speed below the gate; a meaningful half-sized quantum
-            // above it. One chunk per cycle let beam work reach settlement
-            // while a much cheaper exact result was still starved.
-            const slices = remaining <= EXACT_REMAINING ? 8 : 4;
+            if (moves.length === 0) return false;
 
             // A beam/playout may have reached the root lower bound while a
             // proof was sliced across cycles. Do not keep solving a row that
             // has become exact in the meantime.
-            if (active && moves.find((m) => m.cell === active.cell)?.exact) active = null;
+            if (active && moves.find((m) => m.cell === active.cell)?.exact) {
+                if (active.mode === "threshold") eng.thresholdCancel();
+                active = null;
+            }
+            if (active?.mode === "threshold") {
+                const proof = summarizePositionProof(moves, (move) => move.lower);
+                const row = moves.find((move) => move.cell === active.cell);
+                if (proof.positionExact || proof.positionUpper <= 0 ||
+                    active.target !== proof.positionUpper - 1 || !row ||
+                    row.lower >= proof.positionUpper) {
+                    eng.thresholdCancel();
+                    active = null;
+                }
+            }
 
             if (!active) {
+                const proof = summarizePositionProof(moves, (move) => move.lower);
+                // For a positive incumbent U, proving the position only asks
+                // whether any root reaches U-1. Give every threatening compact
+                // root to its normal owner and run the persistent Boolean
+                // threshold solver. A completed miss raises that row's lower
+                // bound to U; all lanes' independent misses then compose into
+                // the board-wide proof, while a hit supplies a better line.
+                const thresholdNext = proof.positionUpper > 0 && !proof.positionExact
+                    ? moves.filter((move) => owns(move) && !move.exact &&
+                        move.lower < proof.positionUpper &&
+                        childRemaining(move) <= EXACT_TRY_REMAINING)
+                        .sort((a, b) => a.size - b.size || a.score - b.score ||
+                            a.cell - b.cell)[0]
+                    : null;
+                if (thresholdNext) {
+                    const started = this.startThreshold(
+                        thresholdNext, proof.positionUpper - 1);
+                    if (started !== null) return started;
+                }
+
                 // Prove the broadest child first (smallest removed root
                 // group). Its exact traversal reaches the most shared
                 // descendants and warms the persistent value memo for the
@@ -645,26 +1553,34 @@ function createExactLadder(isStale) {
                 // On the hard corpus this changes all-root completion from
                 // repeated table-thrashing traversals into one broad solve
                 // followed by mostly memo-backed proofs.
-                const next = moves.filter((m) => !m.exact)
+                const next = active ? null : moves.filter((m) => owns(m) && !m.exact &&
+                    childRemaining(m) <= EXACT_TRY_REMAINING)
                     .sort((a, b) => a.size - b.size || a.score - b.score || a.cell - b.cell)[0];
-                if (!next) return false; // everything proven
+                if (!active && !next) return false; // no child is inside the exact gate
 
-                if (remaining <= BOUND_TRY_REMAINING && !boundTried.has(next.cell)) {
+                const remaining = next ? childRemaining(next) : active.remaining;
+
+                if (!active && remaining <= BOUND_TRY_REMAINING && !boundTried.has(next.cell)) {
                     boundTried.add(next.cell);
                     active = { k: next.k, cell: next.cell, mode: "bound",
-                        budget: BOUND_BUDGET, target: -1 };
+                        budget: BOUND_BUDGET, target: -1, remaining };
                     eng.exactBeginChild(next.k, BOUND_BUDGET);
-                } else {
+                } else if (!active) {
                     const started = this.startValue(next);
                     if (started !== null) return started;
                 }
             }
 
+            // Match the clicked child size, not the untouched parent size.
+            const slices = active.remaining <= EXACT_REMAINING ? 8 : 4;
+
             // a bounded number of chunks per cycle, then back to the beams
             for (let c = 0; c < slices; c++) {
                 if (isStale()) return false;
                 const mode = active.mode;
-                const r = mode === "value" ? eng.vsStep(EXACT_CHUNK) : eng.exactStep(EXACT_CHUNK);
+                const r = mode === "value" ? eng.vsStep(EXACT_CHUNK) :
+                    mode === "threshold" ? eng.thresholdStep(EXACT_CHUNK) :
+                        eng.exactStep(EXACT_CHUNK);
                 if (r === -1) {
                     await nextTick();
                     continue;
@@ -684,6 +1600,18 @@ function createExactLadder(isStale) {
                     const started = this.startValue(next);
                     if (started !== null) return started;
                     continue;
+                }
+
+                if (mode === "threshold") {
+                    if (r === -2) {
+                        thresholdExhausted.set(
+                            `${active.cell}:${active.target}`, active.budget);
+                        active = null;
+                        return false;
+                    }
+                    const merged = eng.thresholdMerge();
+                    active = null;
+                    return merged >= 0;
                 }
 
                 if (mode === "value") {
@@ -708,13 +1636,30 @@ function createExactLadder(isStale) {
             return false; // still running — resume next cycle
         },
 
+        startThreshold(move, target) {
+            const key = `${move.cell}:${target}`;
+            const previous = thresholdExhausted.get(key) ?? EXACT_BUDGET / 4;
+            const budget = Math.min(EXACT_BUDGET_MAX, previous * 4);
+            active = { k: move.k, cell: move.cell, mode: "threshold", budget, target,
+                remaining: childRemaining(move) };
+            const immediate = eng.thresholdBeginChild(move.k, target, budget);
+            if (immediate === -2) { active = null; return false; }
+            if (immediate >= 0) {
+                const merged = eng.thresholdMerge();
+                active = null;
+                return merged >= 0;
+            }
+            return null;
+        },
+
         // Starts or resumes a value enumeration. The per-attempt budget stays
         // within the WASM i32 API; retained DFS/VTT state makes total work
         // across retries unbounded without integer wraparound.
         startValue(move) {
             const previous = exhausted.get(move.cell) ?? EXACT_BUDGET / 4;
             const budget = Math.min(EXACT_BUDGET_MAX, previous * 4);
-            active = { k: move.k, cell: move.cell, mode: "value", budget, target: -1 };
+            active = { k: move.k, cell: move.cell, mode: "value", budget, target: -1,
+                remaining: childRemaining(move) };
             const immediate = eng.vsBegin(move.k, budget);
             if (immediate === -3) { active = null; return false; }
             if (immediate >= 0) return this.finishValue(immediate);
@@ -821,18 +1766,28 @@ async function initGpu() {
 // --- main loop -----------------------------------------------------------------
 
 async function main() {
-    const wasmURL = new URL("./engine.wasm", import.meta.url);
-    wasmURL.searchParams.set("build", "20260712-proof2");
-    const response = await fetch(wasmURL, { cache: "no-store" });
-    if (!response.ok) throw new Error(`engine.wasm HTTP ${response.status} ${response.statusText}`);
-    const bytes = await response.arrayBuffer();
-    const { instance } = await WebAssembly.instantiate(bytes, {
-        env: { abort: () => { throw new Error("wasm abort"); } },
-    });
-    eng = instance.exports;
+    const stem = LANE === 0 ? "engine" : "engine-lane";
+    let loadError = null;
+    for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
+        try {
+            const wasmURL = new URL(`./${name}`, import.meta.url);
+            wasmURL.searchParams.set("build", "20260713-proof13");
+            const response = await fetch(wasmURL);
+            if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
+            const bytes = await response.arrayBuffer();
+            const { instance } = await WebAssembly.instantiate(bytes, {
+                env: { abort: () => { throw new Error("wasm abort"); } },
+            });
+            eng = instance.exports;
+            break;
+        } catch (error) {
+            loadError = error;
+        }
+    }
+    if (!eng) throw loadError ?? new Error("no compatible analysis engine binary");
     IO = eng.ioPtr();
 
-    await initGpu();
+    if (GPU_ALLOWED) await initGpu();
     self.postMessage({ type: "ready", gpu: gpuState });
 
     let doneVersion = 0;

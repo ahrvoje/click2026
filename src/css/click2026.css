@@ -98,10 +98,14 @@ body {
 /* sized to its content so the label never wraps, whatever the window width */
 #leftFooter {
     flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 9px;
     text-align: left;
     padding-left: 10px;
 }
 
+#settingsButton,
 #testsToggle {
     font-size: 12px;
     white-space: nowrap;
@@ -112,6 +116,11 @@ body {
         opacity: 1;
         cursor: pointer;
     }
+}
+
+#settingsButton {
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
 }
 
 #rightFooter {
@@ -355,6 +364,34 @@ body {
 }
 
 /* buttons */
+#movesSliderRow {
+    width: var(--board-size);
+    min-height: 26px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 46px;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 5px 0;
+
+    #movesSlider {
+        width: 100%;
+        accent-color: var(--accent);
+        cursor: pointer;
+    }
+
+    #movesSlider:disabled {
+        cursor: default;
+        opacity: 0.4;
+    }
+
+    #movesSliderOutput {
+        font-size: 11px;
+        text-align: right;
+        opacity: 0.6;
+        white-space: nowrap;
+    }
+}
+
 #startButtonDiv {
     height: 30px;
     margin-top: 2px;
@@ -464,6 +501,8 @@ body {
     list-style: none;
     margin: 0;
     padding: 0;
+    max-height: 276px;
+    overflow-y: auto;
 }
 
 .engineRow {
@@ -517,29 +556,152 @@ body {
     font-weight: bold;
 }
 
-/* telemetry line: fixed-width columns, one line, never wraps */
+/* Engine telemetry: overview, CPU, GPU. All rows share the same grid so the
+   CPU/GPU rates occupy column 2 and all position totals occupy column 3. */
 #engineStatus {
-    display: flex;
-    min-height: 15px;
+    min-height: 43px;
     padding: 4px 0 0 3px;
-    font-size: 11px;
+    font-size: 10px;
     opacity: 0.55;
-    white-space: nowrap;
-    overflow: hidden;
 
-    .engineStState { width: 62px; }
-    .engineStDepth { width: 70px; }
-    .engineStNodes { width: 58px; }
-    .engineStNps { width: 62px; }
+    .engineStatusRow {
+        align-items: baseline;
+        min-width: 0;
+        line-height: 13px;
+    }
 
-    .engineStBackend {
-        flex: 1;
+    .engineStatusOverview,
+    .engineProcessorRow {
+        display: grid;
+        grid-template-columns: 58px 78px 76px minmax(0, 1fr);
+        column-gap: 4px;
+    }
+
+    .engineStState,
+    .engineStRate,
+    .engineStNodes,
+    .engineStTime,
+    .engineHwLabel,
+    .engineHwPositions,
+    .engineHwRate,
+    .engineHwShare {
+        white-space: nowrap;
+    }
+
+    .engineHwLabel {
+        font-weight: bold;
+    }
+
+    .engineStRate,
+    .engineStTotal,
+    .engineHwPositions,
+    .engineHwRate,
+    .engineHwShare {
         text-align: right;
+    }
+
+    .engineStTime,
+    .engineHwShare {
         padding-right: 3px;
+        text-align: right;
+    }
+
+    .engineHwGpuOff {
+        opacity: 0.75;
     }
 }
 
-/* tests dialog — a flex column: title bar, progress, report, Stop pinned to the bottom */
+@media (max-width: 480px) {
+    #engineStatus {
+        font-size: 9.5px;
+
+        .engineStatusOverview,
+        .engineProcessorRow {
+            grid-template-columns: 56px 76px 74px minmax(0, 1fr);
+        }
+    }
+}
+
+/* settings and tests dialogs */
+#settingsDialog {
+    width: min(360px, calc(100vw - 24px));
+    padding: 0;
+    border: none;
+    color: black;
+    background-color: oldlace;
+    border-radius: 5px;
+    overflow: hidden;
+
+    &::backdrop {
+        background-color: rgb(0 0 0 / 0.45);
+    }
+}
+
+#settingsDialog .dialogTitle {
+    color: white;
+}
+
+#settingsForm {
+    display: flex;
+    flex-direction: column;
+}
+
+.settingsBody {
+    display: grid;
+    gap: 14px;
+    padding: 18px 20px 12px;
+}
+
+.settingsGroup {
+    display: grid;
+    gap: 10px;
+    margin: 0;
+    padding: 12px 14px;
+    border: 1px solid rgb(0 0 0 / 0.25);
+    border-radius: 5px;
+
+    legend {
+        padding: 0 5px;
+        font-weight: bold;
+    }
+}
+
+.settingsOption {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    line-height: 20px;
+    cursor: pointer;
+
+    input {
+        width: 16px;
+        height: 16px;
+        margin: 0;
+        accent-color: var(--accent);
+        cursor: pointer;
+    }
+}
+
+.settingsActions {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0 20px 18px;
+}
+
+.settingsClose {
+    min-width: 88px;
+    padding: 8px 18px;
+    color: white;
+    background-color: var(--accent);
+    border-radius: 16px;
+    text-align: center;
+
+    &:hover {
+        color: black;
+        background-color: var(--accent-hover);
+    }
+}
+
 #testsDialog {
     width: 505px;
     height: 300px;

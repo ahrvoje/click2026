@@ -18,7 +18,7 @@
 
 import { Game } from "./game.js";
 import { LETTERS } from "./board.js";
-import { EngineUI } from "./engine-ui.js?build=20260712-proof2";
+import { EngineUI } from "./engine-ui.js?build=20260713-proof13";
 import { TreeUI } from "./tree-ui.js";
 
 const examples = [
@@ -189,7 +189,14 @@ function updateScore() {
 }
 
 function updateMove() {
-    el("moveValue").textContent = `${game.getCurrentMove()} / ${game.getMoves().length}`;
+    const current = game.getCurrentMove();
+    const total = game.getMoves().length;
+    el("moveValue").textContent = `${current} / ${total}`;
+    const slider = el("movesSlider");
+    slider.max = String(total);
+    slider.value = String(Math.min(current, total));
+    slider.disabled = total === 0;
+    el("movesSliderOutput").textContent = `${current} / ${total}`;
 }
 
 function refreshInterface() {
@@ -225,7 +232,7 @@ function prepareInterface() {
     drawAllFields();
     el("timeValue").textContent = "0";
     el("scoreValue").textContent = game.getScore();
-    el("moveValue").textContent = `0 / ${game.getMoves().length}`;
+    updateMove();
     el("autoPauseButton").hidden = true;
     el("autoPlayButton").hidden = false;
     onShownPositionChanged();
@@ -508,6 +515,36 @@ export function toggleEngine() {
 export function toggleEngineMarkers() {
     endTimedPlay();
     EngineUI.toggleMarkers();
+}
+
+export function setMovesSliderVisible(show) {
+    el("movesSliderRow").hidden = !show;
+    if (show && game) updateMove();
+}
+
+export function setSuggestedMovesMode(mode) {
+    EngineUI.setSuggestedMovesMode(mode);
+}
+
+export function showMoveFromSlider(moveIndex) {
+    endTimedPlay();
+
+    if (game.getStatus() === Game.Status.AutoPlay) stopAutoPlay();
+    if (!ensureNavigable()) {
+        updateMove();
+        return;
+    }
+
+    const requested = Number.isFinite(moveIndex) ? Math.round(moveIndex) : game.getCurrentMove();
+    const target = Math.max(0, Math.min(game.getMoves().length, requested));
+    game.rewindToMove(target);
+    refreshInterface();
+    onShownPositionChanged();
+}
+
+export function onSettingsOpened() {
+    endTimedPlay();
+    if (game.getStatus() === Game.Status.AutoPlay) stopAutoPlay();
 }
 
 export function init() {

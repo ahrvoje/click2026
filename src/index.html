@@ -26,11 +26,43 @@
     <meta property="og:description" content="Color clicking puzzle.">
 
     <link rel="icon" type="image/png" href="images/click2014_favicon.png">
-    <link rel="stylesheet" href="css/click2026.css">
-    <script type="module" src="scripts/main.js?build=20260712-proof2"></script>
+    <link rel="stylesheet" href="css/click2026.css?build=20260713-proof13">
+    <script type="module" src="scripts/main.js?build=20260713-proof13"></script>
 </head>
 <body>
 <div id="mainDiv">
+    <dialog id="settingsDialog" aria-labelledby="settingsTitle">
+        <form method="dialog" id="settingsForm">
+            <div class="dialogTitle" id="settingsTitle">Settings</div>
+            <div class="settingsBody">
+                <fieldset class="settingsGroup">
+                    <legend>Moves slider</legend>
+                    <label class="settingsOption">
+                        <input type="checkbox" id="showMovesSlider">
+                        Show
+                    </label>
+                </fieldset>
+                <fieldset class="settingsGroup">
+                    <legend>Suggested moves</legend>
+                    <label class="settingsOption">
+                        <input type="radio" name="suggestedMovesMode" value="top5">
+                        Top 5
+                    </label>
+                    <label class="settingsOption">
+                        <input type="radio" name="suggestedMovesMode" value="top5-nonzero">
+                        Top 5 and first non-zero
+                    </label>
+                    <label class="settingsOption">
+                        <input type="radio" name="suggestedMovesMode" value="all">
+                        All
+                    </label>
+                </fieldset>
+            </div>
+            <div class="settingsActions">
+                <button class="settingsClose" type="submit" value="close">Close</button>
+            </div>
+        </form>
+    </dialog>
     <dialog id="testsDialog">
         <div class="dialogTitle">Tests</div>
         <div class="progressBar">
@@ -58,6 +90,11 @@
                     <canvas id="gameCanvas" width="310" height="310" aria-label="Game board"></canvas>
                 </div>
                 <div id="control">
+                    <div id="movesSliderRow" hidden>
+                        <input id="movesSlider" type="range" min="0" max="0" value="0" step="1"
+                            aria-label="Shown move">
+                        <output id="movesSliderOutput" for="movesSlider">0 / 0</output>
+                    </div>
                     <div id="startButtonDiv"><button id="startButton" type="button">NEW GAME</button></div>
 
                     <div class="rowDiv"><div id="rowInnerDiv" class="rowInnerDiv">
@@ -154,6 +191,7 @@
     <div id="mainFiller"></div>
     <footer id="footer">
         <div id="leftFooter">
+            <button id="settingsButton" type="button">settings</button>
             <label id="testsToggle"><input type="checkbox" id="testsCheckbox"> examples &amp; tests</label>
         </div>
         <div id="rightFooter">

@@ -14,12 +14,16 @@
  */
 
 import { canonicalBlock, LETTERS } from "./board.js";
+import { EngineWorkerPool } from "./engine/pool.js?build=20260713-proof13";
 
 const TOP_N = 5;
+const SUGGESTED_MODE_TOP_5 = "top5";
+const SUGGESTED_MODE_TOP_5_NONZERO = "top5-nonzero";
+const SUGGESTED_MODE_ALL = "all";
 // Keep the module worker, its static imports and the compiled WASM on one
 // cache generation. A stale dependency makes a module worker fail before any
 // of its error-reporting code can run, yielding only an opaque ErrorEvent.
-const ENGINE_ASSET_VERSION = "20260712-proof2";
+const ENGINE_ASSET_VERSION = "20260713-proof13";
 
 // rank accent colors, shared by the list rows and the board outlines; picked
 // to stay distinguishable from the five play colors and the replay highlight
@@ -40,6 +44,7 @@ let lastKey = null;
 let result = null;         // latest worker result for the current position
 let gpuState = "off";
 let hoverIndex = null;
+let suggestedMovesMode = SUGGESTED_MODE_TOP_5;
 
 const el = (id) => document.getElementById(id);
 
@@ -78,7 +83,10 @@ function onWorkerMessage(event) {
 function startWorker() {
     const workerURL = new URL("./engine/worker.js", import.meta.url);
     workerURL.searchParams.set("build", ENGINE_ASSET_VERSION);
-    worker = new Worker(workerURL, { type: "module" });
+    const requested = Number.parseInt(new URL(location.href).searchParams.get("engineWorkers") ?? "", 10);
+    worker = new EngineWorkerPool(workerURL, Number.isFinite(requested)
+        ? { laneCount: Math.max(1, Math.min(16, requested)) }
+        : undefined);
     worker.onmessage = onWorkerMessage;
     worker.onerror = (event) => {
         renderStatus("engine failed to start — see console");
@@ -93,7 +101,10 @@ function startWorker() {
 //
 
 function renderStatus(text) {
-    el("engineStatus").textContent = text;
+    const status = el("engineStatus");
+    status.removeAttribute("aria-label");
+    status.removeAttribute("title");
+    status.textContent = text;
 }
 
 let rowsSig = null; // content signature of the rendered rows, to skip no-op rebuilds
@@ -112,14 +123,64 @@ function span(className, text) {
 }
 
 function formatCount(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
     if (n >= 1e3) return (n / 1e3).toFixed(0) + "k";
     return String(Math.round(n));
 }
 
+function statNumber(...values) {
+    for (const value of values) {
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    }
+    return null;
+}
+
+function formatDuration(ms) {
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+
+    const seconds = ms / 1000;
+    if (seconds < 60) return seconds.toFixed(seconds >= 10 ? 0 : 1) + "s";
+
+    const wholeSeconds = Math.floor(seconds);
+    const minutes = Math.floor(wholeSeconds / 60);
+    const remainingSeconds = wholeSeconds % 60;
+    if (minutes < 60) return `${minutes}m${String(remainingSeconds).padStart(2, "0")}s`;
+
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function processorRow(className, label, pps, positions, share, title) {
+    const row = span(`engineStatusRow engineProcessorRow ${className}`);
+    row.title = title;
+    row.append(
+        span("engineHwLabel", label),
+        span("engineHwRate", pps === null ? "—" : `${formatCount(pps)} pos/s`),
+        span("engineHwPositions", positions === null ? "—" : `${formatCount(positions)} pos`),
+        span("engineHwShare", `${share}%`),
+    );
+    return row;
+}
+
+export function selectSuggestedMoves(moves, mode = SUGGESTED_MODE_TOP_5) {
+    if (mode === SUGGESTED_MODE_ALL) return moves.slice();
+
+    const selected = moves.slice(0, TOP_N);
+    if (mode === SUGGESTED_MODE_TOP_5_NONZERO) {
+        const firstNonzero = moves.find((move) => move.score > 0);
+        if (firstNonzero && !selected.includes(firstNonzero)) selected.push(firstNonzero);
+    }
+    return selected;
+}
+
+function rankColor(index) {
+    return RANK_COLORS[index] ?? `hsl(${(210 + index * 47) % 360}, 75%, 55%)`;
+}
+
 function renderResult() {
     const list = el("engineList");
-    const moves = result.moves.slice(0, TOP_N);
+    const moves = selectSuggestedMoves(result.moves, suggestedMovesMode);
 
     if (moves.length === 0) {
         clearList();
@@ -143,7 +204,7 @@ function renderResult() {
             (move.exact ? ", proven optimal" : "");
 
         const rank = span("engineRank");
-        rank.style.borderColor = RANK_COLORS[index];
+        rank.style.borderColor = rankColor(index);
 
         const square = span("engineSquare");
         square.style.backgroundColor = hooks.playColors[move.color - 1];
@@ -170,20 +231,125 @@ function renderResult() {
     renderStats();
 }
 
-// fixed-width columns so the line never wraps or jiggles as numbers change
+// Three aligned logical rows: overall progress, CPU work and GPU work. New
+// workers provide the detailed counters; the nodes/nps fallback
+// keeps cached/older worker builds readable during a rolling GitHub Pages load.
 function renderStats() {
     const s = result.stats;
-    el("engineStatus").replaceChildren(
-        span("engineStState", {
-            optimal: "optimal ✓",
-            proven: "proven ✓",
-            settled: "settled",
-        }[s.state] ?? "analyzing…"),
-        span("engineStDepth", `w${s.width} d${s.depth}`),
-        span("engineStNodes", `${formatCount(s.nodes)} n`),
-        span("engineStNps", `${formatCount(s.nps)} n/s`),
-        span("engineStBackend", { on: "CPU+GPU", off: "CPU", failed: "GPU off" }[s.gpu]),
+    const cpu = s.cpu && typeof s.cpu === "object" ? s.cpu : {};
+    const gpuStats = s.gpuStats && typeof s.gpuStats === "object" ? s.gpuStats : {};
+    const hasDetailedStats = s.cpu !== undefined || s.gpuStats !== undefined;
+
+    const cpuPositions = statNumber(cpu.positions, s.nodes) ?? 0;
+    const cpuPps = statNumber(cpu.pps, s.nps) ?? 0;
+    const cpuWorkers = statNumber(cpu.workers);
+    const beamPositions = statNumber(cpu.beamPositions);
+    const exactPositions = statNumber(cpu.exactPositions);
+    const cpuPlayoutPositions = statNumber(cpu.playoutPositions);
+
+    const gpuPositions = statNumber(gpuStats.positions);
+    const gpuPps = statNumber(gpuStats.pps);
+    const gpuActivePps = statNumber(gpuStats.activePps);
+    const gpuDuty = statNumber(gpuStats.duty);
+    const gpuPlayouts = statNumber(gpuStats.playouts);
+    const gpuBatches = statNumber(gpuStats.batches);
+    const gpuActiveMs = statNumber(gpuStats.activeMs);
+    const gpuProfile = typeof gpuStats.profile === "string" ? gpuStats.profile : null;
+    const gpuAdapter = gpuStats.adapter && typeof gpuStats.adapter === "object"
+        ? [gpuStats.adapter.vendor, gpuStats.adapter.architecture,
+            gpuStats.adapter.device, gpuStats.adapter.description]
+            .filter((value, index, values) => value && values.indexOf(value) === index)
+            .join(" ")
+        : "";
+
+    const totalPositions = statNumber(
+        s.totalPositions,
+        hasDetailedStats ? cpuPositions + (gpuPositions ?? 0) : null,
+        s.nodes,
+    ) ?? 0;
+    const elapsedMs = statNumber(s.elapsed) ?? 0;
+    const totalPps = statNumber(s.totalPps,
+        elapsedMs > 0 ? totalPositions / elapsedMs * 1000 : null) ?? 0;
+    const elapsedLabel = formatDuration(elapsedMs);
+    const attributedPositions = cpuPositions + (gpuPositions ?? 0);
+    const cpuShare = attributedPositions > 0
+        ? Math.round(cpuPositions / attributedPositions * 100) : 100;
+    const gpuShare = 100 - cpuShare;
+
+    const stateLabel = {
+        optimal: "optimal ✓",
+        proven: "proven ✓",
+        settled: "settled",
+    }[s.state] ?? "analyzing…";
+    const overview = span("engineStatusRow engineStatusOverview");
+    const speed = span("engineStRate", `${formatCount(totalPps)} pos/s`);
+    speed.title = `combined wall-average throughput: ${Math.round(totalPps).toLocaleString()} positions/s`;
+    const total = span("engineStNodes engineStTotal", `${formatCount(totalPositions)} pos`);
+    total.title = `combined positions evaluated: ${Math.round(totalPositions).toLocaleString()}`;
+    const elapsed = span("engineStTime", `time ${elapsedLabel}`);
+    elapsed.title = `analysis elapsed time: ${elapsedLabel}`;
+    overview.append(
+        span("engineStState", stateLabel),
+        speed,
+        total,
+        elapsed,
     );
+
+    const workerSuffix = cpuWorkers !== null && cpuWorkers > 1 ? `×${Math.round(cpuWorkers)}` : "";
+    const cpuLabel = `CPU${workerSuffix}`;
+    const cpuTitle = [
+        `CPU${cpuWorkers !== null ? ` workers: ${Math.round(cpuWorkers)}` : ""}`,
+        `search positions: ${Math.round(cpuPositions).toLocaleString()} (work visits, not unique states)`,
+        `wall-average throughput: ${Math.round(cpuPps).toLocaleString()} positions/s`,
+        beamPositions > 0 ? `beam positions: ${Math.round(beamPositions).toLocaleString()}` : "",
+        exactPositions > 0 ? `exact positions: ${Math.round(exactPositions).toLocaleString()}` : "",
+        cpuPlayoutPositions > 0
+            ? `playout positions: ${Math.round(cpuPlayoutPositions).toLocaleString()}` : "",
+    ].filter(Boolean).join("; ");
+
+    const cpuRow = processorRow("engineHwCpu", cpuLabel,
+        cpuPps, cpuPositions, cpuShare, cpuTitle);
+
+    let gpuAccessible;
+    let gpuRow;
+    if (s.gpu === "on") {
+        const gpuTitle = [
+            "GPU active",
+            gpuProfile ? `profile: ${gpuProfile}` : "",
+            gpuAdapter ? `adapter: ${gpuAdapter}` : "",
+            gpuPositions !== null ? `positions: ${Math.round(gpuPositions).toLocaleString()}` : "",
+            gpuPps !== null ? `wall-average contribution: ${Math.round(gpuPps).toLocaleString()} positions/s` : "",
+            gpuActivePps !== null
+                ? `active throughput: ${Math.round(gpuActivePps).toLocaleString()} positions/s` : "",
+            gpuDuty !== null ? `dispatch duty cycle: ${Math.round(gpuDuty)}%` : "",
+            gpuPlayouts > 0 ? `playouts: ${Math.round(gpuPlayouts).toLocaleString()}` : "",
+            gpuBatches > 0 ? `batches: ${Math.round(gpuBatches).toLocaleString()}` : "",
+            gpuActiveMs > 0 ? `active time: ${formatDuration(gpuActiveMs)}` : "",
+        ].filter(Boolean).join("; ");
+        gpuAccessible = gpuTitle;
+        gpuRow = processorRow("engineHwGpu", "GPU",
+            gpuPps ?? 0, gpuPositions ?? 0, gpuShare, gpuTitle);
+    } else {
+        const failed = s.gpu === "failed";
+        gpuAccessible = failed
+            ? "GPU off after an initialization or verification failure" : "GPU off; WebGPU unavailable";
+        gpuRow = processorRow("engineHwGpu engineHwGpuOff", "GPU",
+            null, null, gpuShare,
+            failed ? "GPU disabled after an initialization or verification failure" : "WebGPU unavailable");
+    }
+
+    const status = el("engineStatus");
+    status.setAttribute("aria-label", [
+        stateLabel,
+        `width ${s.width}`,
+        `depth ${s.depth}`,
+        `total positions: ${Math.round(totalPositions).toLocaleString()}`,
+        `combined wall-average throughput: ${Math.round(totalPps).toLocaleString()} positions/s`,
+        `analysis elapsed time: ${elapsedLabel}`,
+        cpuTitle,
+        gpuAccessible,
+    ].join("; "));
+    status.replaceChildren(overview, cpuRow, gpuRow);
 }
 
 // strokes the boundary of a group (cells as [x, y]) along the block gaps
@@ -270,18 +436,30 @@ export const EngineUI = {
         hooks.redraw();
     },
 
+    setSuggestedMovesMode(mode) {
+        const normalized = [SUGGESTED_MODE_TOP_5, SUGGESTED_MODE_TOP_5_NONZERO,
+            SUGGESTED_MODE_ALL].includes(mode) ? mode : SUGGESTED_MODE_TOP_5;
+        if (normalized === suggestedMovesMode) return;
+
+        suggestedMovesMode = normalized;
+        hoverIndex = null;
+        rowsSig = null;
+        if (result) renderResult();
+        hooks?.redraw();
+    },
+
     // called by the game controller at the end of every board repaint
     drawOverlays(ctx) {
         if (!enabled || !result || !markersOn) return;
 
-        const moves = result.moves.slice(0, TOP_N);
+        const moves = selectSuggestedMoves(result.moves, suggestedMovesMode);
         ctx.save();
         ctx.lineCap = "square";
 
         // draw in reverse so the best move's outline ends up on top
         for (let index = moves.length - 1; index >= 0; index--) {
             const emphasized = hoverIndex === index;
-            ctx.strokeStyle = RANK_COLORS[index];
+            ctx.strokeStyle = rankColor(index);
             ctx.lineWidth = emphasized ? 4 : 2.5;
             ctx.globalAlpha = hoverIndex === null || emphasized ? 0.95 : 0.25;
             strokeGroupOutline(ctx, moves[index].cells);
