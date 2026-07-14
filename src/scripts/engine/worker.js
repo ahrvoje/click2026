@@ -52,13 +52,13 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260713-proof8";
+import { createGpu, dominantColor } from "./gpu.js?build=20260714-proof14";
 import {
-    analysisState, createSearchProgress, positionProofCandidates,
+    analysisState, canTransferExactSuffix, createSearchProgress, positionProofCandidates,
     recordSearchPass, remainingAfterMove, roundRobinPrefixTasks, settlementReady,
     shouldGpuCaretake, summarizePositionProof,
-} from "./schedule.js?build=20260713-proof8";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260713-proof8";
+} from "./schedule.js?build=20260714-proof14";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260714-proof14";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
@@ -253,6 +253,16 @@ async function analyze(myJob, isStale) {
 
     mem().set(myJob.board, IO);
     eng.setBoard();
+    // Record the real one-ply child relation before search starts. A replayed
+    // suffix is always a useful constructive seed, but it may carry an exact
+    // proof only into the board actually produced by its first move.
+    const analysisChildKeys = new Map();
+    for (const root of collectResults().moves) {
+        if (eng.childToIO(root.k) === 1) {
+            analysisChildKeys.set(root.cell,
+                mem().slice(IO, IO + SIZE * SIZE).join(","));
+        }
+    }
     seedFromMemory(key);
 
     const post = (settled) => {
@@ -295,7 +305,7 @@ async function analyze(myJob, isStale) {
         if (resultCache.size > CACHE_MAX) {
             resultCache.delete(resultCache.keys().next().value);
         }
-        prevAnalysis = { key, moves };
+        prevAnalysis = { key, moves, childKeys: analysisChildKeys };
 
         self.postMessage({
             type: "result",
@@ -533,13 +543,15 @@ async function analyze(myJob, isStale) {
         }
     }
 
-    // Give every still-relevant first move the search decomposition it would
-    // receive after the user clicked it: its second moves become roots,
-    // partitioned by stable representative across every lane, with a full
-    // beam heap per lane. This is bounded and constructive; a retained line is
-    // replayable, and only meeting the parent's sound lower bound proves it.
-    moves = await runVirtualChildPortfolio(moves, isStale, post, postIfDue);
-    if (isStale()) return;
+    // Give larger children the search decomposition they would receive after
+    // the user clicked into them. Compact children already qualify for the
+    // persistent exact ladder, so they bypass this potentially much larger
+    // heuristic portfolio. Pair ordinals divide the retained work evenly.
+    if (moves.some((move) => !move.exact &&
+        childRemaining(move) > EXACT_TRY_REMAINING)) {
+        moves = await runVirtualChildPortfolio(moves, isStale, post, postIfDue);
+        if (isStale()) return;
+    }
     virtualChildAuditComplete = true;
     moves = post(false);
     if (await finishLaneIfComplete(moves)) return;
@@ -679,36 +691,42 @@ async function analyze(myJob, isStale) {
 }
 
 // Reproduce the clicked child's bounded beam allocation without abandoning the
-// parent position. All lanes intentionally run the same stable first-root
-// list. Stable second-cell ownership makes pair work disjoint across lanes,
-// and each pair receives its own heap just as it does in the clicked child's
-// root-private schedule.
+// parent position. All lanes intentionally build the same stable parent-major
+// pair list. Ordinal ownership makes pair work exhaustive, disjoint and
+// count-balanced even when representative cells cluster modulo the lane count.
 async function runVirtualChildPortfolio(moves, isStale, post, postIfDue) {
-    const parents = moves.slice().sort((a, b) => a.k - b.k);
+    const parents = moves.filter((move) => childRemaining(move) > EXACT_TRY_REMAINING)
+        .sort((a, b) => a.k - b.k);
     const byParent = [];
+    const allPairs = [];
     for (const parent of parents) {
         const count = eng.childGroupsToIO(parent.k);
         const reps = mem().slice(IO + 256, IO + 256 + count);
         const sizes = mem().slice(IO + 512, IO + 512 + count);
-        const seconds = Array.from(reps, (second, index) => ({
+        const entries = Array.from(reps, (second, index) => ({
             second,
             size: sizes[index],
         }))
-            .filter((entry) => entry.second % LANES === LANE)
-            .sort((a, b) => b.size - a.size || a.second - b.second)
-            .map((entry) => entry.second);
+            .sort((a, b) => b.size - a.size || a.second - b.second);
+        const seconds = entries.map((entry) => {
+            const task = {
+                cell: parent.cell,
+                second: entry.second,
+                ordinal: allPairs.length,
+            };
+            allPairs.push(task);
+            return task;
+        });
         byParent.push({ cell: parent.cell, seconds });
     }
 
-    // Keep two finite orders: round-robin for the cheap discovery tier, so a
-    // wide child cannot delay every other parent's first turn; parent-major
-    // for stronger retries, so each virtual child receives the same bounded
-    // serial allocation it would receive after its parent is clicked.
-    const tasks = roundRobinPrefixTasks(byParent);
-    const parentTasks = byParent.flatMap((parent) => parent.seconds.map((second) => ({
-        cell: parent.cell,
-        second,
-    })));
+    // Proof tiers rotate parents so a wide child cannot delay every other
+    // parent's first serious turn. Beam passes retain the stable parent-major
+    // order; both orders cover the same finite pair set.
+    const tasks = roundRobinPrefixTasks(byParent)
+        .map((entry) => entry.second)
+        .filter((task) => task.ordinal % LANES === LANE);
+    const parentTasks = allPairs.filter((task) => task.ordinal % LANES === LANE);
 
     // The clicked child gives every second move an independent bounded proof
     // turn. Reproduce that allocation first, in fair geometric budget tiers,
@@ -716,10 +734,9 @@ async function runVirtualChildPortfolio(moves, isStale, post, postIfDue) {
     // prove the parent; a miss proves nothing and cannot poison later work.
     for (let tier = 0; tier < VIRTUAL_CHILD_PROOF_BUDGETS.length; tier++) {
         const budget = VIRTUAL_CHILD_PROOF_BUDGETS[tier];
-        // The cheap discovery tier rotates parents. The stronger retry then
-        // finishes one bounded virtual child at a time, matching what happens
-        // after a click without permitting an unbounded root monopoly.
-        const tierTasks = tier === 0 ? tasks : parentTasks;
+        // Rotate parents at both budgets. A strong retry is where a later
+        // parent most needs protection from every child of an earlier one.
+        const tierTasks = tasks;
         for (const task of tierTasks) {
             if (isStale()) return moves;
             const current = moves.find((move) => move.cell === task.cell);
@@ -874,7 +891,7 @@ function seedFromMemory(key) {
             if (m.line.length > 1) {
                 seeds.push({
                     line: m.line.slice(1),
-                    exact: m.exact,
+                    exact: canTransferExactSuffix(prevAnalysis, m, key),
                     score: m.score,
                 });
             }
@@ -1230,7 +1247,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260713-proof8");
+            wasmURL.searchParams.set("build", "20260714-proof14");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();

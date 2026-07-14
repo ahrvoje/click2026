@@ -89,8 +89,11 @@ canvas + engineList                                      └─► lane N-1: com
 not `SharedArrayBuffer`. It therefore works from static GitHub Pages without
 COOP/COEP headers. Root-scoped work is divided deterministically by the root's
 representative cell modulo the active lane count. Lane 0 owns WebGPU; the other
-lanes are CPU-only. Results are soundly combined on the main thread and useful
-lines/proofs are sent back to every lane as replay-validated warm starts.
+lanes are CPU-only. The finite virtual-child portfolio instead numbers its
+complete `(first, second)` task list before filtering, then assigns consecutive
+ordinals modulo the lane count; representative-cell clustering therefore
+cannot leave workers idle. Results are soundly combined on the main thread and
+useful lines/proofs are sent back to every lane as replay-validated warm starts.
 
 | File | Role |
 | --- | --- |
@@ -172,14 +175,15 @@ heuristic or malformed line into a score or proof.
 0. **Warm start** (`seedFromMemory` → `seedLine`/`seedExactByCell`): each
    worker keeps an LRU cache (64 positions) of every move list it has
    posted. A new analysis is seeded with the cached lines of its own
-   position plus the *suffixes* of the previous position's lines — after the
-   player plays move `m`, the rest of `m`'s line is by construction a line
-   of the new position. For rewind/general transposition reuse it also
+   position plus the *suffixes* of the previous position's lines. A suffix is
+   always only a constructive upper bound unless the new board exactly equals
+   the recorded one-ply child of that previous root; only that real edge may
+   transfer the previous row's exact flag. For rewind/general transposition reuse it also
    materializes each one-ply child; if that child board is cached, its line is
    prepended with the creating root move. Every seed is replay-validated
    inside WASM before being merged (wrong guesses are rejected, never
-   trusted), and cached
-   proof flags are restored when the seeded score matches. Consequence:
+   trusted), and same-board/actual-child proof flags are restored only when
+   the seeded score matches. Consequence:
    playing a suggested `0 ★` move can never make the engine "lose" the
    clearing line, and revisiting a position (rewind) restores everything
    it ever knew about it instantly.
@@ -230,16 +234,21 @@ heuristic or malformed line into a score or proof.
    remaining plus proved-permanent cells. This bounded orthogonal objective
    preserves corridors that temporarily accumulate fragments/frozen colors
    immediately before a gravity merge, instead of asking random noise to
-   overcome the same scalar bias in every beam.
+   overcome the same scalar bias in every beam. Its bounded heap admission is
+   independent of the root's previously found nonzero score, so an earlier
+   improvement cannot change this complementary pass enough to hide a clear.
 6. **Virtual-child consistency portfolio**: after the initial width-2048
-   beam, every unresolved parent row materializes its legal second moves. A
-   `(first, second)` pair is assigned by `secondRepresentative % lanes`, and
+   beam, unresolved parents whose child remains above the `≤ 88` exact gate
+   materialize their legal second moves. Compact children skip this portfolio
+   and enter the persistent exact ladder immediately. The complete stable
+   `(first, second)` list is assigned by `pairOrdinal % lanes`, and
    all lanes remain alive until this bounded audit finishes. This is the same
    decomposition the engine would receive after the player clicked `first`;
    second moves no longer compete forever inside one first-root heap.
    `exactBeginRootChildSeek` first gives every pair a 100k-node lower-bound
    target seek, round-robin across parent rows. Still-unresolved rows then get
-   a bounded 1 M-node child-equivalent sweep. Explicit prefix beams follow at
+   a bounded 1 M-node child-equivalent sweep in the same parent-fair order.
+   Explicit prefix beams follow at
    widths 128, 512 and 2048 with deterministic and two diversified seeds.
    Larger second groups go first within a parent, matching the broad-child
    proof policy. Every retained line contains `[first, second, ...tail]` and
@@ -455,6 +464,11 @@ Budgeted branch & bound DFS (`exactBegin`/`exactStep`/`exactMerge`):
   remaining count, lower bound and hash are fused into one board scan;
 * explicit stack, budget-limited and resumable in chunks, so it never
   blocks the worker loop.
+
+Completing a whole-position solve with value `V` also proves that every root
+subtree has value at least `V`. `exactMerge` therefore raises every root lower
+bound to `V`; any already replayable row scoring `V` becomes exact immediately,
+while rows with a larger constructive score remain unresolved.
 
 Entry points sharing the machinery:
 

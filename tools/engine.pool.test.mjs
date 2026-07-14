@@ -10,6 +10,53 @@ import {
 } from "../src/scripts/engine/pool.js";
 
 import assert from "node:assert/strict";
+import {
+    canTransferExactSuffix,
+    roundRobinPrefixTasks,
+} from "../src/scripts/engine/schedule.js";
+
+// Parent-major ordinals stay stable while execution rotates parents fairly.
+// Lane filtering therefore covers every pair exactly once without relying on
+// clustered board-cell representatives.
+const prefixParents = [
+    { cell: 10, seconds: [
+        { second: 11, ordinal: 0 },
+        { second: 12, ordinal: 1 },
+        { second: 13, ordinal: 2 },
+    ] },
+    { cell: 20, seconds: [
+        { second: 21, ordinal: 3 },
+        { second: 22, ordinal: 4 },
+    ] },
+];
+const fairPrefixTasks = roundRobinPrefixTasks(prefixParents)
+    .map((entry) => entry.second);
+assert.deepEqual(fairPrefixTasks.map((task) => task.second), [11, 21, 12, 22, 13]);
+for (let lanes = 1; lanes <= 4; lanes++) {
+    const assigned = Array.from({ length: lanes }, (_, lane) => fairPrefixTasks
+        .filter((task) => task.ordinal % lanes === lane))
+        .flat();
+    assert.deepEqual(assigned.map((task) => task.ordinal).sort((a, b) => a - b),
+        [0, 1, 2, 3, 4]);
+}
+for (const total of [211, 478]) {
+    const counts = Array(16).fill(0);
+    for (let ordinal = 0; ordinal < total; ordinal++) counts[ordinal % 16]++;
+    assert.ok(Math.max(...counts) - Math.min(...counts) <= 1);
+}
+
+// Exactness follows only across the recorded real child edge. The same line
+// remains reusable constructively on every board because worker replay is the
+// independent legality/upper-bound boundary.
+const previousAnalysis = {
+    childKeys: new Map([[10, "actual-child"]]),
+};
+assert.equal(canTransferExactSuffix(previousAnalysis,
+    { cell: 10, exact: true }, "actual-child"), true);
+assert.equal(canTransferExactSuffix(previousAnalysis,
+    { cell: 10, exact: true }, "other-child"), false);
+assert.equal(canTransferExactSuffix(previousAnalysis,
+    { cell: 10, exact: false }, "actual-child"), false);
 
 // Resource policy: one phone lane, two on a constrained notebook, and up to
 // sixteen lanes using one 178 MiB primary plus compact 37 MiB satellites.

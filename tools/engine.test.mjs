@@ -1068,6 +1068,34 @@ suite("permanent-only portfolio crosses temporary fragmentation", () => {
     check(k >= 0, "move-25 clearing root FC is missing");
     if (k < 0) return;
 
+    // Reproduce the real lane-local history: ordinary work first establishes
+    // a positive incumbent. The complementary pass must still traverse the
+    // same clearing corridor it finds on a fresh board.
+    const lane = roots[k].rep % 16;
+    let localSeed = 1;
+    for (let root = 0; root < roots.length; root++) {
+        if (roots[root].rep % 16 !== lane) continue;
+        eng.playoutRoot(root, 32, localSeed);
+        eng.playoutRootSoft(root, 4, localSeed);
+        localSeed += 32;
+    }
+    for (const width of [8, 32, 128, 512]) {
+        eng.beamBeginPartition(width, 0, lane, 16);
+        while (eng.beamStep(400_000) === 0) { /* complete pass */ }
+    }
+    roots = collectResults().roots;
+    check(roots[k].best > 0 && roots[k].best <= 5,
+        "partitioned worker history did not establish the incumbent trap", roots[k]);
+    eng.beamBeginRootPermanent(k, 8192);
+    while (eng.beamStep(400_000) === 0) { /* run complementary pass */ }
+    roots = collectResults().roots;
+    check(roots[k].best === 0 && roots[k].exact,
+        "better incumbent changed the complementary beam result", roots[k]);
+
+    setIOBoard(position);
+    eng.setBoard();
+    roots = collectResults().roots;
+
     // Mirror the worker stages up through width 512, then its bounded
     // score-ordered portfolio audit.
     let seed = 1;
@@ -1366,6 +1394,50 @@ suite("budgeted child proof keeps a witness without claiming exactness", () => {
         "partial positive witness was unsafely marked exact", { lower, after });
     check(replayLine(position, after.line) === after.best,
         "committed partial witness does not replay", after);
+});
+
+suite("whole-position exact proof raises every root lower bound", () => {
+    const position = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+    for (const [x, column] of ["231", "123", "223", "132"].entries()) {
+        for (let y = 0; y < column.length; y++) position[x][y] = Number(column[y]);
+    }
+
+    setIOBoard(position);
+    eng.setBoard();
+    const before = collectResults().roots;
+    const childLowers = before.map((_, k) => eng.getRootLower(k));
+    eng.exactBeginChild(0, 10_000);
+    let childResult = -1;
+    while (childResult === -1) childResult = eng.exactStep(1_000);
+    check(eng.exactMerge() > SIZE * SIZE,
+        "child completion was accepted as a whole-position proof", { childResult });
+    check(before.every((_, k) => eng.getRootLower(k) === childLowers[k]),
+        "rejected child proof changed a sibling lower bound");
+
+    setIOBoard(position);
+    eng.setBoard();
+    const initial = collectResults().roots;
+    check(initial.length === 2 && initial.every((_, k) => eng.getRootLower(k) === 0) &&
+        initial.some((root) => root.best === 5 && !root.exact),
+    "positive-optimum fixture lost its weak per-root bounds", initial);
+
+    eng.exactBegin(10_000);
+    let result = -1;
+    while (result === -1) result = eng.exactStep(1_000);
+    check(result === 5 && eng.exactMerge() === 5,
+        "whole-position fixture did not prove its positive optimum", { result });
+
+    const after = collectResults().roots;
+    check(after.every((_, k) => eng.getRootLower(k) >= 5),
+        "global proof did not propagate its lower bound to every root",
+        after.map((root, k) => ({ root, lower: eng.getRootLower(k) })));
+    check(after.filter((root) => root.best === 5).every((root) => root.exact) &&
+        after.filter((root) => root.best > 5).every((root) => !root.exact),
+    "global lower bound marked the wrong parent rows exact", after);
+    for (const root of after) {
+        check(replayLine(position, root.line) === root.best,
+            "positive-optimum merge damaged a constructive line", root);
+    }
 });
 
 // --- 5: exact solver vs brute force -------------------------------------------

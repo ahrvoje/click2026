@@ -730,6 +730,11 @@ let savedSingleWeight: f32 = 0.0;
 let savedFragWeight: f32 = 0.0;
 let savedFrozenWeight: f32 = 0.0;
 let beamWeightsSwapped: bool = false;
+// The orthogonal permanent-only pass is meant to explore a complementary
+// corridor independent of earlier heuristic luck. Incumbent pruning is sound
+// for exact search, but in a bounded beam it changes heap/dedup admission and
+// can paradoxically make a better prior score hide a later clearing line.
+let passIgnoreIncumbent: bool = false;
 let passActive: bool = false;
 let curArena: i32 = 0;              // 0 -> bank A is the current layer
 let curCount: i32 = 0;
@@ -879,6 +884,8 @@ export function setBoard(): i32 {
     cpuPlayouts = 0;
     passActive = false;
     exActive = false;
+    exComplete = false;
+    exWholeBoard = false;
     clearExactPrefix();
     vsActive = false;
     vsPaused = false;
@@ -970,6 +977,7 @@ export function getRootLower(root: i32): i32 {
 }
 
 function restoreBeamWeights(): void {
+    passIgnoreIncumbent = false;
     if (!beamWeightsSwapped) return;
     W_SINGLE = savedSingleWeight;
     W_FRAG = savedFragWeight;
@@ -1220,6 +1228,7 @@ export function beamBeginRootPermanent(k: i32, width: i32): void {
     W_FROZEN = 0.0;
     beamWeightsSwapped = true;
     beamInit(width, 0, k >= 0 && k < rootCount ? k : -1, 0, 1);
+    passIgnoreIncumbent = passActive;
     if (!passActive) restoreBeamWeights();
 }
 
@@ -1287,7 +1296,7 @@ export function beamStep(budget: i32): i32 {
             // reject a child before copying, removing, collapsing and scanning
             // it. A terminal that could improve its root is never skipped.
             const childRemaining = nodeRemaining - <i32>unchecked(REP_SIZES[g]);
-            if (EVAL_EXTRAS_NONNEGATIVE && heapSize >= passWidth &&
+            if (!passIgnoreIncumbent && EVAL_EXTRAS_NONNEGATIVE && heapSize >= passWidth &&
                 <f32>childRemaining >= unchecked(H_EVAL[<i32>unchecked(H_ORD[0])]) &&
                 childRemaining >= unchecked(ROOT_BEST[nodeRoot])) {
                 continue;
@@ -1304,7 +1313,8 @@ export function beamStep(budget: i32): i32 {
 
             // Unlike the heuristic evaluation, this forced-cell lower bound
             // is permanent. The subtree cannot strictly improve its root.
-            if (evalLower >= unchecked(ROOT_BEST[nodeRoot])) continue;
+            if (!passIgnoreIncumbent &&
+                evalLower >= unchecked(ROOT_BEST[nodeRoot])) continue;
 
             // beam admission: quick reject against the current worst
             if (heapSize >= passWidth &&
@@ -1590,6 +1600,9 @@ let exBudget: i32 = 0;
 let exComplete: bool = false;
 let exSeek: bool = false;
 let exSeekTarget: i32 = -1;
+// Distinguish a proof of ROOT_BOARD from a proof below one root. Only the
+// former may raise the shared lower bound of every root in exactMerge().
+let exWholeBoard: bool = false;
 let exPrefixRoot: i32 = -1;
 let exPrefixSecond: i32 = -1;
 let ttStamp: u32 = 0;
@@ -1613,6 +1626,7 @@ function consumeExactPrefix(): void {
     exComplete = false;
     exSeek = false;
     exSeekTarget = -1;
+    exWholeBoard = false;
     clearExactPrefix();
 }
 
@@ -1702,6 +1716,7 @@ export function exactBegin(budget: i32): void {
     vsActive = false;
     exActive = true;
     exComplete = false;
+    exWholeBoard = true;
     exSeek = false;
     exBest = NO_SCORE;
     exBestLen = 0;
@@ -1816,6 +1831,7 @@ export function exactStep(chunk: i32): i32 {
 export function exactBeginChild(k: i32, budget: i32): i32 {
     clearExactPrefix();
     exActive = false;
+    exWholeBoard = false;
     if (k < 0 || k >= rootCount) return 0;
 
     vsPaused = false;
@@ -1844,7 +1860,7 @@ export function exactBeginChild(k: i32, budget: i32): i32 {
 // never an exactness claim. EX_LINE starts in the child position, so prepend
 // the root move. Returns the root's resulting best score.
 export function exactCommitChild(k: i32): i32 {
-    if (exPrefixRoot >= 0 || k < 0 || k >= rootCount) return NO_SCORE;
+    if (exWholeBoard || exPrefixRoot >= 0 || k < 0 || k >= rootCount) return NO_SCORE;
 
     if (exHasWitness && exBest < unchecked(ROOT_BEST[k])) {
         unchecked(ROOT_BEST[k] = exBest);
@@ -1862,7 +1878,8 @@ export function exactCommitChild(k: i32): i32 {
 // Merges a completed child search into root k: exhaustive completion proves
 // the move's value in addition to committing any improved witness.
 export function exactMergeChild(k: i32): i32 {
-    if (exPrefixRoot >= 0 || !exComplete || k < 0 || k >= rootCount) return NO_SCORE;
+    if (exWholeBoard || exPrefixRoot >= 0 || !exComplete ||
+        k < 0 || k >= rootCount) return NO_SCORE;
 
     exactCommitChild(k);
 
@@ -1877,6 +1894,7 @@ export function exactMergeChild(k: i32): i32 {
 export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
     clearExactPrefix();
     exActive = false;
+    exWholeBoard = false;
     if (k < 0 || k >= rootCount) return 0;
 
     vsPaused = false;
@@ -1991,7 +2009,7 @@ export function exactCommitRootChild(k: i32, secondCell: i32): i32 {
 // merges a completed exact result into the root table: roots whose best equals
 // the proven optimum are flagged exact; returns the optimum (or NO_SCORE)
 export function exactMerge(): i32 {
-    if (exPrefixRoot >= 0 || !exComplete) return NO_SCORE;
+    if (!exWholeBoard || exPrefixRoot >= 0 || !exComplete) return NO_SCORE;
 
     // the proven-optimal line also improves its root move if it is better
     if (exBestLen > 0) {
@@ -2008,10 +2026,14 @@ export function exactMerge(): i32 {
         }
     }
 
+    // Whole-position completion proves that every root value is at least the
+    // global optimum. Persist that shared lower bound so a constructive row at
+    // the optimum becomes exact without separately enumerating its child.
     for (let k = 0; k < rootCount; k++) {
-        if (unchecked(ROOT_BEST[k]) == exBest) {
-            unchecked(ROOT_EXACT[k] = 1);
+        if (<i32>unchecked(ROOT_LOWER[k]) < exBest) {
+            unchecked(ROOT_LOWER[k] = <u8>exBest);
         }
+        maybeMarkRootExact(k);
     }
 
     return exBest;
@@ -2168,6 +2190,8 @@ function vsPush(bd: usize, cutoff: i32, inheritedLower: i32, parentRemaining: i3
 export function vsBegin(k: i32, budget: i32): i32 {
     clearExactPrefix();
     exActive = false;
+    exComplete = false;
+    exWholeBoard = false;
     if (k < 0 || k >= rootCount) return -3;
 
     // A budget retry of the same root resumes the explicit DFS frontier.

@@ -69,6 +69,14 @@ export function roundRobinPrefixTasks(parents) {
     return tasks;
 }
 
+// A suffix of an exact root line is exact in the next position only when that
+// position is the actual board produced by the root move. Replaying the suffix
+// on some other board validates a constructive score, never its lower bound.
+export function canTransferExactSuffix(previous, move, nextBoardKey) {
+    return move?.exact === true && previous?.childKeys instanceof Map &&
+        previous.childKeys.get(move.cell) === nextBoardKey;
+}
+
 // A move's constructive score is an upper bound. Its admissible lower bound
 // normally supplies the other side; once that move is exact, its exact score
 // is the stronger lower bound even when the static bound itself stayed weak.
