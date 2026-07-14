@@ -115,7 +115,7 @@ try {
     // play the engine's #1 suggestion by clicking its group cell on the canvas
     const target = await page.evaluate(async () => {
         // reach into the module graph via a dynamic import of the same URL
-        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260714-proof14");
+        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260714-parity3");
         return EngineUI.isOn();
     });
     check(target === true, "EngineUI singleton shared with page modules");

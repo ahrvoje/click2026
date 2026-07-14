@@ -322,6 +322,41 @@ heuristic or malformed line into a score or proof.
      and completed entries. Per-attempt budgets escalate ×4 up to the
      WASM-safe i32 limit, while total progress remains unbounded. A finished
      proof marks the row ✓.
+   * **near-gate proof parity**: a threatening root whose child sits just
+     above the `≤ 88` exact gate would enter the persistent exact ladder the
+     moment it is played — one more removal takes a grandchild under the
+     gate — so it used to be unprovable before the move and proved in under
+     a second after it. When no compact child is left, the ladder now gives
+     exactly those roots (child within its own largest group of the gate,
+     still able to improve the incumbent or match a zero) the same
+     escalating `vsBegin` value attempts pre-play, 8 M ×4 capped at a
+     32 M-node parity budget per root — roughly what the child's first
+     post-play seconds buy. Once the width ladder is exhausted and the
+     max-width audit is covered, these quanta run back-to-back like the
+     post-play ladder. The engine cannot settle while a parity candidate
+     remains neither proved nor probed to the cap.
+     Farther above the band, threatening roots keep the *constructive* side
+     of the same guarantee: playing such a move makes the child re-run its
+     whole virtual-child portfolio one forced ply deeper — every
+     `(second, third)` prefix gets a 100k then a 1 M-node target seek plus
+     deterministic and diversified prefix beams — which is how an unproved
+     `1` row used to flip to a proven `0` within a second of being played.
+     One free ply of depth costs more than an order of magnitude: measured
+     on that regression, a `(first, second)` seek at 16 M nodes and a
+     width-8192 `(first, second)` beam both miss zeros the child's 1 M
+     `(second, third)` seeks or width-2048 beams find quickly. Pre-play, the
+     audit therefore gives every `(first, second, third)` prefix of a
+     threatening root the identical schedule (`exactBeginRootChildSeek3`,
+     `beamBeginRootGrandchild`): 100k/1M seeks targeting the root's
+     admissible lower bound, then beams at 128/512/2048 with the same three
+     seeds, triples lane-partitioned by stable ordinal and budget tiers
+     rotated across roots. It runs only on boards of at most 120 remaining
+     cells — beyond that even the played child cannot prove quickly, so
+     openings neither burn speculative exact work nor delay settlement.
+     Once the position value is certified, or the width ladder is exhausted
+     with the max-width audit covered, all pending parity work runs
+     back-to-back instead of paying a max-width beam between quanta.
+     Settlement waits for both audits.
    Proof and terminal states are distinct. **`optimal ✓`** means the global
    position bounds agree, so the best achievable score cannot change; the
    worker nevertheless keeps the existing playout, locked-pass and max-width
@@ -334,7 +369,8 @@ heuristic or malformed line into a score or proof.
    means an as-yet-unproved position reached 24 completed, unchanged *global*
    width-16384 passes above the proving gate, after the private max-width audit
    described above; locked and submaximal passes do not consume that budget.
-   Any unresolved child inside the exact gate also blocks settlement.
+   Any unresolved child inside the exact gate, and any near-gate parity
+   candidate not yet proved or probed to its cap, also blocks settlement.
    The engine stops honestly instead of cycling. An optimal position can also
    finish that alternative audit without losing its `optimal` state; the
    protocol's independent `settled` flag says whether compute has stopped.

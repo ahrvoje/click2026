@@ -12,8 +12,68 @@ import {
 import assert from "node:assert/strict";
 import {
     canTransferExactSuffix,
+    pairAuditCandidates,
+    parityProofCandidates,
     roundRobinPrefixTasks,
 } from "../src/scripts/engine/schedule.js";
+
+// Escalating pair-seek audit: above-gate threatening roots qualify on boards
+// a played child could prove fast; exhausted rounds, sound-nonzero rows
+// against a zero incumbent, in-gate children and large boards stay out.
+{
+    const auditMoves = [
+        { cell: 1, score: 0, lower: 0, size: 2, exact: true },  // proven incumbent
+        { cell: 2, score: 1, lower: 0, size: 2, exact: false }, // zero hopeful
+        { cell: 3, score: 1, lower: 1, size: 2, exact: false }, // sound nonzero row
+        { cell: 4, score: 2, lower: 0, size: 3, exact: false }, // rounds exhausted
+        { cell: 5, score: 2, lower: 0, size: 2, exact: false }, // in-gate child → ladder
+    ];
+    const auditOptions = {
+        childRemainingOf: (move) => (move.cell === 5 ? 80 : 100),
+        exhaustedOf: (move) => move.cell === 4,
+        gate: 88,
+        boardRemaining: 103,
+        maxRemaining: 120,
+    };
+    assert.deepEqual(pairAuditCandidates(auditMoves, auditOptions)
+        .map((move) => move.cell), [2]);
+    assert.deepEqual(pairAuditCandidates(auditMoves,
+        { ...auditOptions, boardRemaining: 130 }), []);
+}
+
+// Pre/post-play proof parity band: only threatening roots whose child crosses
+// the exact gate after one more removal qualify; proven rows, sound-nonzero
+// rows against a zero incumbent, deep above-band roots and capped roots stay
+// out. Tighter score/lower gaps come first.
+{
+    const gate = 88;
+    const cap = 32000000;
+    const parityMoves = [
+        { cell: 1, score: 0, lower: 0, size: 4, exact: true },  // proven incumbent
+        { cell: 6, score: 1, lower: 0, size: 2, exact: false }, // in band, gap 1
+        { cell: 4, score: 1, lower: 1, size: 3, exact: false }, // sound lower 1 cannot be a zero
+        { cell: 2, score: 2, lower: 0, size: 6, exact: false }, // in band, gap 2
+        { cell: 5, score: 2, lower: 0, size: 5, exact: false }, // in band but budget capped
+        { cell: 3, score: 3, lower: 0, size: 2, exact: false }, // far above the band
+    ];
+    const remainingOf = (move) =>
+        ({ 1: 80, 2: 90, 3: 120, 4: 89, 5: 90, 6: 90 })[move.cell];
+    const candidates = parityProofCandidates(parityMoves, {
+        childRemainingOf: remainingOf,
+        maxChildGroupOf: () => 4, // band: remaining <= 92
+        exhaustedOf: (move) => (move.cell === 5 ? cap : 0),
+        gate,
+        cap,
+    });
+    assert.deepEqual(candidates.map((move) => move.cell), [6, 2]);
+    assert.deepEqual(parityProofCandidates([], {
+        childRemainingOf: () => 90,
+        maxChildGroupOf: () => 4,
+        exhaustedOf: () => 0,
+        gate,
+        cap,
+    }), []);
+}
 
 // Parent-major ordinals stay stable while execution rotates parents fairly.
 // Lane filtering therefore covers every pair exactly once without relying on

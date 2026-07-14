@@ -1208,6 +1208,70 @@ export function beamBeginRootChild(
     );
 }
 
+// Start at depth three under one explicit [root, second, third] prefix — the
+// exact parent-side twin of the clicked child running beamBeginRootChild()
+// on its own (second, third) pair. The retained edge chain includes all
+// three prefix moves, so a terminal found by beamStep() remains a replayable
+// line on ROOT_BOARD.
+export function beamBeginRootGrandchild(
+    k: i32, secondCell: i32, thirdCell: i32, width: i32, noiseSeed: u32,
+): void {
+    restoreBeamWeights();
+    passActive = false;
+    passWidth = 0;
+    heapSize = 0;
+    curCount = 0;
+    curCursor = 0;
+    layerDepth = 0;
+    edgeCount = 0;
+
+    if (k < 0 || k >= rootCount || width < 1 || unchecked(ROOT_EXACT[k]) != 0) return;
+    if (secondCell < 0 || secondCell >= CELLS) return;
+    if (thirdCell < 0 || thirdCell >= CELLS) return;
+    if (width > MAX_WIDTH) width = MAX_WIDTH;
+
+    passWidth = width;
+    passNoise = noiseSeed;
+    layerDepth = 3;
+    dedupStamp++;
+    curArena = 0;
+
+    memory.copy(pu8(PLAYOUT_START), pu8(ROOT_BOARD), CELLS);
+    const first = <i32>unchecked(ROOT_REP[k]);
+    if (applyMove(pu8(PLAYOUT_START), first) == 0) return;
+    if (applyMove(pu8(PLAYOUT_START), secondCell) == 0) return;
+
+    const firstEdge: u32 = <u32>edgeCount;
+    unchecked(EDGE_PAR[edgeCount] = NO_EDGE);
+    unchecked(EDGE_MOVE[edgeCount] = <u8>first);
+    edgeCount++;
+    const secondEdge: u32 = <u32>edgeCount;
+    unchecked(EDGE_PAR[edgeCount] = firstEdge);
+    unchecked(EDGE_MOVE[edgeCount] = <u8>secondCell);
+    edgeCount++;
+
+    const bd = curBoards();
+    memory.copy(bd, pu8(PLAYOUT_START), CELLS);
+    if (applyMove(bd, thirdCell) == 0) return;
+    evalBoard(bd, 0);
+
+    if (!evalHasMoves) {
+        reportTerminal(k, evalRemaining, secondEdge, thirdCell);
+        return; // terminal prefix — recorded, nothing left to search
+    }
+
+    unchecked(EDGE_PAR[edgeCount] = secondEdge);
+    unchecked(EDGE_MOVE[edgeCount] = <u8>thirdCell);
+    unchecked(META_ROOT_A[0] = <u8>k);
+    unchecked(META_EDGE_A[0] = <u32>edgeCount);
+    unchecked(META_REMAIN_A[0] = <u8>evalRemaining);
+    edgeCount++;
+    curCount = 1;
+
+    heapSize = 0;
+    passActive = true;
+}
+
 // root-locked pass: the whole beam explores only the subtree of root move k,
 // deepening the most promising candidates instead of re-searching everything
 export function beamBeginRoot(k: i32, width: i32, noiseSeed: u32): void {
@@ -1586,6 +1650,18 @@ export function grandchildToIO(k: i32, second: i32): i32 {
     return applyMove(pu8(IO), second) >= 2 ? 1 : 0;
 }
 
+// Legal third moves of the [root, second] grandchild — the move list the
+// clicked child's own virtual-child portfolio would enumerate for `second`.
+export function grandchildGroupsToIO(k: i32, second: i32): i32 {
+    if (grandchildToIO(k, second) == 0) return 0;
+    const n = enumerateGroups(pu8(IO));
+    for (let g = 0; g < n; g++) {
+        store<u8>(pu8(IO) + 256 + <usize>g, unchecked(REPS[g]));
+        store<u8>(pu8(IO) + 512 + <usize>g, unchecked(REP_SIZES[g]));
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // exact solver — budgeted branch & bound DFS with transposition table
 // ---------------------------------------------------------------------------
@@ -1605,11 +1681,13 @@ let exSeekTarget: i32 = -1;
 let exWholeBoard: bool = false;
 let exPrefixRoot: i32 = -1;
 let exPrefixSecond: i32 = -1;
+let exPrefixThird: i32 = -1;
 let ttStamp: u32 = 0;
 
 function clearExactPrefix(): void {
     exPrefixRoot = -1;
     exPrefixSecond = -1;
+    exPrefixThird = -1;
 }
 
 // A committed or abandoned forced-prefix seek must not remain eligible for
@@ -1971,13 +2049,101 @@ export function exactBeginRootChildSeek(
     return 1;
 }
 
+// Targeted exact seek below one explicit [root, second, third] prefix — the
+// exact parent-side twin of the (second, third) pair seek the clicked child
+// runs in its own virtual-child portfolio. One more forced ply is what keeps
+// pre-play proof effort comparable to the portfolio the child re-runs the
+// moment the move is played: a single ply of free DFS depth costs more than
+// an order of magnitude in budget.
+export function exactBeginRootChildSeek3(
+    k: i32, secondCell: i32, thirdCell: i32, budget: i32, target: i32,
+): i32 {
+    consumeExactPrefix();
+    vsPaused = false;
+    vsActive = false;
+    if (k < 0 || k >= rootCount || unchecked(ROOT_EXACT[k]) != 0 ||
+        secondCell < 0 || secondCell >= CELLS ||
+        thirdCell < 0 || thirdCell >= CELLS || budget < 0 ||
+        target < 0 || target > CELLS || target < <i32>unchecked(ROOT_LOWER[k])) {
+        return 0;
+    }
+
+    memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
+    if (applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k])) < 2 ||
+        applyMove(pu8(PLAYOUT_BOARD), secondCell) < 2 ||
+        applyMove(pu8(PLAYOUT_BOARD), thirdCell) < 2) {
+        return 0;
+    }
+
+    exActive = true;
+    exComplete = false;
+    exSeek = true;
+    exSeekTarget = target;
+    exBest = target + 1;
+    exBestLen = 0;
+    exHasWitness = false;
+    exNodes = 0;
+    exBudget = budget;
+    exDepth = 0;
+    ttStamp++;
+    exPrefixRoot = k;
+    exPrefixSecond = secondCell;
+    exPrefixThird = thirdCell;
+
+    scanExactStats(pu8(PLAYOUT_BOARD));
+    strengthenExactStats(pu8(PLAYOUT_BOARD));
+    const rootLower = <i32>unchecked(ROOT_LOWER[k]);
+    if (statLower < rootLower) statLower = rootLower;
+    let forcedMove = -1;
+    const memo = vttLookup(statHash);
+    if (memo == target && vttHitMove != 255) forcedMove = vttHitMove;
+    exPush(pu8(PLAYOUT_BOARD), forcedMove);
+    return 1;
+}
+
+// Commits only the live [root, second, third] seek. A target hit supplies a
+// replayable line; maybeMarkRootExact() remains the sole proof transition.
+export function exactCommitRootChild3(
+    k: i32, secondCell: i32, thirdCell: i32,
+): i32 {
+    if (k < 0 || k >= rootCount || exPrefixRoot != k ||
+        exPrefixSecond != secondCell || exPrefixThird != thirdCell) {
+        return NO_SCORE;
+    }
+    if (!exHasWitness) {
+        consumeExactPrefix();
+        return NO_SCORE;
+    }
+
+    const len = exBestLen + 3;
+    if (len > LINE_MAX) {
+        consumeExactPrefix();
+        return NO_SCORE;
+    }
+
+    if (exBest < unchecked(ROOT_BEST[k])) {
+        unchecked(ROOT_BEST[k] = exBest);
+        unchecked(ROOT_LINES[k * LINE_MAX] = unchecked(ROOT_REP[k]));
+        unchecked(ROOT_LINES[k * LINE_MAX + 1] = <u8>secondCell);
+        unchecked(ROOT_LINES[k * LINE_MAX + 2] = <u8>thirdCell);
+        for (let d = 0; d < exBestLen; d++) {
+            unchecked(ROOT_LINES[k * LINE_MAX + 3 + d] = unchecked(EX_LINE[d]));
+        }
+        unchecked(ROOT_LINE_LEN[k] = <u8>len);
+    }
+    maybeMarkRootExact(k);
+    const result = unchecked(ROOT_BEST[k]);
+    consumeExactPrefix();
+    return result;
+}
+
 // Commits only the live seek whose prefix exactly matches the arguments. A
 // target hit supplies a replayable line, but one solved second branch cannot
 // prove the whole parent child table by itself. maybeMarkRootExact() is the
 // sole proof transition and fires only when the witness meets ROOT_LOWER.
 export function exactCommitRootChild(k: i32, secondCell: i32): i32 {
     if (k < 0 || k >= rootCount || exPrefixRoot != k ||
-        exPrefixSecond != secondCell) {
+        exPrefixSecond != secondCell || exPrefixThird >= 0) {
         return NO_SCORE;
     }
     if (!exHasWitness) {

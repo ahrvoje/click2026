@@ -26,7 +26,14 @@
  *      plus playout rounds biased to the current top moves
  *      (GPU-accelerated when WebGPU is available); once the board is small
  *      enough, a hybrid B&B/value-memo ladder takes priority until every
- *      move is proved
+ *      move is proved; threatening roots within one child move of the exact
+ *      gate get the same escalating value attempts pre-play (capped per
+ *      root) that their child would run right after being played; farther
+ *      above the gate (boards ≤ 120), every (first, second, third) prefix
+ *      gets the clicked child's own virtual-child schedule — 100k/1M target
+ *      seeks plus deterministic and diversified prefix beams — running
+ *      back-to-back once the position value is certified; both audits
+ *      block settlement until finished or proved
  *
  * Analysis ends in exactly three ways: a new position arrives, EVERY move is
  * proven optimal ("proven"), or SETTLE_PASSES unchanged *global* max-width
@@ -52,13 +59,13 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260714-proof14";
+import { createGpu, dominantColor } from "./gpu.js?build=20260714-parity3";
 import {
-    analysisState, canTransferExactSuffix, createSearchProgress, positionProofCandidates,
-    recordSearchPass, remainingAfterMove, roundRobinPrefixTasks, settlementReady,
-    shouldGpuCaretake, summarizePositionProof,
-} from "./schedule.js?build=20260714-proof14";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260714-proof14";
+    analysisState, canTransferExactSuffix, createSearchProgress, pairAuditCandidates,
+    parityProofCandidates, positionProofCandidates, recordSearchPass, remainingAfterMove,
+    roundRobinPrefixTasks, settlementReady, shouldGpuCaretake, summarizePositionProof,
+} from "./schedule.js?build=20260714-parity3";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260714-parity3";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
@@ -81,6 +88,28 @@ const POSITION_PROBE_BUDGET = 2000000; // one fair threshold/proof turn per thre
 const POSITION_PROBE_ROOTS = 16; // 32M-node board cap; remaining roots keep the normal fairness audit
 const EXACT_BUDGET = 8000000;   // first value-memo attempt; retries resume and escalate ×4
 const EXACT_BUDGET_MAX = 2000000000; // i32-safe budget per resumable attempt
+// Pre/post-play proof parity: a threatening root within one child move of the
+// exact gate gets the same escalating value attempts its child position would
+// run immediately after being played, capped at roughly what the child's
+// first post-play seconds buy (one 8M attempt plus one ×4 retry) so
+// settlement stays reachable.
+const EXACT_PARITY_BUDGET = 32000000;
+// Constructive parity for threatening roots farther above the gate. The
+// clicked child re-runs its whole virtual-child portfolio one forced ply
+// deeper: every (second, third) prefix gets a 100k then a 1M-node target
+// seek plus deterministic and diversified prefix beams. One free ply of
+// depth costs more than an order of magnitude — a (first, second) seek at
+// 16M and a width-8192 (first, second) beam both provably miss zeros the
+// child's 1M seeks / width-2048 beams find quickly. Give threatening
+// parents the identical (first, second, third) turns: same subtrees, same
+// budgets, same widths. Only boards a played child could plausibly prove
+// fast participate.
+const PAIR_AUDIT_ROUNDS = [
+    { seek: 100000 }, { seek: 1000000 },
+    { width: 128, seed: 0 }, { width: 512, seed: 0 },
+    { width: 2048, seed: 0 }, { width: 2048, seed: 1 }, { width: 2048, seed: 2 },
+];
+const PAIR_AUDIT_REMAINING = 120;
 const LINE_BUDGET = 64000000;   // initial memo-guided line seek; rare retries escalate ×4
 const WIDEN_WIDTHS = [8, 32, 128, 512, 2048];
 // A clicked child receives deterministic lane-partitioned beams, then private
@@ -421,6 +450,11 @@ async function analyze(myJob, isStale) {
         }
     };
 
+    // Created before the lane-completion check: pre-play proof parity work
+    // spans lanes, so even a lane whose own roots are complete may still owe
+    // pair seeks for threatening roots it does not own.
+    const ladder = createExactLadder(isStale, postIfDue);
+
     // CPU root ownership is disjoint, but WebGPU can cheaply sample every
     // root.  Lane zero therefore remains as a GPU caretaker after its own CPU
     // roots finish, consuming replay-validated proof/line seeds broadcast by
@@ -429,6 +463,11 @@ async function analyze(myJob, isStale) {
     const finishLaneIfComplete = async (snapshot) => {
         if (!ownedComplete(snapshot)) return false;
         if (!virtualChildAuditComplete) return false;
+        // Like the virtual-child audit, parity pair seeks are partitioned
+        // across every lane. Stay alive until this lane's bounded slice is
+        // proved out or capped, or most of a threatening root's second moves
+        // would silently lose their escalated audit turns.
+        if (ladder.pendingProofCount(snapshot) > 0) return false;
         if (!shouldGpuCaretake(snapshot, LANE, gpuState)) {
             stopGpuPump();
             post(true);
@@ -570,7 +609,6 @@ async function analyze(myJob, isStale) {
     // 8. continuous investigation — runs until the position changes, every
     // move is PROVEN optimal, or nothing new has been found despite climbing
     // the whole width ladder (settled stop); scores only improve over time
-    const ladder = createExactLadder(isStale);
     let progress = createSearchProgress(
         moves.map((m) => `${m.cell}:${m.score}:${m.exact ? 1 : 0}`).join("|"),
         moves[0].score);
@@ -611,6 +649,21 @@ async function analyze(myJob, isStale) {
         // Width answers one question: has the best attainable position score
         // improved? Tail-row changes must not hold the top search at width 512.
         const tier = Math.min(WIDTH_TIERS.length - 1, Math.floor(progress.bestFruitless / 4));
+
+        // Proof parity priority: pending pre-play proof work (near-gate value
+        // attempts, escalating pair seeks) runs back-to-back — as the played
+        // child's own schedule would — once wider beams stop being the
+        // purposeful spend: either the position value is already certified so
+        // beams cannot change the objective, or the width ladder is exhausted
+        // and the private max-width audit has no uncovered root.
+        const proofOnly = summarizePositionProof(moves,
+            (move) => move.lower).positionExact ||
+            (tier === WIDTH_TIERS.length - 1 &&
+                uncoveredPrivateCandidates(moves, lockedMaxWidths).length === 0);
+        if (proofOnly && ladder.pendingProofCount(moves) > 0) {
+            postIfDue();
+            continue;
+        }
 
         // odd passes lock the whole beam onto one candidate: bigger-group
         // hopefuls first (can a larger group match the best score?), then the
@@ -681,8 +734,9 @@ async function analyze(myJob, isStale) {
         const uncoveredPrivate = uncoveredPrivateCandidates(moves, lockedMaxWidths).length;
         const uncoveredExact = moves.filter((move) => owns(move) && !move.exact &&
             childRemaining(move) <= EXACT_TRY_REMAINING).length;
+        const uncoveredProof = ladder.pendingProofCount(moves);
         if (settlementReady(progress, SETTLE_PASSES, eng.getRemaining(),
-            EXACT_REMAINING, uncoveredPrivate + uncoveredExact)) {
+            EXACT_REMAINING, uncoveredPrivate + uncoveredExact + uncoveredProof)) {
             stopGpuPump();
             post(true);
             return;
@@ -1025,13 +1079,127 @@ async function gpuBeamAssist(moves, seedBase, isStale) {
 // directly. The memo is shared across roots, retries and later analysis
 // positions. Improving terminals are retained as durable lines inside WASM;
 // a memo-guided witness DFS repairs any remaining policy-cache gap.
-function createExactLadder(isStale) {
+function createExactLadder(isStale, postIfDue) {
     const exhausted = new Map(); // cell -> last value-solve budget tried
     const lineExhausted = new Map(); // cell -> last guided witness budget tried
     const boundTried = new Set();
-    let active = null; // { k, cell, mode: "bound" | "value" | "line", budget, target }
+    const maxChildGroups = new Map(); // cell -> largest group inside the child
+    const pairAudits = new Map(); // cell -> { round, index, seconds } seek cursor
+    let active = null; // { k, cell, mode: "bound" | "value" | "line" | "pairSeek", budget, target }
+
+    // The board is fixed for the whole analysis, so the child's largest group
+    // (which decides whether one more removal crosses the exact gate) is
+    // computed once per root. childGroupsToIO only writes the IO scratch and
+    // runs at the same task boundaries as collectResults.
+    const maxChildGroupOf = (move) => {
+        let largest = maxChildGroups.get(move.cell);
+        if (largest === undefined) {
+            const count = eng.childGroupsToIO(move.k);
+            largest = count > 0 ?
+                Math.max(...mem().slice(IO + 512, IO + 512 + count)) : 0;
+            maxChildGroups.set(move.cell, largest);
+        }
+        return largest;
+    };
 
     return {
+        // Threatening roots inside the one-move band above the exact gate:
+        // once played, their child would enter this ladder immediately. They
+        // get the same escalating value attempts pre-play, and they block
+        // settlement until proved or probed to the parity cap.
+        parityCandidates(moves) {
+            return parityProofCandidates(moves, {
+                childRemainingOf: childRemaining,
+                maxChildGroupOf,
+                exhaustedOf: (move) => exhausted.get(move.cell) ?? 0,
+                gate: EXACT_TRY_REMAINING,
+                cap: EXACT_PARITY_BUDGET,
+            }).filter(owns);
+        },
+
+        // Escalating pair-seek audit: every lane audits its stable slice of
+        // each threatening root's second moves — the same lane partition the
+        // played child would apply to those moves as its own roots.
+        pairCandidates(moves) {
+            return pairAuditCandidates(moves, {
+                childRemainingOf: childRemaining,
+                exhaustedOf: (move) =>
+                    (pairAudits.get(move.cell)?.round ?? 0) >= PAIR_AUDIT_ROUNDS.length,
+                gate: EXACT_TRY_REMAINING,
+                boardRemaining: eng.getRemaining(),
+                maxRemaining: PAIR_AUDIT_REMAINING,
+            });
+        },
+
+        // Pre-play proof work still owed before this lane may settle.
+        pendingProofCount(moves) {
+            return this.parityCandidates(moves).length + this.pairCandidates(moves).length;
+        },
+
+        // Begins the next (first, second, third) audit turn, advancing the
+        // per-root cursor across the round schedule. The lane owns every
+        // LANES-th triple in the same stable big-groups-first order the
+        // clicked child would give its own (second, third) pairs, and rounds
+        // rotate across roots so one wide root cannot hold every other root
+        // at tier zero. Returns the active descriptor or null when every
+        // triple has had its full schedule.
+        nextPairSeek(moves) {
+            const queue = this.pairCandidates(moves)
+                .sort((a, b) => (pairAudits.get(a.cell)?.round ?? 0) -
+                    (pairAudits.get(b.cell)?.round ?? 0));
+            for (const move of queue) {
+                let audit = pairAudits.get(move.cell);
+                if (!audit) {
+                    const count = eng.childGroupsToIO(move.k);
+                    const reps = mem().slice(IO + 256, IO + 256 + count);
+                    const sizes = mem().slice(IO + 512, IO + 512 + count);
+                    const seconds = Array.from(reps, (second, index) => ({
+                        second,
+                        size: sizes[index],
+                    })).sort((a, b) => b.size - a.size || a.second - b.second);
+                    const triples = [];
+                    let ordinal = 0;
+                    for (const { second } of seconds) {
+                        const thirdCount = eng.grandchildGroupsToIO(move.k, second);
+                        const thirdReps = mem().slice(IO + 256, IO + 256 + thirdCount);
+                        const thirdSizes = mem().slice(IO + 512, IO + 512 + thirdCount);
+                        const thirds = Array.from(thirdReps, (third, index) => ({
+                            third,
+                            size: thirdSizes[index],
+                        })).sort((a, b) => b.size - a.size || a.third - b.third);
+                        for (const { third } of thirds) {
+                            if (ordinal++ % LANES === LANE) triples.push({ second, third });
+                        }
+                    }
+                    audit = { round: 0, index: 0, triples };
+                    pairAudits.set(move.cell, audit);
+                }
+                while (audit.round < PAIR_AUDIT_ROUNDS.length) {
+                    if (audit.index >= audit.triples.length) {
+                        audit.round++;
+                        audit.index = 0;
+                        break; // fair tiering: other roots reach this round first
+                    }
+                    const { second, third } = audit.triples[audit.index++];
+                    const round = PAIR_AUDIT_ROUNDS[audit.round];
+                    if (round.seek !== undefined) {
+                        const target = eng.getRootLower(move.k);
+                        if (eng.exactBeginRootChildSeek3(
+                            move.k, second, third, round.seek, target) === 1) {
+                            return { k: move.k, cell: move.cell, mode: "pairSeek",
+                                target, second, third, remaining: childRemaining(move) };
+                        }
+                    } else {
+                        eng.beamBeginRootGrandchild(
+                            move.k, second, third, round.width, round.seed);
+                        return { k: move.k, cell: move.cell, mode: "pairBeam",
+                            second, third, remaining: childRemaining(move) };
+                    }
+                }
+            }
+            return null;
+        },
+
         shouldPrioritize(moves) {
             const unresolved = moves.filter((move) => owns(move) && !move.exact);
             // When every owned child is under the exact gate, finish the
@@ -1061,20 +1229,46 @@ function createExactLadder(isStale) {
                 // followed by mostly memo-backed proofs.
                 const next = moves.filter((m) => owns(m) && !m.exact &&
                     childRemaining(m) <= EXACT_TRY_REMAINING)
-                    .sort((a, b) => a.size - b.size || a.score - b.score || a.cell - b.cell)[0];
-                if (!next) return false; // no child is inside the exact gate
+                    .sort((a, b) => a.size - b.size || a.score - b.score || a.cell - b.cell)[0] ??
+                    // Proof parity: with no compact child left, spend the
+                    // capped escalating attempts on near-gate threats.
+                    this.parityCandidates(moves)[0];
+                if (next) {
+                    const remaining = childRemaining(next);
 
-                const remaining = childRemaining(next);
-
-                if (remaining <= BOUND_TRY_REMAINING && !boundTried.has(next.cell)) {
-                    boundTried.add(next.cell);
-                    active = { k: next.k, cell: next.cell, mode: "bound",
-                        budget: BOUND_BUDGET, target: -1, remaining };
-                    eng.exactBeginChild(next.k, BOUND_BUDGET);
+                    if (remaining <= BOUND_TRY_REMAINING && !boundTried.has(next.cell)) {
+                        boundTried.add(next.cell);
+                        active = { k: next.k, cell: next.cell, mode: "bound",
+                            budget: BOUND_BUDGET, target: -1, remaining };
+                        eng.exactBeginChild(next.k, BOUND_BUDGET);
+                    } else {
+                        const started = this.startValue(next);
+                        if (started !== null) return started;
+                    }
                 } else {
-                    const started = this.startValue(next);
-                    if (started !== null) return started;
+                    // Constructive parity: give the remaining threatening
+                    // roots the clicked child's own (second, third) schedule.
+                    active = this.nextPairSeek(moves);
+                    if (!active) return false; // no proof work owed anywhere
                 }
+            }
+
+            // A prefix beam runs like every other beam pass: to completion,
+            // yielding between chunks. It cannot share cycle quanta because
+            // the continuous loop's own passes would reset the beam state.
+            if (active.mode === "pairBeam") {
+                for (;;) {
+                    if (isStale()) return false;
+                    if (eng.beamStep(CHUNK) === 1) break;
+                    postIfDue();
+                    await nextTick();
+                }
+                const before = moves.find((m) => m.cell === active.cell);
+                const updated = collectResults().moves
+                    .find((m) => m.cell === active.cell);
+                active = null;
+                return updated !== undefined && (updated.exact ||
+                    (before !== undefined && updated.score < before.score));
             }
 
             // Match the clicked child size, not the untouched parent size.
@@ -1113,6 +1307,18 @@ function createExactLadder(isStale) {
                         return false;
                     }
                     return this.finishValue(r);
+                }
+
+                if (mode === "pairSeek") {
+                    // A (first, second, third) target seek finished. A hit
+                    // commits a replayable line and may meet ROOT_LOWER
+                    // exactly; exhaustion or a completed non-winning branch
+                    // commits nothing and the cursor simply moves on.
+                    const committed = eng.exactCommitRootChild3(
+                        active.k, active.second, active.third);
+                    const hit = committed === active.target;
+                    active = null;
+                    return hit;
                 }
 
                 // line seek finished: exactly `target` means the line is in
@@ -1247,7 +1453,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260714-proof14");
+            wasmURL.searchParams.set("build", "20260714-parity3");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();

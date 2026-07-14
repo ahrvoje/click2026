@@ -127,6 +127,60 @@ export function shouldGpuCaretake(moves, lane, gpuState) {
     return lane === 0 && gpuState === "on" && moves.some((move) => !move.exact);
 }
 
+// Pre/post-play proof parity. A root just above the exact gate crosses it
+// after a single removal: the moment it is played, its child position runs
+// the escalating value ladder on its own compact moves and can prove in
+// seconds what the parent never attempted. Select exactly the threatening
+// roots inside that one-move band — a distant root gets no ladder after
+// being played either, so it must not receive speculative exact work or
+// block settlement. Tight score/lower gaps first: cheapest proofs land
+// soonest.
+export function parityProofCandidates(moves, {
+    childRemainingOf, maxChildGroupOf, exhaustedOf, gate, cap,
+}) {
+    if (moves.length === 0) return [];
+    const incumbent = moves[0].score;
+    return moves
+        .filter((move) => {
+            if (move.exact) return false;
+            const remaining = childRemainingOf(move);
+            if (remaining <= gate) return false;
+            if (remaining - maxChildGroupOf(move) > gate) return false;
+            if (exhaustedOf(move) >= cap) return false;
+            const canImprove = move.lower < incumbent;
+            const canAlsoClear = incumbent === 0 && move.score > 0 && move.lower === 0;
+            return canImprove || canAlsoClear;
+        })
+        .sort((a, b) => (a.score - a.lower) - (b.score - b.lower) ||
+            a.score - b.score || b.size - a.size || a.cell - b.cell);
+}
+
+// Constructive parity farther above the gate. The moment such a root is
+// played, its child re-runs the bounded proof seeks one ply deeper — every
+// (second, third) prefix gets its own 100k/1M turn plus per-second B&B
+// probes — which is how an unproved row flips to a proven zero within a
+// second of being played. Mirror that aggregate branch budget pre-play by
+// escalating the one-shot virtual-child pair seeks for every root that can
+// still improve the incumbent or match a zero. Only boards small enough that
+// the played child could actually prove quickly participate; anything larger
+// has no discontinuity to mirror.
+export function pairAuditCandidates(moves, {
+    childRemainingOf, exhaustedOf, gate, boardRemaining, maxRemaining,
+}) {
+    if (moves.length === 0 || boardRemaining > maxRemaining) return [];
+    const incumbent = moves[0].score;
+    return moves
+        .filter((move) => {
+            if (move.exact || exhaustedOf(move)) return false;
+            if (childRemainingOf(move) <= gate) return false;
+            const canImprove = move.lower < incumbent;
+            const canAlsoClear = incumbent === 0 && move.score > 0 && move.lower === 0;
+            return canImprove || canAlsoClear;
+        })
+        .sort((a, b) => (a.score - a.lower) - (b.score - b.lower) ||
+            a.score - b.score || b.size - a.size || a.cell - b.cell);
+}
+
 // One fair bounded proof probe is useful only for roots that can still beat
 // the incumbent. Tight score/lower gaps go first, but no threatening root is
 // omitted; the caller owns the per-root budget and can stop as soon as the
