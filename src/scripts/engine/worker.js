@@ -52,14 +52,14 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260714-regress2";
+import { createGpu, dominantColor } from "./gpu.js?build=20260715-hwmodel2";
 import {
     analysisState, canTransferExactSuffix, caretakerProofCandidates, createSearchProgress,
     exactCandidateOrder, mirrorClickedPrefixTasks, positionProofCandidates, recordSearchPass,
     remainingAfterMove, roundRobinPrefixTasks, settlementReady, shouldGpuCaretake,
     summarizePositionProof,
-} from "./schedule.js?build=20260714-regress2";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260714-regress2";
+} from "./schedule.js?build=20260715-hwmodel2";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-hwmodel2";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
@@ -119,7 +119,11 @@ let eng = null;
 let IO = 0;
 let gpu = null;
 let gpuState = "off";           // "off" | "on" | "failed"
-let pendingGpu = null;          // one shared-buffer batch may be in flight
+const pendingGpuBatches = new Set(); // logical batches in flight (pipelined)
+// Two logical batches stay queued so the JS turnaround of a completed batch
+// (verify, collect, repack) overlaps device execution of the next one instead
+// of draining the GPU at every macrotask boundary.
+const GPU_PIPELINE_BATCHES = 2;
 
 let job = null;
 let jobVersion = 0;
@@ -298,14 +302,15 @@ async function analyze(myJob, isStale) {
     // lanes alive through the bounded virtual-child audit below.
     let virtualChildAuditComplete = false;
     const key = myJob.board.join(",");
-    // A batch submitted by the replaced position still updates lifetime
-    // counters when it completes. Let this position start its CPU baseline
-    // immediately, but hold its GPU counter baseline until that old bounded
-    // dispatch drains. Until then posts report zero new GPU work.
-    const inheritedGpu = pendingGpu;
+    // Batches submitted by the replaced position still update lifetime
+    // counters when they complete. Let this position start its CPU baseline
+    // immediately, but hold its GPU counter baseline until those old bounded
+    // dispatches drain. Until then posts report zero new GPU work.
+    const inheritedGpu = pendingGpuBatches.size > 0 ?
+        Promise.allSettled([...pendingGpuBatches]) : null;
     let gpuStart = inheritedGpu === null ? (gpu?.getStats?.() ?? {}) : null;
     const gpuBaselineReady = inheritedGpu === null ? Promise.resolve() :
-        inheritedGpu.catch(() => { /* disableGpu handles failures */ }).then(() => {
+        inheritedGpu.then(() => { // allSettled — disableGpu handles failures
             gpuStart = gpu?.getStats?.() ?? {};
         });
 
@@ -423,13 +428,14 @@ async function analyze(myJob, isStale) {
     const gpuSamplesFor = (snapshot, fallback) => gpu?.recommendPlayouts?.(
         snapshot.filter((move) => !move.exact).length) ?? fallback;
 
-    // Keep one logical batch (internally striped over the GPU resource slots)
-    // continuously queued.  Batch preparation and replay verification execute
-    // only at ordinary JavaScript task boundaries, never concurrently with a
-    // WASM call.  The GPU owns copies of its boards after submission, so the
-    // CPU remains free to advance beam/exact chunks in the meantime.
+    // Keep up to GPU_PIPELINE_BATCHES logical batches (each internally striped
+    // over the GPU resource slots) continuously queued.  Batch preparation and
+    // replay verification execute only at ordinary JavaScript task boundaries,
+    // never concurrently with a WASM call.  The GPU owns copies of its boards
+    // after submission, so the CPU remains free to advance beam/exact chunks
+    // in the meantime.
     const launchGpuBatch = () => {
-        if (pendingGpu !== null || gpuState !== "on") return false;
+        if (pendingGpuBatches.size >= GPU_PIPELINE_BATCHES || gpuState !== "on") return false;
         const snapshot = latestGpuMoves;
         if (!gpuPumpEnabled || isStale() || !snapshot.some((move) => !move.exact)) return false;
         const samples = gpuSamplesFor(snapshot, gpuPumpFallback);
@@ -446,27 +452,34 @@ async function analyze(myJob, isStale) {
                 if (!isStale() && eng) latestGpuMoves = collectResults().moves;
             })
             .finally(() => {
-                if (pendingGpu === pending) pendingGpu = null;
+                pendingGpuBatches.delete(pending);
                 if (gpuPumpEnabled && !isStale() && gpuState === "on" &&
                     latestGpuMoves.some((move) => !move.exact)) {
                     // Use a macrotask rather than an unbounded microtask chain:
                     // position-change messages stay promptly preemptive even
                     // with a mock/driver that resolves a batch immediately.
-                    void nextTick().then(() => launchGpuBatch());
+                    void nextTick().then(() => fillGpuPipeline());
                 }
             });
-        pendingGpu = pending;
+        pendingGpuBatches.add(pending);
         return true;
+    };
+    const fillGpuPipeline = () => {
+        let launched = false;
+        while (launchGpuBatch()) launched = true;
+        return launched;
     };
     const startGpuPump = (fallback = gpuPumpFallback) => {
         gpuPumpFallback = fallback;
         gpuPumpEnabled = true;
-        return launchGpuBatch();
+        return fillGpuPipeline();
     };
     const stopGpuPump = () => { gpuPumpEnabled = false; };
     const drainGpu = async () => {
-        const pending = pendingGpu;
-        if (pending === null) return;
+        if (pendingGpuBatches.size === 0) return;
+        // resolve when ANY in-flight batch settles; failures are handled by
+        // the batch's own catch, so the race result itself is irrelevant
+        const pending = Promise.race([...pendingGpuBatches]).then(() => {}, () => {});
         let wakeJobChange;
         const changed = new Promise((resolve) => {
             wakeJobChange = resolve;
@@ -533,7 +546,7 @@ async function analyze(myJob, isStale) {
                 post(true);
                 return true;
             }
-            if (pendingGpu === null) launchGpuBatch();
+            fillGpuPipeline();
             await drainGpu();
             if (isStale()) { stopGpuPump(); return true; }
 
@@ -1809,7 +1822,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260714-regress2");
+            wasmURL.searchParams.set("build", "20260715-hwmodel2");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();

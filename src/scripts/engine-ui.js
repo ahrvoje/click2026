@@ -14,7 +14,7 @@
  */
 
 import { canonicalBlock, LETTERS } from "./board.js";
-import { EngineWorkerPool } from "./engine/pool.js?build=20260714-regress2";
+import { EngineWorkerPool } from "./engine/pool.js?build=20260715-hwmodel2";
 
 const TOP_N = 5;
 const SUGGESTED_MODE_TOP_5 = "top5";
@@ -23,7 +23,7 @@ const SUGGESTED_MODE_ALL = "all";
 // Keep the module worker, its static imports and the compiled WASM on one
 // cache generation. A stale dependency makes a module worker fail before any
 // of its error-reporting code can run, yielding only an opaque ErrorEvent.
-const ENGINE_ASSET_VERSION = "20260714-regress2";
+const ENGINE_ASSET_VERSION = "20260715-hwmodel2";
 
 // rank accent colors, shared by the list rows and the board outlines; picked
 // to stay distinguishable from the five play colors and the replay highlight
@@ -151,6 +151,37 @@ function formatDuration(ms) {
     return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
+// Best-available silicon tag for the CPU row label. Browsers deliberately
+// expose no CPU model, so this is the UA-CH architecture/bitness ("x64",
+// "arm64") or the device model on mobile; empty when nothing is exposed.
+let cpuModelTag = "";
+(async () => {
+    try {
+        const uaData = navigator.userAgentData;
+        if (uaData?.getHighEntropyValues) {
+            const { architecture = "", bitness = "", model = "" } =
+                await uaData.getHighEntropyValues(["architecture", "bitness", "model"]);
+            if (model) {
+                cpuModelTag = model.replace(/\s+/g, "").slice(0, 9);
+                return;
+            }
+            if (architecture.startsWith("x86")) {
+                cpuModelTag = bitness === "64" ? "x64" : "x86";
+                return;
+            }
+            if (architecture.startsWith("arm")) {
+                cpuModelTag = bitness === "64" ? "arm64" : "arm";
+                return;
+            }
+        }
+        const ua = navigator.userAgent ?? "";
+        if (/\b(?:x64|Win64|WOW64|amd64|x86_64)\b/i.test(ua)) cpuModelTag = "x64";
+        else if (/\b(?:aarch64|arm64)\b/i.test(ua)) cpuModelTag = "arm64";
+    } catch {
+        // UA-CH high-entropy values may be denied; the row simply stays CPU×N.
+    }
+})();
+
 function processorRow(className, label, pps, positions, share, title) {
     const row = span(`engineStatusRow engineProcessorRow ${className}`);
     row.title = title;
@@ -257,10 +288,13 @@ function renderStats() {
     const gpuProfile = typeof gpuStats.profile === "string" ? gpuStats.profile : null;
     const gpuAdapter = gpuStats.adapter && typeof gpuStats.adapter === "object"
         ? [gpuStats.adapter.vendor, gpuStats.adapter.architecture,
-            gpuStats.adapter.device, gpuStats.adapter.description]
+            gpuStats.adapter.device, gpuStats.adapter.description,
+            gpuStats.adapter.model]
             .filter((value, index, values) => value && values.indexOf(value) === index)
             .join(" ")
         : "";
+    const gpuModel = gpuStats.adapter && typeof gpuStats.adapter.model === "string"
+        ? gpuStats.adapter.model : "";
 
     const totalPositions = statNumber(
         s.totalPositions,
@@ -296,9 +330,10 @@ function renderStats() {
     );
 
     const workerSuffix = cpuWorkers !== null && cpuWorkers > 1 ? `×${Math.round(cpuWorkers)}` : "";
-    const cpuLabel = `CPU${workerSuffix}`;
+    const cpuLabel = `CPU${workerSuffix}${cpuModelTag ? `/${cpuModelTag}` : ""}`;
     const cpuTitle = [
         `CPU${cpuWorkers !== null ? ` workers: ${Math.round(cpuWorkers)}` : ""}`,
+        cpuModelTag ? `architecture: ${cpuModelTag}` : "",
         `search positions: ${Math.round(cpuPositions).toLocaleString()} (work visits, not unique states)`,
         `wall-average throughput: ${Math.round(cpuPps).toLocaleString()} positions/s`,
         beamPositions > 0 ? `beam positions: ${Math.round(beamPositions).toLocaleString()}` : "",
@@ -327,7 +362,7 @@ function renderStats() {
             gpuActiveMs > 0 ? `active time: ${formatDuration(gpuActiveMs)}` : "",
         ].filter(Boolean).join("; ");
         gpuAccessible = gpuTitle;
-        gpuRow = processorRow("engineHwGpu", "GPU",
+        gpuRow = processorRow("engineHwGpu", gpuModel ? `GPU/${gpuModel}` : "GPU",
             gpuPps ?? 0, gpuPositions ?? 0, gpuShare, gpuTitle);
     } else {
         const failed = s.gpu === "failed";

@@ -9,8 +9,17 @@
  * adopted result through the WASM core (playoutVerify) before trusting it, and
  * disables the GPU path permanently on the first mismatch.
  *
+ * Internally each thread holds its board as register-resident bitplanes (an
+ * occupancy mask plus three color-bit planes of 144 bits each) instead of
+ * per-cell private arrays, so flood fill, gravity and column compaction are
+ * bit-parallel ALU work with no spilled local-memory traffic. Enumeration
+ * scans groups twice per move (count, then locate the RNG pick), which keeps
+ * the RNG stream and group order exactly equal to the CPU twin. See
+ * tools/gpu.kernel.test.mjs for the word-level equivalence proof harness.
+ *
  * The kernel returns, per candidate, the packed minimum
- * (finalRemaining << 24 | seedIndex) plus an exact processed-position count.
+ * (finalRemaining << 24 | seedIndex) plus an exact processed-position count,
+ * both reduced per workgroup before one global atomic per metric.
  * The full move line is reconstructed CPU-side by replaying the winning seed.
  *
  * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
@@ -38,6 +47,91 @@ export function dominantColor(board) {
     return best;
 }
 
+// Compact model tag for the telemetry row: "NVIDIA GeForce RTX 4080" and
+// "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x00004680) Direct3D11 ...)" turn
+// into "RTX4080" and "UHD770". Brand and backend words identify nothing the
+// row does not already say, so they are dropped; only the model remains.
+export function compactGpuModel(rawName) {
+    let name = String(rawName ?? "");
+    const angle = name.match(/^ANGLE \([^,]*,\s*([^,]*?)(?:,[^)]*)?\)$/);
+    if (angle) name = angle[1];
+    name = name
+        .replace(/\(0x[0-9A-Fa-f]+\)/g, " ")
+        .replace(/\((?:R|TM|C)\)/gi, " ")
+        .replace(/\b(?:Direct3D|D3D|Vulkan|Metal|OpenGL)\S*\b[\s\S]*$/i, " ")
+        .replace(/\bvs_\d+\S*[\s\S]*$/i, " ")
+        .replace(/\b(?:NVIDIA|GeForce|Intel|AMD|ATI|Radeon|Apple|Qualcomm|Microsoft|Samsung|Graphics|Corporation|Inc)\b\.?/gi, " ")
+        .replace(/[^0-9A-Za-z ]+/g, " ")
+        .trim();
+    if (name === "") return "";
+    const compact = name.split(/\s+/).join("");
+    return compact.length > 12 ? compact.slice(0, 12) : compact;
+}
+
+// WebGPU adapter identity is usually redacted to vendor/architecture, but the
+// WebGL renderer string still names the actual model. Worker-safe; returns ""
+// wherever OffscreenCanvas WebGL or the debug extension is unavailable.
+function probeWebglRenderer() {
+    try {
+        if (typeof OffscreenCanvas === "undefined") return "";
+        const gl = new OffscreenCanvas(1, 1).getContext("webgl");
+        if (!gl) return "";
+        const info = gl.getExtension("WEBGL_debug_renderer_info");
+        const renderer = String(gl.getParameter(
+            info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER) ?? "");
+        gl.getExtension("WEBGL_lose_context")?.loseContext();
+        return renderer;
+    } catch {
+        return "";
+    }
+}
+
+// The kernel keeps the whole game in registers as bitplanes: one occupancy
+// mask plus three color-bit planes (colors 1..5 in binary), each a 144-bit
+// mask over column-major cells (bit index = cell = col * 12 + row) packed
+// into vec4<u32> + u32. The previous kernel's ~1.8 KB of per-thread private
+// arrays spilled to device memory and dominated its runtime; these masks are
+// register-resident and flood fill becomes bit-parallel dilation.
+function playoutMaskWords(predicate) {
+    const words = [0, 0, 0, 0, 0];
+    for (let bit = 0; bit < 144; bit++) {
+        if (predicate(bit)) words[bit >> 5] |= 1 << (bit & 31);
+    }
+    return words.map((word) => `0x${(word >>> 0).toString(16).toUpperCase()}u`);
+}
+
+const NOT_ROW0 = playoutMaskWords((bit) => bit % 12 !== 0);
+const NOT_ROW11 = playoutMaskWords((bit) => bit % 12 !== 11);
+
+// Boards arrive packed four cells per u32 (36 words per child). Mask word w
+// covers cells [32w, 32w+32) = buffer words [8w, 8w+8); word 4 holds only
+// cells 128..143. Generated per mask word so every plane store is static.
+const PLAYOUT_UNPACK = [0, 1, 2, 3, 4].map((w) => {
+    const lanes = ["x", "y", "z", "w"];
+    const store = (name, value) => (w < 4
+        ? `${name}.lo.${lanes[w]} = ${value};` : `${name}.hi = ${value};`);
+    return `{
+            var o = 0u; var a0 = 0u; var a1 = 0u; var a2 = 0u;
+            for (var j = 0u; j < ${w === 4 ? 4 : 8}u; j += 1u) {
+                let word = BOARDS[boardsBase + ${w * 8}u + j];
+                for (var k = 0u; k < 4u; k += 1u) {
+                    let color = (word >> (k * 8u)) & 0xFFu;
+                    if (color != 0u) {
+                        let bit = 1u << (j * 4u + k);
+                        o |= bit;
+                        if ((color & 1u) != 0u) { a0 |= bit; }
+                        if ((color & 2u) != 0u) { a1 |= bit; }
+                        if ((color & 4u) != 0u) { a2 |= bit; }
+                    }
+                }
+            }
+            ${store("occ", "o")}
+            ${store("pl0", "a0")}
+            ${store("pl1", "a1")}
+            ${store("pl2", "a2")}
+        }`;
+}).join(" ");
+
 const SHADER = /* wgsl */ `
 struct Params {
     children: u32,
@@ -52,16 +146,26 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> OUT: array<atomic<u32>>; // children, (final << 24) | seedIdx
 @group(0) @binding(4) var<storage, read_write> POSITIONS: array<atomic<u32>>; // exact visited-board count
 
-var<private> board: array<u32, 144>;
-var<private> visited: array<u32, 5>;
-var<private> visited2: array<u32, 5>;
-var<private> stk: array<u32, 144>;
-var<private> reps: array<u32, 80>;
-var<private> cols: array<u32, 80>;
+// One 144-bit board mask: bits 0..127 in lo, 128..143 in hi (low 16 bits).
+struct M144 { lo: vec4<u32>, hi: u32 }
+
+// bits whose row is 0 / 11 removed — column-boundary masks for row shifts
+const NOT_ROW0_LO = vec4<u32>(${NOT_ROW0.slice(0, 4).join(", ")});
+const NOT_ROW0_HI = ${NOT_ROW0[4]};
+const NOT_ROW11_LO = vec4<u32>(${NOT_ROW11.slice(0, 4).join(", ")});
+const NOT_ROW11_HI = ${NOT_ROW11[4]};
+
+var<private> occ: M144;
+var<private> pl0: M144;
+var<private> pl1: M144;
+var<private> pl2: M144;
 var<private> rx: u32;
 var<private> ry: u32;
 var<private> rz: u32;
 var<private> rw: u32;
+
+var<workgroup> wgMin: atomic<u32>;
+var<workgroup> wgPositions: atomic<u32>;
 
 // xorshift128 — bit-identical twin of rngNext()/rngSeed() in asm/engine.ts
 fn rngNext() -> u32 {
@@ -80,174 +184,308 @@ fn rngSeed(seed: u32) {
     for (var i = 0; i < 4; i++) { rngNext(); }
 }
 
-// flood fill during enumeration: marks the shared visited mask, returns size
-fn enumFlood(start: u32, color: u32) -> u32 {
-    visited[start >> 5u] |= (1u << (start & 31u));
-    stk[0] = start;
-    var sp = 1u;
-    var size = 0u;
+fn mAnd(a: M144, b: M144) -> M144 { return M144(a.lo & b.lo, a.hi & b.hi); }
+fn mOr(a: M144, b: M144) -> M144 { return M144(a.lo | b.lo, a.hi | b.hi); }
+fn mAndNot(a: M144, b: M144) -> M144 { return M144(a.lo & ~b.lo, a.hi & ~b.hi); }
+fn mIsZero(a: M144) -> bool { return all(a.lo == vec4<u32>()) && a.hi == 0u; }
+fn mEq(a: M144, b: M144) -> bool { return all(a.lo == b.lo) && a.hi == b.hi; }
 
-    while (sp > 0u) {
-        sp -= 1u;
-        let c = stk[sp];
-        size += 1u;
-        let col = c / 12u;
-        let row = c % 12u;
-
-        if (col > 0u && board[c - 12u] == color && (visited[(c - 12u) >> 5u] & (1u << ((c - 12u) & 31u))) == 0u) {
-            visited[(c - 12u) >> 5u] |= (1u << ((c - 12u) & 31u));
-            stk[sp] = c - 12u; sp += 1u;
-        }
-        if (col < 11u && board[c + 12u] == color && (visited[(c + 12u) >> 5u] & (1u << ((c + 12u) & 31u))) == 0u) {
-            visited[(c + 12u) >> 5u] |= (1u << ((c + 12u) & 31u));
-            stk[sp] = c + 12u; sp += 1u;
-        }
-        if (row > 0u && board[c - 1u] == color && (visited[(c - 1u) >> 5u] & (1u << ((c - 1u) & 31u))) == 0u) {
-            visited[(c - 1u) >> 5u] |= (1u << ((c - 1u) & 31u));
-            stk[sp] = c - 1u; sp += 1u;
-        }
-        if (row < 11u && board[c + 1u] == color && (visited[(c + 1u) >> 5u] & (1u << ((c + 1u) & 31u))) == 0u) {
-            visited[(c + 1u) >> 5u] |= (1u << ((c + 1u) & 31u));
-            stk[sp] = c + 1u; sp += 1u;
-        }
-    }
-
-    return size;
+fn mPop(a: M144) -> u32 {
+    let c = countOneBits(a.lo);
+    return c.x + c.y + c.z + c.w + countOneBits(a.hi);
 }
 
-// removes the group containing "start" (own visited mask), then collapses —
-// the twin of applyMove() + collapse() in asm/engine.ts
-fn removeGroupAt(start: u32) {
-    let color = board[start];
-    for (var w = 0u; w < 5u; w += 1u) { visited2[w] = 0u; }
+// lowest set bit index; callers guarantee a non-zero mask
+fn mFtb(a: M144) -> u32 {
+    if (a.lo.x != 0u) { return firstTrailingBit(a.lo.x); }
+    if (a.lo.y != 0u) { return 32u + firstTrailingBit(a.lo.y); }
+    if (a.lo.z != 0u) { return 64u + firstTrailingBit(a.lo.z); }
+    if (a.lo.w != 0u) { return 96u + firstTrailingBit(a.lo.w); }
+    return 128u + firstTrailingBit(a.hi);
+}
 
-    visited2[start >> 5u] |= (1u << (start & 31u));
-    stk[0] = start;
-    var sp = 1u;
+fn mBit(cell: u32) -> M144 {
+    let w = cell >> 5u;
+    let b = 1u << (cell & 31u);
+    return M144(vec4<u32>(
+        select(0u, b, w == 0u), select(0u, b, w == 1u),
+        select(0u, b, w == 2u), select(0u, b, w == 3u)), select(0u, b, w == 4u));
+}
 
-    while (sp > 0u) {
-        sp -= 1u;
-        let c = stk[sp];
-        board[c] = 0u;
-        let col = c / 12u;
-        let row = c % 12u;
+fn wordAt(a: M144, w: u32) -> u32 {
+    var v = select(a.lo.x, a.lo.y, w == 1u);
+    v = select(v, a.lo.z, w == 2u);
+    v = select(v, a.lo.w, w == 3u);
+    v = select(v, a.hi, w == 4u);
+    return select(v, 0u, w > 4u);
+}
 
-        if (col > 0u && board[c - 12u] == color && (visited2[(c - 12u) >> 5u] & (1u << ((c - 12u) & 31u))) == 0u) {
-            visited2[(c - 12u) >> 5u] |= (1u << ((c - 12u) & 31u));
-            stk[sp] = c - 12u; sp += 1u;
-        }
-        if (col < 11u && board[c + 12u] == color && (visited2[(c + 12u) >> 5u] & (1u << ((c + 12u) & 31u))) == 0u) {
-            visited2[(c + 12u) >> 5u] |= (1u << ((c + 12u) & 31u));
-            stk[sp] = c + 12u; sp += 1u;
-        }
-        if (row > 0u && board[c - 1u] == color && (visited2[(c - 1u) >> 5u] & (1u << ((c - 1u) & 31u))) == 0u) {
-            visited2[(c - 1u) >> 5u] |= (1u << ((c - 1u) & 31u));
-            stk[sp] = c - 1u; sp += 1u;
-        }
-        if (row < 11u && board[c + 1u] == color && (visited2[(c + 1u) >> 5u] & (1u << ((c + 1u) & 31u))) == 0u) {
-            visited2[(c + 1u) >> 5u] |= (1u << ((c + 1u) & 31u));
-            stk[sp] = c + 1u; sp += 1u;
-        }
+fn mHas(a: M144, cell: u32) -> bool {
+    return ((wordAt(a, cell >> 5u) >> (cell & 31u)) & 1u) != 0u;
+}
+
+// row + 1 inside each column (cell + 1); nothing may enter row 0
+fn mUp(a: M144) -> M144 {
+    let carry = vec4<u32>(0u, a.lo.x, a.lo.y, a.lo.z) >> vec4<u32>(31u);
+    return M144(((a.lo << vec4<u32>(1u)) | carry) & NOT_ROW0_LO,
+        ((a.hi << 1u) | (a.lo.w >> 31u)) & NOT_ROW0_HI);
+}
+
+// row - 1 inside each column (cell - 1); nothing may enter row 11
+fn mDown(a: M144) -> M144 {
+    let carry = vec4<u32>(a.lo.y, a.lo.z, a.lo.w, a.hi) << vec4<u32>(31u);
+    return M144(((a.lo >> vec4<u32>(1u)) | carry) & NOT_ROW11_LO,
+        (a.hi >> 1u) & NOT_ROW11_HI);
+}
+
+// col + 1 (cell + 12); bits past cell 143 fall off the board
+fn mRight(a: M144) -> M144 {
+    let carry = vec4<u32>(0u, a.lo.x, a.lo.y, a.lo.z) >> vec4<u32>(20u);
+    return M144((a.lo << vec4<u32>(12u)) | carry,
+        ((a.hi << 12u) | (a.lo.w >> 20u)) & 0xFFFFu);
+}
+
+// col - 1 (cell - 12)
+fn mLeft(a: M144) -> M144 {
+    let carry = vec4<u32>(a.lo.y, a.lo.z, a.lo.w, a.hi) << vec4<u32>(20u);
+    return M144((a.lo >> vec4<u32>(12u)) | carry, a.hi >> 12u);
+}
+
+fn neighborsOf(a: M144) -> M144 {
+    return mOr(mOr(mUp(a), mDown(a)), mOr(mLeft(a), mRight(a)));
+}
+
+fn colorAt(cell: u32) -> u32 {
+    return u32(mHas(pl0, cell)) | (u32(mHas(pl1, cell)) << 1u) |
+        (u32(mHas(pl2, cell)) << 2u);
+}
+
+// occupied cells whose color equals \`color\` — branchless plane intersection
+fn sameColorMask(color: u32) -> M144 {
+    let lo = occ.lo
+        & select(~pl0.lo, pl0.lo, (color & 1u) != 0u)
+        & select(~pl1.lo, pl1.lo, (color & 2u) != 0u)
+        & select(~pl2.lo, pl2.lo, (color & 4u) != 0u);
+    let hi = occ.hi
+        & select(~pl0.hi, pl0.hi, (color & 1u) != 0u)
+        & select(~pl1.hi, pl1.hi, (color & 2u) != 0u)
+        & select(~pl2.hi, pl2.hi, (color & 4u) != 0u);
+    return M144(lo, hi);
+}
+
+// bit-parallel flood fill: dilate the seed inside its color plane to fixpoint
+fn floodFrom(seed: M144, same: M144) -> M144 {
+    var grp = seed;
+    loop {
+        let grown = mAnd(mOr(grp, neighborsOf(grp)), same);
+        if (mEq(grown, grp)) { return grp; }
+        grp = grown;
     }
+}
 
-    // gravity down inside columns
+// 12-bit column field at base = col * 12; a field spans at most two words
+fn field12(a: M144, base: u32) -> u32 {
+    let w = base >> 5u;
+    let s = base & 31u;
+    let straddles = s > 20u;
+    let high = select(0u, wordAt(a, w + 1u) << (32u - s), straddles);
+    return ((wordAt(a, w) >> s) | high) & 0xFFFu;
+}
+
+fn withWordCleared(a: M144, w: u32, bits: u32) -> M144 {
+    return M144(vec4<u32>(
+        a.lo.x & ~select(0u, bits, w == 0u),
+        a.lo.y & ~select(0u, bits, w == 1u),
+        a.lo.z & ~select(0u, bits, w == 2u),
+        a.lo.w & ~select(0u, bits, w == 3u)),
+        a.hi & ~select(0u, bits, w == 4u));
+}
+
+fn withWordOr(a: M144, w: u32, bits: u32) -> M144 {
+    return M144(vec4<u32>(
+        a.lo.x | select(0u, bits, w == 0u),
+        a.lo.y | select(0u, bits, w == 1u),
+        a.lo.z | select(0u, bits, w == 2u),
+        a.lo.w | select(0u, bits, w == 3u)),
+        a.hi | select(0u, bits, w == 4u));
+}
+
+fn setField12(a: M144, base: u32, value: u32) -> M144 {
+    let w = base >> 5u;
+    let s = base & 31u;
+    var r = withWordCleared(a, w, 0xFFFu << s);
+    r = withWordOr(r, w, value << s);
+    let straddles = s > 20u;
+    r = withWordCleared(r, w + 1u, select(0u, 0xFFFu >> (32u - s), straddles));
+    r = withWordOr(r, w + 1u, select(0u, value >> (32u - s), straddles));
+    return r;
+}
+
+// gravity inside one just-cleared column; true when the column emptied —
+// the twin of the touched-column loop of collapse() in asm/engine.ts
+fn collapseColumn(col: u32) -> bool {
+    let base = col * 12u;
+    let colOcc = field12(occ, base);
+    let fallen = (1u << countOneBits(colOcc)) - 1u;
+    if (colOcc == fallen) { return colOcc == 0u; }
+    let c0 = field12(pl0, base);
+    let c1 = field12(pl1, base);
+    let c2 = field12(pl2, base);
+    var n0 = 0u;
+    var n1 = 0u;
+    var n2 = 0u;
+    var rem = colOcc;
+    var k = 0u;
+    while (rem != 0u) {
+        let j = firstTrailingBit(rem);
+        rem &= rem - 1u;
+        let bit = 1u << k;
+        n0 |= select(0u, bit, ((c0 >> j) & 1u) != 0u);
+        n1 |= select(0u, bit, ((c1 >> j) & 1u) != 0u);
+        n2 |= select(0u, bit, ((c2 >> j) & 1u) != 0u);
+        k += 1u;
+    }
+    occ = setField12(occ, base, fallen);
+    pl0 = setField12(pl0, base, n0);
+    pl1 = setField12(pl1, base, n1);
+    pl2 = setField12(pl2, base, n2);
+    return false;
+}
+
+// stable left compaction of non-empty columns; runs only when a move just
+// emptied a column, exactly like collapse() in asm/engine.ts
+fn compactColumns() {
+    var srcCols = 0u;
     for (var col = 0u; col < 12u; col += 1u) {
-        var w = 0u;
-        for (var j = 0u; j < 12u; j += 1u) {
-            let v = board[col * 12u + j];
-            board[col * 12u + j] = 0u;
-            if (v != 0u) {
-                board[col * 12u + w] = v;
-                w += 1u;
-            }
-        }
+        srcCols |= select(0u, 1u << col, mHas(occ, col * 12u));
     }
-
-    // compact non-empty columns left
-    var writeCol = 0u;
-    for (var col = 0u; col < 12u; col += 1u) {
-        if (board[col * 12u] != 0u) {
-            if (writeCol != col) {
-                for (var j = 0u; j < 12u; j += 1u) {
-                    board[writeCol * 12u + j] = board[col * 12u + j];
-                    board[col * 12u + j] = 0u;
-                }
-            }
-            writeCol += 1u;
-        }
+    // occupied columns already form a prefix — nothing to move
+    if (srcCols == (1u << countOneBits(srcCols)) - 1u) { return; }
+    var rebuiltOcc = M144(vec4<u32>(), 0u);
+    var rebuilt0 = M144(vec4<u32>(), 0u);
+    var rebuilt1 = M144(vec4<u32>(), 0u);
+    var rebuilt2 = M144(vec4<u32>(), 0u);
+    var rem = srcCols;
+    var dst = 0u;
+    while (rem != 0u) {
+        let src = firstTrailingBit(rem);
+        rem &= rem - 1u;
+        let srcBase = src * 12u;
+        let dstBase = dst * 12u;
+        rebuiltOcc = setField12(rebuiltOcc, dstBase, field12(occ, srcBase));
+        rebuilt0 = setField12(rebuilt0, dstBase, field12(pl0, srcBase));
+        rebuilt1 = setField12(rebuilt1, dstBase, field12(pl1, srcBase));
+        rebuilt2 = setField12(rebuilt2, dstBase, field12(pl2, srcBase));
+        dst += 1u;
     }
+    occ = rebuiltOcc;
+    pl0 = rebuilt0;
+    pl1 = rebuilt1;
+    pl2 = rebuilt2;
 }
 
 @compute @workgroup_size(${WORKGROUP})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
-    let child = gid.y;
-    if (t >= P.playouts || child >= P.children) { return; }
-
-    // unpack the candidate board (4 cells per word)
-    for (var c = 0u; c < 144u; c += 1u) {
-        let word = BOARDS[child * 36u + c / 4u];
-        board[c] = (word >> ((c % 4u) * 8u)) & 0xFFu;
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    if (li == 0u) {
+        atomicStore(&wgMin, 0xFFFFFFFFu);
+        atomicStore(&wgPositions, 0u);
     }
+    workgroupBarrier();
 
-    rngSeed(P.seedBase + t);
-    let tabu = TABU[child];
+    let child = wg.y;
+    let t = wg.x * ${WORKGROUP}u + li;
+    var result = 0xFFFFFFFFu;
     // Match the CPU counter exactly: one processed position is a non-terminal
     // board whose legal groups were enumerated and from which a move is made.
     // The terminal board is inspected for termination but is not expanded.
     var positions = 0u;
 
-    // playout loop — the twin of playoutRun() in asm/engine.ts
-    // (nb: "move" and "target" are reserved words in WGSL)
-    for (var mv = 0u; mv < 80u; mv += 1u) {
-        // enumerate clickable groups in ascending cell order
-        for (var w = 0u; w < 5u; w += 1u) { visited[w] = 0u; }
-        var n = 0u;
-        for (var cell = 0u; cell < 144u; cell += 1u) {
-            if ((visited[cell >> 5u] & (1u << (cell & 31u))) != 0u) { continue; }
-            let color = board[cell];
-            if (color == 0u) { continue; }
-            let size = enumFlood(cell, color);
-            if (size >= 2u && n < 80u) {
-                reps[n] = cell;
-                cols[n] = color;
-                n += 1u;
-            }
-        }
-        if (n == 0u) { break; }
-        positions += 1u;
+    if (t < P.playouts && child < P.children) {
+        let boardsBase = child * 36u;
+        ${PLAYOUT_UNPACK}
 
-        // Prefer non-tabu groups; the worker supplements this exploitation
-        // batch with full-support CPU samples.
-        var pick = 0u;
-        var cand = 0u;
-        for (var g = 0u; g < n; g += 1u) {
-            if (cols[g] != tabu) { cand += 1u; }
-        }
-        if (cand > 0u) {
-            var skip = rngNext() % cand;
-            for (var g = 0u; g < n; g += 1u) {
-                if (cols[g] != tabu) {
-                    if (skip == 0u) { pick = g; break; }
-                    skip -= 1u;
+        rngSeed(P.seedBase + t);
+        let tabu = TABU[child];
+
+        // playout loop — the twin of playoutRun() in asm/engine.ts; groups
+        // are enumerated twice per move (count, then locate the pick), which
+        // consumes exactly one rngNext() per move like the CPU and is far
+        // cheaper than spilling per-group representative arrays
+        for (var mv = 0u; mv < 80u; mv += 1u) {
+            // count clickable groups (n) and non-tabu clickable groups
+            // (cand) in ascending representative-cell order
+            var n = 0u;
+            var cand = 0u;
+            var unv = occ;
+            while (!mIsZero(unv)) {
+                let cell = mFtb(unv);
+                let color = colorAt(cell);
+                let seed = mBit(cell);
+                let grp = floodFrom(seed, sameColorMask(color));
+                unv = mAndNot(unv, grp);
+                if (!mEq(grp, seed)) {
+                    n += 1u;
+                    if (color != tabu) { cand += 1u; }
                 }
             }
-        } else {
-            pick = rngNext() % n;
+            if (n == 0u) { break; }
+            positions += 1u;
+
+            // Prefer non-tabu groups; the worker supplements this
+            // exploitation batch with full-support CPU samples.
+            var wantNonTabu = false;
+            var pick = 0u;
+            if (cand > 0u) {
+                pick = rngNext() % cand;
+                wantNonTabu = true;
+            } else {
+                pick = rngNext() % n;
+            }
+
+            // second pass: same order, stop at the picked group
+            var grp = M144(vec4<u32>(), 0u);
+            var seen = 0u;
+            unv = occ;
+            while (!mIsZero(unv)) {
+                let cell = mFtb(unv);
+                let color = colorAt(cell);
+                let seed = mBit(cell);
+                let cur = floodFrom(seed, sameColorMask(color));
+                unv = mAndNot(unv, cur);
+                if (!mEq(cur, seed) && (!wantNonTabu || color != tabu)) {
+                    if (seen == pick) { grp = cur; break; }
+                    seen += 1u;
+                }
+            }
+
+            // remove the group, then collapse — the twin of
+            // applyEnumeratedMove() + collapse() in asm/engine.ts
+            occ = mAndNot(occ, grp);
+            pl0 = mAndNot(pl0, grp);
+            pl1 = mAndNot(pl1, grp);
+            pl2 = mAndNot(pl2, grp);
+            var emptied = false;
+            for (var col = 0u; col < 12u; col += 1u) {
+                if (field12(grp, col * 12u) != 0u) {
+                    emptied = collapseColumn(col) || emptied;
+                }
+            }
+            if (emptied) { compactColumns(); }
         }
 
-        removeGroupAt(reps[pick]);
+        result = (mPop(occ) << 24u) | (P.seedOffset + t);
     }
 
-    var remaining = 0u;
-    for (var c = 0u; c < 144u; c += 1u) {
-        if (board[c] != 0u) { remaining += 1u; }
+    // One workgroup-reduced contribution per metric instead of one global
+    // atomic per playout: every thread of a workgroup shares one candidate
+    // row (child = workgroup y), so this is exact and far less contended.
+    atomicMin(&wgMin, result);
+    atomicAdd(&wgPositions, positions);
+    workgroupBarrier();
+    if (li == 0u && child < P.children) {
+        atomicMin(&OUT[child], atomicLoad(&wgMin));
+        atomicAdd(&POSITIONS[child], atomicLoad(&wgPositions));
     }
-
-    // One contended add per complete playout is negligible beside its flood
-    // fills, and avoids a high-volume per-playout result/readback.
-    atomicAdd(&POSITIONS[child], positions);
-    atomicMin(&OUT[child], (remaining << 24u) | (P.seedOffset + t));
 }
 `;
 
@@ -256,9 +494,9 @@ const EVAL_WORDS = 6;
 
 const PROFILE_DEFAULTS = Object.freeze({
     mobile: Object.freeze({ initial: 512, min: 128, max: 4096, targetMs: 40, inFlight: 1, evalThreshold: 256 }),
-    integrated: Object.freeze({ initial: 1024, min: 256, max: 8192, targetMs: 55, inFlight: 2, evalThreshold: 192 }),
-    balanced: Object.freeze({ initial: 1024, min: 256, max: 8192, targetMs: 60, inFlight: 2, evalThreshold: 160 }),
-    discrete: Object.freeze({ initial: 2048, min: 512, max: 16384, targetMs: 75, inFlight: 3, evalThreshold: 96 }),
+    integrated: Object.freeze({ initial: 1024, min: 256, max: 16384, targetMs: 55, inFlight: 2, evalThreshold: 192 }),
+    balanced: Object.freeze({ initial: 1024, min: 256, max: 16384, targetMs: 60, inFlight: 2, evalThreshold: 160 }),
+    discrete: Object.freeze({ initial: 2048, min: 512, max: 65536, targetMs: 75, inFlight: 3, evalThreshold: 96 }),
 });
 
 function clamp(value, lo, hi) {
@@ -449,6 +687,20 @@ export async function createGpu(options = {}) {
     } catch {
         // Adapter identity is optional and often intentionally redacted.
     }
+    // Model tag for the telemetry row. Chrome blanks device/description, so
+    // fall back to the WebGL renderer string — but only when it names the
+    // same vendor: on dual-GPU machines WebGL may run on the other adapter,
+    // and a confidently wrong model is worse than the architecture tag.
+    let adapterModel = compactGpuModel(adapterInfo.device) ||
+        compactGpuModel(adapterInfo.description);
+    if (adapterModel === "") {
+        const renderer = probeWebglRenderer();
+        const vendor = (adapterInfo.vendor ?? "").toLowerCase();
+        if (renderer !== "" && (vendor === "" || renderer.toLowerCase().includes(vendor))) {
+            adapterModel = compactGpuModel(renderer);
+        }
+    }
+    adapterInfo.model = adapterModel || adapterInfo.architecture || "";
 
     const ua = navigator.userAgent ?? "";
     const mobile = navigator.userAgentData?.mobile === true || /iPhone|iPad|iPod|Android|Mobile/i.test(ua) ||

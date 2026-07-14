@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import {
     calculateRecommendedGpuPlayouts,
+    compactGpuModel,
     dominantColor,
     evaluateBoardFeatures,
     gpuProfileFor,
@@ -20,6 +21,22 @@ assert.equal(gpuProfileFor({ vendor: "AMD", description: "AMD Radeon RX 7900 XTX
 assert.equal(gpuProfileFor({ vendor: "AMD", description: "Radeon Pro W7800" }), "discrete");
 assert.equal(gpuProfileFor({ vendor: "NVIDIA" }, true), "mobile");
 assert.equal(gpuProfileFor({}, false), "balanced");
+
+assert.equal(compactGpuModel("NVIDIA GeForce RTX 4080"), "RTX4080");
+assert.equal(compactGpuModel(
+    "ANGLE (NVIDIA, NVIDIA GeForce RTX 4080 (0x00002704) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    "RTX4080");
+assert.equal(compactGpuModel(
+    "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x00004680) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    "UHD770");
+assert.equal(compactGpuModel("AMD Radeon RX 7900 XTX"), "RX7900XTX");
+assert.equal(compactGpuModel("Intel(R) Arc(TM) A770 Graphics"), "ArcA770");
+assert.equal(compactGpuModel("Apple M2 Pro"), "M2Pro");
+assert.equal(compactGpuModel("Qualcomm Adreno 740"), "Adreno740");
+assert.equal(compactGpuModel("AMD Radeon(TM) Graphics"), "",
+    "brand-only APU names carry no model and fall back to the architecture tag");
+assert.equal(compactGpuModel(""), "");
+assert.equal(compactGpuModel(undefined), "");
 
 const initialDesktop = calculateRecommendedGpuPlayouts("discrete", 80);
 assert.equal(initialDesktop, 2048);

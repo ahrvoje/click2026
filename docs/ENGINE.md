@@ -112,6 +112,7 @@ every lane as replay-validated warm starts.
 | `tools/engine.test.mjs` | Node proof of rule equivalence + search validity |
 | `tools/engine.pool.test.mjs` | lane selection, root partition and sound merge tests |
 | `tools/gpu.test.mjs` | GPU profile, packing, counters and CPU-twin helper tests |
+| `tools/gpu.kernel.test.mjs` | word-level bitplane-kernel twin vs per-cell playout oracle |
 | `tools/engine.tune.mjs` | evaluation weight tuning harness |
 | `tools/engine.e2e.mjs` | headless-browser end-to-end check |
 
@@ -680,9 +681,9 @@ profile from mobile hints and available adapter identity:
 | Profile | Samples/root (initial; range) | Target batch | In-flight slots |
 | --- | --- | --- | --- |
 | mobile | 512; 128–4096 | 40 ms | 1 |
-| integrated | 1024; 256–8192 | 55 ms | 2 |
-| balanced/unknown | 1024; 256–8192 | 60 ms | 2 |
-| discrete | 2048; 512–16384 | 75 ms | 3 |
+| integrated | 1024; 256–16384 | 55 ms | 2 |
+| balanced/unknown | 1024; 256–16384 | 60 ms | 2 |
+| discrete | 2048; 512–65536 | 75 ms | 3 |
 
 After the first batches, `recommendPlayouts()` uses an EWMA of observed
 aggregate playout throughput, the number of candidate rows and the profile's
@@ -695,10 +696,20 @@ responsive while giving a desktop discrete GPU enough independent work.
 The hard-tabu WGSL kernel is the deterministic twin of `playoutRun()` in
 `asm/engine.ts`: same xorshift128 RNG, ascending-cell enumeration, dominant-
 color taboo and stable collapse. Boards travel packed four cells per `u32`.
-Each playout thread atomically contributes its exact expanded-board count—one
+Internally each thread keeps the whole game as register-resident bitplanes —
+an occupancy mask plus three color-bit planes of 144 bits (`vec4<u32>` + `u32`
+each) — so flood fill is bit-parallel dilation and gravity/compaction are
+12-bit column-field operations, with no per-thread arrays spilled to device
+memory. Groups are enumerated twice per move (count, then locate the RNG
+pick), which consumes exactly one `rngNext()` per move like the CPU twin.
+`tools/gpu.kernel.test.mjs` proves the word-level algorithm equivalent to a
+per-cell oracle across randomized boards, seeds and taboo colors.
+Each playout thread contributes its exact expanded-board count—one
 for every non-terminal board from which it applies a move, matching the CPU
 playout definition; the final terminal board is excluded—and competes to write
-`(finalRemaining << 24) | seedIndex`. Readback is therefore
+`(finalRemaining << 24) | seedIndex`. Both metrics are reduced inside the
+workgroup first (all 64 threads of a workgroup sample the same candidate row),
+so the storage buffers see one atomic per metric per workgroup. Readback is
 two `u32` values per candidate (best result plus position count), not a result
 per GPU thread.
 
@@ -706,10 +717,11 @@ Large logical batches are split by candidate and sample ranges and striped
 over a private pool of 1–3 resources in the normal profiles (the API permits
 up to 4 for tests/overrides). Multiple dispatches can be queued while another
 slot is mapping its tiny readback. After the initial feature assist, a bounded
-pump keeps one logical batch continuously queued across CPU beam, proof and
-exact stages. Completion refreshes the unresolved-root snapshot, replay-
-verifies winning seeds in WASM, then queues the successor at a macrotask
-boundary. If lane 0 finishes its CPU-owned roots first, it remains a GPU
+pump keeps up to two logical batches continuously queued across CPU beam,
+proof and exact stages, so the JS turnaround of a completed batch (verify,
+collect, repack) overlaps device execution of its successor. Completion
+refreshes the unresolved-root snapshot, replay-verifies winning seeds in WASM,
+then refills the pipeline at a macrotask boundary. If lane 0 finishes its CPU-owned roots first, it remains a GPU
 caretaker while satellite lanes continue, so useful position-wide GPU sampling
 does not stop merely because lane 0's root partition finished. Once every
 CPU-only peer has posted `settled`, the pool sends a job-scoped `stop-caretaker`
@@ -858,7 +870,14 @@ in sync.
   column three in both processor rows, placing both totals directly under the
   combined total. Column four places each processor's share of evaluated
   positions directly under wall time; the displayed CPU and GPU percentages
-  are complementary and therefore always total 100%. Beam/playout counters,
+  are complementary and therefore always total 100%. The row labels carry a
+  compact silicon tag: `GPU/RTX4080` — derived from the WebGPU adapter
+  identity, falling back to the WebGL renderer string when it names the same
+  vendor, then to the architecture — so a dual-GPU machine reveals at a
+  glance which adapter the engine actually received. Browsers expose no CPU
+  model, so the CPU label carries the best available identification,
+  UA-CH architecture/bitness or mobile device model: `CPU×16/x64`.
+  Beam/playout counters,
   duty, batches and busy time are kept
   out of the visible panel. They, the selected device profile and adapter
   identity remain available in tooltips without consuming visible telemetry
