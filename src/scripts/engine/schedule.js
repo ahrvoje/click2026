@@ -69,6 +69,46 @@ export function roundRobinPrefixTasks(parents) {
     return tasks;
 }
 
+// Reconstruct the task order and lane identity a position receives after its
+// parent move is actually played. `branches` must be in the clicked board's
+// stable root-index order; tasks within a branch are already in that root's
+// preferred order. Ownership is the parent-major ordinal, while execution is
+// diagonal/round-robin across roots. Keeping both values is what makes a
+// receding parent search comparable to the post-click search.
+export function mirrorClickedPrefixTasks(branches, limit = Infinity) {
+    let ordinal = 0;
+    const indexed = Array.from(branches ?? [], (branch) =>
+        Array.from(branch?.tasks ?? [], (task) => ({
+            ...task,
+            postClickOrdinal: ordinal++,
+        })));
+    const rounds = indexed.reduce((max, tasks) => Math.max(max, tasks.length), 0);
+    const ordered = [];
+    const bounded = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : Infinity;
+    for (let round = 0; round < rounds && ordered.length < bounded; round++) {
+        for (const tasks of indexed) {
+            if (round < tasks.length) ordered.push(tasks[round]);
+            if (ordered.length >= bounded) break;
+        }
+    }
+    return ordered;
+}
+
+// Stable ownership for a fixed search context. Unlike a sequential ordinal,
+// this does not change when another lane has already proved and omitted an
+// unrelated parent. That lets workers build only their still-live context
+// queues without duplicating work or leaving a prefix unassigned.
+export function prefixTaskOwner(cell, prefix, laneCount) {
+    const lanes = Math.max(1, Math.floor(Number(laneCount) || 1));
+    let hash = (Math.floor(Number(cell) || 0) + 1) >>> 0;
+    for (const move of prefix ?? []) {
+        hash ^= (Math.floor(Number(move) || 0) + 1) >>> 0;
+        hash = Math.imul(hash, 0x45D9F3B) >>> 0;
+        hash ^= hash >>> 16;
+    }
+    return hash % lanes;
+}
+
 // A suffix of an exact root line is exact in the next position only when that
 // position is the actual board produced by the root move. Replaying the suffix
 // on some other board validates a constructive score, never its lower bound.
@@ -117,7 +157,7 @@ export function analysisState(proof, stopped) {
     return stopped ? "settled" : "analyzing";
 }
 
-// Lane zero owns the only WebGPU device.  Its modulo-owned CPU roots can be
+// Lane zero owns the only WebGPU device. Its ordinal-owned CPU roots can be
 // finished before satellite workers have proved their roots; stopping that
 // worker at that point also stops otherwise useful, position-wide GPU
 // playouts.  Keep it alive only while there is genuine unresolved work.  The
@@ -125,60 +165,6 @@ export function analysisState(proof, stopped) {
 // stale position or failed device.
 export function shouldGpuCaretake(moves, lane, gpuState) {
     return lane === 0 && gpuState === "on" && moves.some((move) => !move.exact);
-}
-
-// Pre/post-play proof parity. A root just above the exact gate crosses it
-// after a single removal: the moment it is played, its child position runs
-// the escalating value ladder on its own compact moves and can prove in
-// seconds what the parent never attempted. Select exactly the threatening
-// roots inside that one-move band — a distant root gets no ladder after
-// being played either, so it must not receive speculative exact work or
-// block settlement. Tight score/lower gaps first: cheapest proofs land
-// soonest.
-export function parityProofCandidates(moves, {
-    childRemainingOf, maxChildGroupOf, exhaustedOf, gate, cap,
-}) {
-    if (moves.length === 0) return [];
-    const incumbent = moves[0].score;
-    return moves
-        .filter((move) => {
-            if (move.exact) return false;
-            const remaining = childRemainingOf(move);
-            if (remaining <= gate) return false;
-            if (remaining - maxChildGroupOf(move) > gate) return false;
-            if (exhaustedOf(move) >= cap) return false;
-            const canImprove = move.lower < incumbent;
-            const canAlsoClear = incumbent === 0 && move.score > 0 && move.lower === 0;
-            return canImprove || canAlsoClear;
-        })
-        .sort((a, b) => (a.score - a.lower) - (b.score - b.lower) ||
-            a.score - b.score || b.size - a.size || a.cell - b.cell);
-}
-
-// Constructive parity farther above the gate. The moment such a root is
-// played, its child re-runs the bounded proof seeks one ply deeper — every
-// (second, third) prefix gets its own 100k/1M turn plus per-second B&B
-// probes — which is how an unproved row flips to a proven zero within a
-// second of being played. Mirror that aggregate branch budget pre-play by
-// escalating the one-shot virtual-child pair seeks for every root that can
-// still improve the incumbent or match a zero. Only boards small enough that
-// the played child could actually prove quickly participate; anything larger
-// has no discontinuity to mirror.
-export function pairAuditCandidates(moves, {
-    childRemainingOf, exhaustedOf, gate, boardRemaining, maxRemaining,
-}) {
-    if (moves.length === 0 || boardRemaining > maxRemaining) return [];
-    const incumbent = moves[0].score;
-    return moves
-        .filter((move) => {
-            if (move.exact || exhaustedOf(move)) return false;
-            if (childRemainingOf(move) <= gate) return false;
-            const canImprove = move.lower < incumbent;
-            const canAlsoClear = incumbent === 0 && move.score > 0 && move.lower === 0;
-            return canImprove || canAlsoClear;
-        })
-        .sort((a, b) => (a.score - a.lower) - (b.score - b.lower) ||
-            a.score - b.score || b.size - a.size || a.cell - b.cell);
 }
 
 // Exact-ladder rotation: every in-band root gets its bounded value attempt

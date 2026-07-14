@@ -88,12 +88,17 @@ canvas + engineList                                      └─► lane N-1: com
 `EngineWorkerPool` uses ordinary independent workers and private WASM memories,
 not `SharedArrayBuffer`. It therefore works from static GitHub Pages without
 COOP/COEP headers. Root-scoped work is divided deterministically by the root's
-representative cell modulo the active lane count. Lane 0 owns WebGPU; the other
-lanes are CPU-only. The finite virtual-child portfolio instead numbers its
-complete `(first, second)` task list before filtering, then assigns consecutive
-ordinals modulo the lane count; representative-cell clustering therefore
-cannot leave workers idle. Results are soundly combined on the main thread and
-useful lines/proofs are sent back to every lane as replay-validated warm starts.
+stable enumeration ordinal modulo the active lane count. Root enumeration is
+ascending by representative cell, so every worker agrees on ownership while
+lane root counts differ by at most one. Lane 0 owns WebGPU; the other lanes are
+CPU-only. The bounded virtual-child portfolio likewise partitions its complete
+second-ply task list by stable ordinal. For the deeper pre-click consistency
+portfolio, each unresolved first move independently recreates the task ordinals
+that its child position would receive after that move was clicked; ownership is
+`postClickOrdinal % lanes`. Execution is diagonally interleaved across that
+child's roots and then round-robin across the original parent rows. Results are
+soundly combined on the main thread and useful lines/proofs are sent back to
+every lane as replay-validated warm starts.
 
 | File | Role |
 | --- | --- |
@@ -126,12 +131,14 @@ of the reported memory can reduce that count. The API is privacy-rounded and
 often capped, so it is used as a low-memory guard rather than proof that a
 desktop has little RAM.
 
-Lane 0 loads the full 2^23-entry value memo and starts at about 178 MiB of WASM
-linear memory. Each additional lane loads a compact 2^18-entry memo and starts
-at about 37 MiB. Compact lanes can still run every search stage on their owned
-roots; their smaller memo trades exact-search cache retention for safe total
-memory. Sixteen lanes reserve about 733 MiB in total. Use `?engineWorkers=N`
-to force 1–16 lanes for diagnosis and benchmarks.
+Lane 0 loads the full 2^23-entry value/certificate memo and starts at about
+178 MiB of WASM linear memory. Each additional lane loads a compact 2^20-entry
+memo and starts at about 46 MiB. Compact lanes can still run every search stage
+on their owned roots; their smaller memo trades exact-search cache retention
+for safe total memory. Sixteen lanes reserve about 868 MiB in total. The
+`deviceMemory` guard is applied only to reported values below 8 GiB, because
+browsers commonly cap the value at 8 GiB even on larger desktops. Use
+`?engineWorkers=N` to force 1–16 lanes for diagnosis and benchmarks.
 If a lane fails, the pool restarts all lanes with one fewer worker because the
 modulo partition changes with `N`; continuing the survivors would abandon the
 failed lane's roots.
@@ -159,10 +166,11 @@ Implemented in `worker.js::analyze()` independently in every lane; every stage
 refines that lane's per-root result table inside WASM and posts a snapshot to
 the pool. Each worker constructs the same immediate greedy table so a complete
 move list is available at once. CPU playouts, partitioned global beams,
-root-private beams, bounded proof probes and exact ladders then work only on
-roots owned by that lane. Stochastic lanes receive independent non-zero seed
-streams. The stable modulo partition is exhaustive and disjoint; changing the
-lane count requires a complete pool restart.
+root-private beams, bounded proof probes and exact ladders normally work only
+on roots owned by that lane; the finite virtual-prefix stages described below
+apply their own deterministic cross-lane partition. Stochastic lanes receive
+independent non-zero seed streams. The stable root partition is exhaustive and
+disjoint; changing the lane count requires a complete pool restart.
 
 For each root, the pool retains the minimum replayable score (constructive
 upper bound) and maximum sound lower bound. One exact result proves that root;
@@ -175,15 +183,18 @@ heuristic or malformed line into a score or proof.
 0. **Warm start** (`seedFromMemory` → `seedLine`/`seedExactByCell`): each
    worker keeps an LRU cache (64 positions) of every move list it has
    posted. A new analysis is seeded with the cached lines of its own
-   position plus the *suffixes* of the previous position's lines. A suffix is
-   always only a constructive upper bound unless the new board exactly equals
-   the recorded one-ply child of that previous root; only that real edge may
-   transfer the previous row's exact flag. For rewind/general transposition reuse it also
+   position plus the *suffixes* of the previous position's lines. A suffix
+   that replays on the new board is always only a constructive upper bound
+   unless the new board key equals the exact one-ply child recorded for that
+   previous root move. Only that actual parent→child relation may transfer the
+   previous row's exact flag; replaying the same legal suffix on an unrelated
+   board cannot transfer its lower-bound proof. For rewind/general
+   transposition reuse the worker also
    materializes each one-ply child; if that child board is cached, its line is
    prepended with the creating root move. Every seed is replay-validated
-   inside WASM before being merged (wrong guesses are rejected, never
-   trusted), and same-board/actual-child proof flags are restored only when
-   the seeded score matches. Consequence:
+   inside WASM before being merged (wrong guesses are rejected, never trusted).
+   Same-board cached proofs are restored when the seeded score matches, and a
+   proved cached child may prove its creating parent row. Consequence:
    playing a suggested `0 ★` move can never make the engine "lose" the
    clearing line, and revisiting a position (rewind) restores everything
    it ever knew about it instantly.
@@ -234,29 +245,42 @@ heuristic or malformed line into a score or proof.
    remaining plus proved-permanent cells. This bounded orthogonal objective
    preserves corridors that temporarily accumulate fragments/frozen colors
    immediately before a gravity merge, instead of asking random noise to
-   overcome the same scalar bias in every beam. Its bounded heap admission is
-   independent of the root's previously found nonzero score, so an earlier
-   improvement cannot change this complementary pass enough to hide a clear.
-6. **Virtual-child consistency portfolio**: after the initial width-2048
-   beam, unresolved parents whose child remains above the `≤ 88` exact gate
-   materialize their legal second moves. Compact children skip this portfolio
-   and enter the persistent exact ladder immediately. The complete stable
-   `(first, second)` list is assigned by `pairOrdinal % lanes`, and
+   overcome the same scalar bias in every beam. Its bounded frontier ignores
+   the current nonzero incumbent when pruning, so an earlier score improvement
+   cannot paradoxically hide a clearing corridor from the complementary pass.
+6. **Virtual-child and receding-horizon consistency portfolio**: after the
+   initial width-2048 beam, every unresolved parent whose child remains above
+   the exact gate materializes its legal second moves. The complete sorted
+   `(first, second)` list receives a stable ordinal partition across lanes, and
    all lanes remain alive until this bounded audit finishes. This is the same
    decomposition the engine would receive after the player clicked `first`;
-   second moves no longer compete forever inside one first-root heap.
-   `exactBeginRootChildSeek` first gives every pair a 100k-node lower-bound
-   target seek, round-robin across parent rows. Still-unresolved rows then get
-   a bounded 1 M-node child-equivalent sweep in the same parent-fair order.
-   Explicit prefix beams follow at
-   widths 128, 512 and 2048 with deterministic and two diversified seeds.
-   Larger second groups go first within a parent, matching the broad-child
-   proof policy. Every retained line contains `[first, second, ...tail]` and
-   is replayable from the original board. A prefix result is constructive only;
-   it proves the parent exactly when its score meets that parent's independent
-   admissible lower bound. Exhaustion or one completed non-winning branch can
-   never assert a proof. Work is bounded and linear in the legal two-move
-   prefixes, rather than an uncontrolled recursive expansion of child jobs.
+   second moves no longer compete forever inside one first-root heap. Each pair
+   gets the clicked child's one-ply table, hard/soft playouts, fair 100k- and
+   1 M-node target-seek tiers, and explicit prefix beams at widths 128, 512 and
+   2048 (deterministic plus two diversified width-2048 seeds).
+
+   A click would expose the same problem one ply deeper, so still-live parents
+   also receive a bounded third-ply frontier. For each original parent, second
+   moves remain in the clicked board's stable root-index order; the third moves
+   below each second move are ordered largest-first. A parent-major
+   `postClickOrdinal` is assigned before scheduling, exactly reproducing the
+   lane identity (`postClickOrdinal % lanes`) that the task would have after the
+   original parent was clicked. Execution then diagonally interleaves the
+   second branches so each gets its first third-move context before any gets a
+   second, and round-robin interleaves the original parents. At most 256
+   `[second, third]` contexts per parent enter this frontier. Proving or
+   filtering an unrelated original parent therefore cannot renumber, duplicate
+   or orphan another parent's work. Every context gets a 100k-node target
+   probe; rows within five cells of their sound bound also get width-128/2048
+   beams and a later 1 M-node probe.
+
+   Every retained line contains `[first, second, third, ...tail]` as applicable
+   and is replayable from the original board. Prefix work is constructive only:
+   a target witness may prove the parent when it meets that parent's independent
+   admissible lower bound, but exhaustion or a completed non-winning prefix
+   never raises the parent bound. The 256-context cap is deliberate: exhaustive
+   first×second×third expansion caused multi-billion-node stalls and merely
+   moved the search cliff one ply instead of repairing it.
 7. **Large-board position-proof portfolio**: after the virtual-child audit, a
    child above the `remaining ≤ 88` persistent-exact gate receives
    a fair, bounded branch-and-bound pass. Up to 16 unresolved roots whose lower
@@ -308,55 +332,21 @@ heuristic or malformed line into a score or proof.
      hopefuls (GPU batch of 1024 hard-tabu samples/root plus a small CPU
      soft-tabu supplement when available; otherwise CPU 48+6 samples for
      prioritized moves and 8+1 for the rest);
-   * the **exact-proof ladder** (Section 6): after the initial playout and
-     widening schedule, root children with `parentRemaining - move.size ≤ 88`
-     receive exact
-     chunks back-to-back instead of interleaving full width-16384 beams with
-     a retained exact frontier when every unresolved owned child qualifies.
-     On mixed boards, eligible children receive one bounded quantum per cycle
-     so one threshold-crossing root cannot starve the rest. At child remaining
-     `≤ 64` the ladder first tries a 2 M-node
-     incumbent-driven branch and bound; larger positions go directly to the
-     persistent exact-value memo because the fixed probe was pure discarded
-     work on the collected tails. Value retries retain both the DFS frontier
-     and completed entries. Per-attempt budgets escalate ×4 up to the
-     WASM-safe i32 limit, while total progress remains unbounded. A finished
-     proof marks the row ✓.
-   * **near-gate proof parity**: a threatening root whose child sits just
-     above the `≤ 88` exact gate would enter the persistent exact ladder the
-     moment it is played — one more removal takes a grandchild under the
-     gate — so it used to be unprovable before the move and proved in under
-     a second after it. When no compact child is left, the ladder now gives
-     exactly those roots (child within its own largest group of the gate,
-     still able to improve the incumbent or match a zero) the same
-     escalating `vsBegin` value attempts pre-play, 8 M ×4 capped at a
-     32 M-node parity budget per root — roughly what the child's first
-     post-play seconds buy. Once the width ladder is exhausted and the
-     max-width audit is covered, these quanta run back-to-back like the
-     post-play ladder. The engine cannot settle while a parity candidate
-     remains neither proved nor probed to the cap.
-     Farther above the band, threatening roots keep the *constructive* side
-     of the same guarantee: playing such a move makes the child re-run its
-     whole virtual-child portfolio one forced ply deeper — every
-     `(second, third)` prefix gets a 100k then a 1 M-node target seek plus
-     deterministic and diversified prefix beams — which is how an unproved
-     `1` row used to flip to a proven `0` within a second of being played.
-     One free ply of depth costs more than an order of magnitude: measured
-     on that regression, a `(first, second)` seek at 16 M nodes and a
-     width-8192 `(first, second)` beam both miss zeros the child's 1 M
-     `(second, third)` seeks or width-2048 beams find quickly. Pre-play, the
-     audit therefore gives every `(first, second, third)` prefix of a
-     threatening root the identical schedule (`exactBeginRootChildSeek3`,
-     `beamBeginRootGrandchild`): 100k/1M seeks targeting the root's
-     admissible lower bound, then beams at 128/512/2048 with the same three
-     seeds, triples lane-partitioned by stable ordinal and budget tiers
-     rotated across roots. It runs only on boards of at most 120 remaining
-     cells — beyond that even the played child cannot prove quickly, so
-     openings neither burn speculative exact work nor delay settlement.
-     Once the position value is certified, or the width ladder is exhausted
-     with the max-width audit covered, all pending parity work runs
-     back-to-back instead of paying a max-width beam between quanta.
-     Settlement waits for both audits.
+   * the **threshold/exact-proof ladder** (Section 6): after the initial
+     playout and widening schedule, root children with
+     `parentRemaining - move.size ≤ 88` are eligible for a pool-coordinated
+     fixed-prefix threshold frontier. With a positive position incumbent `U`,
+     its tasks ask the cheaper Boolean question whether a threatening child can
+     reach `U-1`. A witness improves the constructive line; a row lower bound
+     rises to `U` only after the coordinator has received exhaustive misses for
+     that row's complete dependency set. The coordinator deduplicates exact
+     board states across roots and paths before redistributing deeper work.
+     Once the position value is known, the conventional B&B/value ladder keeps
+     proving alternative rows. At child remaining `≤ 64` it first tries a
+     2 M-node incumbent-driven B&B; 65–88 goes directly to the persistent exact
+     value memo. Value retries retain their DFS frontier and completed cache
+     entries; budgets escalate ×4 up to the WASM-safe i32 limit. A finished
+     exact proof marks the row ✓.
    Proof and terminal states are distinct. **`optimal ✓`** means the global
    position bounds agree, so the best achievable score cannot change; the
    worker nevertheless keeps the existing playout, locked-pass and max-width
@@ -369,8 +359,7 @@ heuristic or malformed line into a score or proof.
    means an as-yet-unproved position reached 24 completed, unchanged *global*
    width-16384 passes above the proving gate, after the private max-width audit
    described above; locked and submaximal passes do not consume that budget.
-   Any unresolved child inside the exact gate, and any near-gate parity
-   candidate not yet proved or probed to its cap, also blocks settlement.
+   Any unresolved child inside the exact gate also blocks settlement.
    The engine stops honestly instead of cycling. An optimal position can also
    finish that alternative audit without losing its `optimal` state; the
    protocol's independent `settled` flag says whether compute has stopped.
@@ -494,17 +483,16 @@ Budgeted branch & bound DFS (`exactBegin`/`exactStep`/`exactMerge`):
 * upper bound: best line already known from the beams (start value);
 * lower bound (admissible): propagated permanent cells plus newly created
   singleton colors; subtrees whose bound reaches the incumbent are cut;
-* transposition table: 2^20 entries in four-way buckets, keyed by Zobrist
-  hash (replacement can cause re-expansion but never an invalid prune);
+* transposition table: a dedicated 2^20-entry four-way seen table, keyed by
+  Zobrist hash. A primary whole-position `exactBegin` pass can instead borrow
+  available key/stamp slots from the 2^23-entry value table as a transient,
+  larger duplicate filter; exact values and threshold certificates are never
+  overwritten by that pass. Replacement or a protected full bucket can cause
+  re-expansion but never an invalid prune;
 * child boards are generated directly in the next explicit-stack frame, and
   remaining count, lower bound and hash are fused into one board scan;
 * explicit stack, budget-limited and resumable in chunks, so it never
   blocks the worker loop.
-
-Completing a whole-position solve with value `V` also proves that every root
-subtree has value at least `V`. `exactMerge` therefore raises every root lower
-bound to `V`; any already replayable row scoring `V` becomes exact immediately,
-while rows with a larger constructive score remain unresolved.
 
 Entry points sharing the machinery:
 
@@ -516,12 +504,15 @@ Entry points sharing the machinery:
 * `exactChildSeek(k, budget, target)` — like the child solve but with a
   *known* target value. It stops at the first matching terminal witness; the
   target was already proven by the value solver, so a second proof is waste;
-* `exactBeginRootChildSeek(k, second, budget, target)` /
-  `exactCommitRootChild(k, second)` — a fair target seek below one explicit
-  two-move prefix. The commit is guarded by the active prefix identity and
-  prepends both moves to the recorded line. Completing or exhausting one
-  second branch never proves the whole parent; only a constructive target that
-  meets the independently computed parent lower bound can set the exact flag.
+* `exactBeginRootPrefixSeek(k, prefixLen, budget, target)` /
+  `exactCommitRootPrefix(token)` — a target seek below an arbitrary explicit
+  prefix supplied through IO. The positive begin-generation token prevents a
+  stale completion from attaching a witness to a later prefix. The saved root
+  and prefix are prepended to the recorded tail. The older
+  `exactBeginRootChildSeek`/`exactCommitRootChild` pair is the one-prefix-move
+  wrapper used by the second-ply portfolio. Completing or exhausting one
+  prefix never proves the whole parent; only a constructive target that meets
+  the independently computed parent lower bound can set the exact flag.
 
 Above the persistent-exact gate, the post-beam position-proof portfolio uses
 the same child B&B machinery with a hard 2 M-node budget per root. It is a
@@ -531,6 +522,70 @@ budget exhaustion preserves a better replayable terminal line but does not
 claim that root is exact. The portfolio terminates early when the minimum
 constructive score equals the minimum admissible root bound. Continuous beam
 and playout work then remains available to improve or prove the other rows.
+
+### Threshold-certificate solver
+
+For a positive incumbent, computing every exact minimax value answers more
+than the position proof requires. `thresholdBegin(target)` and
+`thresholdBeginChild(k, target)` instead decide whether any terminal with
+`remaining ≤ target` exists. `thresholdStep` is a resumable explicit-stack
+OR-DFS. A witness is copied into a durable replayable line. A state is stored
+as a no-target certificate only after all of its children have failed, so the
+context-free statement is exactly `value > target`; budget exhaustion never
+creates a certificate or raises a bound. `thresholdMerge` raises every root
+lower bound after a completed whole-position miss, but only root `k` after a
+completed child miss.
+
+The threshold solver shares the persistent value table using disjoint stamp
+ranges:
+
+* `0` is empty;
+* `1` is an exact value plus policy move;
+* `2..146` encodes the certificate `value > stamp - 2`;
+* `147..255` is reserved for transient generations of the primary's wide
+  whole-position B&B seen set.
+
+An exact value is stronger than a certificate. A certificate for target `T`
+also discharges every lower target, while an exact value at or below `T`
+supplies witness-first move ordering. Four-way replacement prefers durable
+exact entries and larger completed sub-DAGs; declining or losing a cache entry
+causes only safe re-expansion.
+
+For a positive incumbent `U`, the pool coordinates a complete fixed-prefix
+frontier at target `U - 1` for every row with
+`lower ≤ U - 1 < score` whose child has at most 88 cells. The initial frontier
+has one empty-prefix task per candidate.
+Tasks in each broadcast frontier have stable ordinal ownership
+(`taskOrdinal % lanes`), so a retry stays on the same lane. A worker runs
+`thresholdBeginRootPrefix` with a 250k-node budget. If that budget is exhausted
+before the fixed prefix reaches length three, it returns the task's *complete*
+legal-child manifest and a materialized 144-byte successor board for each
+child; the next round can split again through prefix depth three.
+
+The pool groups successor tasks by exact equality of all 144 board bytes, not
+by a Zobrist or content hash. One representative task retains every
+participating root alias, with one replayable prefix per root, so commuting
+move orders are searched once without losing any root's proof obligation. A
+prefix miss discharges all of its aliases, but a root lower bound rises to `U`
+only after every dependency currently representing that root has returned an
+exhaustive miss. A split never counts as a miss. Thus state sharing reduces
+work without letting a partial frontier certify a row.
+
+At prefix depth three, an exhausted hard task rotates behind the other tasks
+assigned to its lane while completed value-table certificates are retained.
+Its budget doubles on each return from 250k up to 8 M nodes; a lone task can
+resume directly. A frontier is hard-limited to 8192 unique board states and
+65536 root aliases. Exceeding either limit cancels and blacklists that
+`(position, target)` plan instead of truncating it, because dropping one branch
+would make a later lower bound unsound. A witness improves the constructive
+line and causes an obsolete target plan to be replaced; changing the board or
+plan epoch likewise cancels stale work.
+
+The worker-local `thresholdBeginChild` path remains available to the ordinary
+exact ladder when no coordinated plan is active. Its first retained attempt is
+8 M nodes and retries escalate ×4 up to 2 B nodes. Changing its root/target or
+starting an incompatible exact/value search cancels that retained DFS state,
+so a stale decision cannot be merged into another obligation.
 
 ### Value solver (`vsBegin` / `vsStep` / `vsBuildLine`)
 
@@ -542,9 +597,9 @@ child reaches that board's admissible lower bound: no remaining child can do
 better, so the stored value is still exact. Values, a best move and the
 state's remaining count are stored in a persistent, four-way memo. The primary
 lane uses 2^23 entries (`VTT`, 96 MiB across keys/data/occupancy/depth); compact
-satellites use 2^18 entries. Full buckets evict the lowest-remaining state,
-retaining the larger sub-DAG that is more expensive to reconstruct. Entries
-are shared within one worker
+satellites use 2^20 entries. Full exact-value buckets evict the
+lowest-remaining state, retaining the larger sub-DAG that is more expensive to
+reconstruct. Entries are shared within one worker
 
 * across that lane's owned root moves and budget escalations,
 * across later analysis positions in the same worker — playing a move turns
@@ -576,14 +631,32 @@ Root separator bounds propagate monotonically. Recomputing the geometric
 fixed point at every node reduced nodes but increased time, so it is refreshed
 only once when a path first enters the final eight cells.
 
-The persistent exact-value ladder is gated per root at
+The persistent threshold/exact ladder is gated per root at
 `parentRemaining - rootGroupSize ≤ 88`, which is exactly the remaining count
-seen after that move is played. Child positions at or below 56 run eight chunks
-per scheduler quantum; 57–88 run four. When all unresolved owned roots qualify,
-the next exact quantum follows immediately. A mixed board interleaves those
-bounded quanta with heuristic work, and cannot settle while an eligible child
-remains unresolved. Above the per-child gate, the bounded virtual-child and
-per-root B&B portfolios run before continuous heuristic search. For those beams,
+seen after that move is played. With a positive incumbent `U`, the coordinated
+frontier described above takes precedence and seeks `U-1`; its bounded slices
+yield to the event loop but not to another CPU heuristic pass while that plan
+remains active. The position becomes optimal once every threatening row's
+complete aliased dependency set has missed and all effective root lowers reach
+`U`, without enumerating irrelevant values above `U`. The exact-value phase
+still follows to prove alternative rows. In the worker-local ladder, child
+positions at or below 56 run eight chunks per scheduler quantum and 57–88 run
+four; mixed boards interleave those local quanta with heuristic work. The
+engine cannot settle while an eligible proof obligation remains unresolved.
+
+Two scheduling rules keep the ladder from stalling on hard rows. Value
+attempts rotate least-invested-first (`exactCandidateOrder`): every in-band
+root gets its bounded attempt at a tier before any sibling escalates a tier
+further, so one un-enumerable child cannot monopolize the lane while a root
+behind it is provable within its very first budget — switching roots only
+costs a VTT-accelerated re-descent, bounded by the geometric budgets. And
+once lane zero's own roots are all exact, it adopts every unproven in-band
+satellite-owned root (`caretakerProofCandidates`) instead of stopping: the
+satellites' compact value memos can thrash for minutes on a ~80-cell child
+the primary's full table proves in seconds, exact proofs are lane-independent,
+and the pool merges any lane's proof and re-seeds the stuck owner.
+Above the per-child gate, the bounded virtual-child and per-root B&B portfolios
+run before continuous heuristic search. For those beams,
 a global seen-set is deliberately NOT used:
 stochastic passes revisit
 states *on purpose* with different noise and beam context — blocking
@@ -593,9 +666,10 @@ above it, diversification does — and when even max-width diversification
 stops producing changes, the engine settles instead of cycling (Section 4).
 
 Verified against exhaustive JS brute force on hundreds of small boards in
-the test suite — root optima, per-child B&B proofs and per-child value
-solves (plus a wasm-vs-wasm cross-check of the two solvers on 32-cell
-boards), including line replayability throughout.
+the test suite — root optima, per-child B&B proofs, per-child value solves and
+whole/child threshold decisions on both sides of the true value (plus a
+wasm-vs-wasm cross-check of the value solvers on 32-cell boards), including
+line replayability and one-node threshold resumption throughout.
 
 ## 7. WebGPU acceleration
 
@@ -636,8 +710,13 @@ pump keeps one logical batch continuously queued across CPU beam, proof and
 exact stages. Completion refreshes the unresolved-root snapshot, replay-
 verifies winning seeds in WASM, then queues the successor at a macrotask
 boundary. If lane 0 finishes its CPU-owned roots first, it remains a GPU
-caretaker until peer exact seeds prove every root, the job changes, the search
-settles or the device fails.
+caretaker while satellite lanes continue, so useful position-wide GPU sampling
+does not stop merely because lane 0's root partition finished. Once every
+CPU-only peer has posted `settled`, the pool sends a job-scoped `stop-caretaker`
+control message; lane 0 stops the pump and posts its own terminal snapshot.
+Exact completion, a new job or device failure also stops it. This handshake
+prevents the caretaker loop from keeping counters and elapsed time alive after
+all CPU peers have reached their terminal state.
 
 Optional timestamp queries measure actual compute-pass time. They are never a
 requirement: device creation retries without the feature and telemetry falls
@@ -679,6 +758,12 @@ witness candidates; it is never trusted as an exact value or proof.
 UI → pool       {type:"analyze", id, board}      // Uint8Array(144), col-major, cell = col*12+row
 pool → lane     {type:"analyze", id, board, lane, lanes, gpu}
 pool → lane     {type:"merge", id, seeds}        // merged lines/proofs; replay-validated in WASM
+pool → lane     {type:"threshold-plan", id, epoch, target, roots}
+pool → lane     {type:"threshold-frontier", id, epoch, target, round, tasks}
+lane → pool     {type:"threshold-prefix-split", ..., rootCell, prefix, children}
+lane → pool     {type:"threshold-prefix-miss", ..., rootCell, prefix}
+pool → lane     {type:"threshold-root-bound" | "threshold-cancel", ...}
+pool → lane 0   {type:"stop-caretaker", id}      // CPU-only peers settled; stop the GPU pump
 pool → UI       {type:"ready", gpu, workers}      // gpu = "on" | "off" | "failed"
                 {type:"result", id, remaining, moves, stats}
                 {type:"error", message}
@@ -897,9 +982,9 @@ the former unbounded heap-starvation tail is gone.
 
 * **Exact-proof memory is deliberate**: the 2^23 value memo raises the
   primary worker's initial WASM linear memory from about 74 MiB to 178 MiB;
-  each compact satellite is about 37 MiB. The automatic lane/memory policy is
-  conservative but necessarily heuristic because browser capability values
-  are rounded. Forcing too many workers can create memory pressure. The hard
+  each 2^20-entry compact satellite is about 46 MiB. The automatic lane/memory
+  policy is conservative but necessarily heuristic because browser capability
+  values are rounded. Forcing too many workers can create memory pressure. The hard
   corpus showed a sharp cache-capacity cliff at 2^22 entries; a 6.3 M-entry
   three-way experiment saved memory but slowed the 78-cell proof from about
   45 s to 51.5 s. This engine favors the requested worst-case latency on a
@@ -907,17 +992,27 @@ the former unbounded heap-starvation tail is gone.
 * **Exact tables use 64-bit Zobrist identity**: a hash match is treated as a
   board match. The collision probability is negligible for game analysis but
   not mathematically zero; formal proof certificates would require a second
-  independent fingerprint or full-board verification on TT hits.
-* **Beam cross-move reuse is line-level**: the warm-start cache carries best
-  lines and proofs across positions, while the beam frontier is rebuilt.
-  Exact VTT values do persist across positions. True beam pondering
-  (searching the expected child while the player thinks) is the next step up.
-* **Parallelism is root-level**: each WASM instance remains single-threaded
-  and the pool caps itself at sixteen lanes. Immediate baselines and private
-  tables are duplicated, and one exceptionally hard root can leave other
-  lanes idle because there is no dynamic work stealing. Sharing a frontier or
-  transposition table would require synchronization and, for shared memory,
-  cross-origin isolation that ordinary GitHub Pages does not provide.
+  independent fingerprint or full-board verification on TT hits. This does
+  not apply to pool-coordinated threshold-frontier grouping, which compares
+  all 144 board bytes exactly.
+* **Beam cross-move reuse is line-level**: the warm-start cache carries
+  replayable best lines across positions, while the beam frontier is rebuilt.
+  Exact flags transfer only for the same cached board, an actual recorded
+  one-ply child, or a proved cached-child composition; a replayable suffix on
+  an unrelated board remains an upper bound. Exact VTT values and threshold
+  certificates do persist within each worker across positions. True beam
+  pondering (searching the expected child while the player thinks) is the next
+  step up.
+* **Parallelism is mostly root-level**: bounded second- and third-ply virtual
+  contexts are distributed across lanes, and the positive threshold solver is
+  the exception that redistributes a pool-coordinated, exact-board-deduplicated
+  fixed-prefix frontier. Long-lived value/private work remains root-owned.
+  Each WASM instance is single-threaded and the pool caps itself at sixteen
+  lanes. Immediate baselines and private tables are duplicated; a hard
+  depth-three threshold task remains on its stable lane and there is no
+  mid-round work stealing. Sharing a live DFS stack or transposition table
+  would require synchronization and, for shared memory, cross-origin isolation
+  that ordinary GitHub Pages does not provide.
 * **Permanent reachability remains conservative**: the future-touch graph is
   an over-approximation, so connected cells may still be impossible to join.
   Exact column-slab canonicalization is sound at proven interaction-free cuts

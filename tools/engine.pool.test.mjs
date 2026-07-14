@@ -10,161 +10,9 @@ import {
 } from "../src/scripts/engine/pool.js";
 
 import assert from "node:assert/strict";
-import {
-    canTransferExactSuffix,
-    caretakerProofCandidates,
-    exactCandidateOrder,
-    pairAuditCandidates,
-    parityProofCandidates,
-    roundRobinPrefixTasks,
-} from "../src/scripts/engine/schedule.js";
-
-// Ladder rotation: least-invested budget first, so every in-band root gets
-// its bounded value attempt before any hard sibling escalates a tier; fresh
-// roots keep the memo-warming broadest-child order among themselves.
-{
-    const ladderMoves = [
-        { cell: 4, score: 2, size: 3 }, // hard root, one 8M tier already spent
-        { cell: 7, score: 6, size: 3 }, // fresh, provable within its first tier
-        { cell: 9, score: 3, size: 2 }, // fresh, broadest child goes first
-    ];
-    const invested = new Map([[4, 8000000]]);
-    assert.deepEqual(exactCandidateOrder(ladderMoves,
-        (move) => invested.get(move.cell) ?? 0).map((move) => move.cell), [9, 7, 4]);
-    invested.set(9, 8000000).set(7, 32000000);
-    assert.deepEqual(exactCandidateOrder(ladderMoves,
-        (move) => invested.get(move.cell) ?? 0).map((move) => move.cell), [9, 4, 7]);
-    assert.deepEqual(ladderMoves.map((move) => move.cell), [4, 7, 9]); // input untouched
-}
-
-// Primary-lane proof caretaking: only lane zero, only once its own roots are
-// exact, and only for unproven satellite-owned roots inside the exact band.
-{
-    const owns = (move) => move.cell % 4 === 0;
-    const caretakerMoves = [
-        { cell: 4, score: 0, size: 2, exact: true },  // owned, proved
-        { cell: 3, score: 2, size: 3, exact: false }, // satellite, in band
-        { cell: 5, score: 1, size: 2, exact: true },  // satellite, already proved
-        { cell: 6, score: 3, size: 2, exact: false }, // satellite, above the band
-    ];
-    const options = {
-        lane: 0,
-        owns,
-        childRemainingOf: (move) => (move.cell === 6 ? 100 : 81),
-        gate: 88,
-    };
-    assert.deepEqual(caretakerProofCandidates(caretakerMoves, options)
-        .map((move) => move.cell), [3]);
-    assert.deepEqual(caretakerProofCandidates(caretakerMoves,
-        { ...options, lane: 1 }), []);
-    const ownedUnproven = caretakerMoves.map((move) =>
-        (move.cell === 4 ? { ...move, exact: false } : move));
-    assert.deepEqual(caretakerProofCandidates(ownedUnproven, options), []);
-}
-
-// Escalating pair-seek audit: above-gate threatening roots qualify on boards
-// a played child could prove fast; exhausted rounds, sound-nonzero rows
-// against a zero incumbent, in-gate children and large boards stay out.
-{
-    const auditMoves = [
-        { cell: 1, score: 0, lower: 0, size: 2, exact: true },  // proven incumbent
-        { cell: 2, score: 1, lower: 0, size: 2, exact: false }, // zero hopeful
-        { cell: 3, score: 1, lower: 1, size: 2, exact: false }, // sound nonzero row
-        { cell: 4, score: 2, lower: 0, size: 3, exact: false }, // rounds exhausted
-        { cell: 5, score: 2, lower: 0, size: 2, exact: false }, // in-gate child → ladder
-    ];
-    const auditOptions = {
-        childRemainingOf: (move) => (move.cell === 5 ? 80 : 100),
-        exhaustedOf: (move) => move.cell === 4,
-        gate: 88,
-        boardRemaining: 103,
-        maxRemaining: 120,
-    };
-    assert.deepEqual(pairAuditCandidates(auditMoves, auditOptions)
-        .map((move) => move.cell), [2]);
-    assert.deepEqual(pairAuditCandidates(auditMoves,
-        { ...auditOptions, boardRemaining: 130 }), []);
-}
-
-// Pre/post-play proof parity band: only threatening roots whose child crosses
-// the exact gate after one more removal qualify; proven rows, sound-nonzero
-// rows against a zero incumbent, deep above-band roots and capped roots stay
-// out. Tighter score/lower gaps come first.
-{
-    const gate = 88;
-    const cap = 32000000;
-    const parityMoves = [
-        { cell: 1, score: 0, lower: 0, size: 4, exact: true },  // proven incumbent
-        { cell: 6, score: 1, lower: 0, size: 2, exact: false }, // in band, gap 1
-        { cell: 4, score: 1, lower: 1, size: 3, exact: false }, // sound lower 1 cannot be a zero
-        { cell: 2, score: 2, lower: 0, size: 6, exact: false }, // in band, gap 2
-        { cell: 5, score: 2, lower: 0, size: 5, exact: false }, // in band but budget capped
-        { cell: 3, score: 3, lower: 0, size: 2, exact: false }, // far above the band
-    ];
-    const remainingOf = (move) =>
-        ({ 1: 80, 2: 90, 3: 120, 4: 89, 5: 90, 6: 90 })[move.cell];
-    const candidates = parityProofCandidates(parityMoves, {
-        childRemainingOf: remainingOf,
-        maxChildGroupOf: () => 4, // band: remaining <= 92
-        exhaustedOf: (move) => (move.cell === 5 ? cap : 0),
-        gate,
-        cap,
-    });
-    assert.deepEqual(candidates.map((move) => move.cell), [6, 2]);
-    assert.deepEqual(parityProofCandidates([], {
-        childRemainingOf: () => 90,
-        maxChildGroupOf: () => 4,
-        exhaustedOf: () => 0,
-        gate,
-        cap,
-    }), []);
-}
-
-// Parent-major ordinals stay stable while execution rotates parents fairly.
-// Lane filtering therefore covers every pair exactly once without relying on
-// clustered board-cell representatives.
-const prefixParents = [
-    { cell: 10, seconds: [
-        { second: 11, ordinal: 0 },
-        { second: 12, ordinal: 1 },
-        { second: 13, ordinal: 2 },
-    ] },
-    { cell: 20, seconds: [
-        { second: 21, ordinal: 3 },
-        { second: 22, ordinal: 4 },
-    ] },
-];
-const fairPrefixTasks = roundRobinPrefixTasks(prefixParents)
-    .map((entry) => entry.second);
-assert.deepEqual(fairPrefixTasks.map((task) => task.second), [11, 21, 12, 22, 13]);
-for (let lanes = 1; lanes <= 4; lanes++) {
-    const assigned = Array.from({ length: lanes }, (_, lane) => fairPrefixTasks
-        .filter((task) => task.ordinal % lanes === lane))
-        .flat();
-    assert.deepEqual(assigned.map((task) => task.ordinal).sort((a, b) => a - b),
-        [0, 1, 2, 3, 4]);
-}
-for (const total of [211, 478]) {
-    const counts = Array(16).fill(0);
-    for (let ordinal = 0; ordinal < total; ordinal++) counts[ordinal % 16]++;
-    assert.ok(Math.max(...counts) - Math.min(...counts) <= 1);
-}
-
-// Exactness follows only across the recorded real child edge. The same line
-// remains reusable constructively on every board because worker replay is the
-// independent legality/upper-bound boundary.
-const previousAnalysis = {
-    childKeys: new Map([[10, "actual-child"]]),
-};
-assert.equal(canTransferExactSuffix(previousAnalysis,
-    { cell: 10, exact: true }, "actual-child"), true);
-assert.equal(canTransferExactSuffix(previousAnalysis,
-    { cell: 10, exact: true }, "other-child"), false);
-assert.equal(canTransferExactSuffix(previousAnalysis,
-    { cell: 10, exact: false }, "actual-child"), false);
 
 // Resource policy: one phone lane, two on a constrained notebook, and up to
-// sixteen lanes using one 178 MiB primary plus compact 37 MiB satellites.
+// sixteen lanes using one 178 MiB primary plus compact 46 MiB satellites.
 assert.equal(selectLaneCount({ hardwareConcurrency: 6, deviceMemory: 8, mobile: true }), 1);
 assert.equal(selectLaneCount({ hardwareConcurrency: 8, deviceMemory: 8, mobile: false }), 2);
 assert.equal(selectLaneCount({ hardwareConcurrency: 10, deviceMemory: 8, mobile: false }), 3);
@@ -172,19 +20,29 @@ assert.equal(selectLaneCount({ hardwareConcurrency: 16, deviceMemory: 8, mobile:
 assert.equal(selectLaneCount({ hardwareConcurrency: 20, deviceMemory: 8, mobile: false }), 8);
 assert.equal(selectLaneCount({ hardwareConcurrency: 24, deviceMemory: 8, mobile: false }), 8);
 assert.equal(selectLaneCount({ hardwareConcurrency: 32, deviceMemory: 8, mobile: false }), 16);
+assert.equal(selectLaneCount({ hardwareConcurrency: 32, deviceMemory: 4, mobile: false }), 6);
 assert.equal(selectLaneCount({ hardwareConcurrency: 32, deviceMemory: 2, mobile: false }), 1);
 assert.equal(selectLaneCount({ hardwareConcurrency: 32, deviceMemory: 8, mobile: false },
     { maxLanes: 3 }), 3);
 
-// Every root has exactly one stable owner for every supported pool size.
+// Every root ordinal has exactly one stable owner for every supported pool
+// size. Consecutive enumeration indices also keep lane counts within one.
 for (let lanes = 1; lanes <= 16; lanes++) {
-    for (let cell = 0; cell < 144; cell++) {
+    for (let rootIndex = 0; rootIndex < 144; rootIndex++) {
         const owners = Array.from({ length: lanes }, (_, lane) =>
-            laneOwnsRoot(cell, lane, lanes)).filter(Boolean).length;
+            laneOwnsRoot(rootIndex, lane, lanes)).filter(Boolean).length;
         assert.equal(owners, 1);
-        assert.equal(rootOwner(cell, lanes), cell % lanes);
+        assert.equal(rootOwner(rootIndex, lanes), rootIndex % lanes);
+    }
+    for (let rootCount = 0; rootCount <= 72; rootCount++) {
+        const counts = Array(lanes).fill(0);
+        for (let rootIndex = 0; rootIndex < rootCount; rootIndex++) {
+            counts[rootOwner(rootIndex, lanes)]++;
+        }
+        assert.ok(Math.max(...counts) - Math.min(...counts) <= 1);
     }
 }
+assert.equal(new Set(Array.from({ length: 15 }, (_, k) => rootOwner(k, 16))).size, 15);
 const seeds = new Set();
 for (let lane = 0; lane < 16; lane++) {
     for (let pass = 0; pass < 16; pass++) seeds.add(laneSeed(1, lane, pass));
@@ -333,6 +191,7 @@ class FakeWorker {
 const pool = new EngineWorkerPool("https://example.test/worker.js", {
     Worker: FakeWorker,
     laneCount: 2,
+    mergeIntervalMs: 0, // synchronous merges keep these asserts step-by-step
 });
 assert.equal(FakeWorker.instances[0].url.searchParams.get("gpu"), "1");
 assert.equal(FakeWorker.instances[1].url.searchParams.get("gpu"), "0");
@@ -382,12 +241,166 @@ assert.equal(emitted.at(-1).stats.totalPositions, terminal.stats.totalPositions)
 pool.terminate();
 assert.ok(FakeWorker.instances.every((worker) => worker.terminated));
 
+// A positive bound is a distributed proof over a complete adaptive frontier.
+// A hard task may split, but neither the split nor partial/duplicate misses
+// can raise a root until every resulting branch is covered.
+FakeWorker.instances = [];
+const thresholdPool = new EngineWorkerPool("https://example.test/worker.js", {
+    Worker: FakeWorker,
+    laneCount: 2,
+    mergeIntervalMs: 0, // synchronous merges keep these asserts step-by-step
+});
+const thresholdEmitted = [];
+thresholdPool.onmessage = (event) => thresholdEmitted.push(event.data);
+thresholdPool.postMessage({ type: "analyze", id: 7, board: new Uint8Array(144) });
+const thresholdMoves = [move(0, 1, 0), move(1, 1, 0)];
+FakeWorker.instances[0].emit({ ...laneResult(0, thresholdMoves), remaining: 84 });
+FakeWorker.instances[1].emit({ ...laneResult(1, thresholdMoves), remaining: 84 });
+const plans = FakeWorker.instances.map((worker) =>
+    worker.messages.find((message) => message.type === "threshold-plan"));
+assert.ok(plans.every(Boolean));
+assert.deepEqual(plans.map(({ roots, target }) => ({ roots, target })), [
+    { roots: [0, 1], target: 0 },
+    { roots: [0, 1], target: 0 },
+]);
+const plan = plans[0];
+const proofBoard = (value) => new Uint8Array(144).fill(value);
+const outcome = (lane, type, rootCell, prefix, extra = {}) =>
+    FakeWorker.instances[lane].emit({
+        type,
+        id: 7,
+        epoch: plan.epoch,
+        target: 0,
+        round: extra.round ?? 0,
+        rootCell,
+        prefix,
+        ...extra,
+    });
+outcome(0, "threshold-prefix-split", 0, [], { children: [
+    { cell: 10, board: proofBoard(1) },
+    { cell: 20, board: proofBoard(2) },
+] });
+assert.ok(FakeWorker.instances.every((worker) =>
+    !worker.messages.some((message) => message.type === "threshold-root-bound")));
+outcome(1, "threshold-prefix-miss", 1, []);
+assert.ok(FakeWorker.instances.every((worker) => worker.messages.some((message) =>
+    message.type === "threshold-root-bound" && message.rootCell === 1 && message.lower === 1)));
+const roundOne = FakeWorker.instances[0].messages.find((message) =>
+    message.type === "threshold-frontier" && message.round === 1);
+assert.deepEqual(roundOne.tasks, [
+    { rootCell: 0, prefix: [10] },
+    { rootCell: 0, prefix: [20] },
+]);
+const miss = (lane, prefix) => FakeWorker.instances[lane].emit({
+    type: "threshold-prefix-miss",
+    id: 7,
+    epoch: plan.epoch,
+    target: 0,
+    round: 1,
+    rootCell: 0,
+    prefix,
+});
+miss(0, [10]);
+miss(0, [10]); // duplicate is idempotent
+assert.equal(FakeWorker.instances[0].messages.filter((message) =>
+    message.type === "threshold-root-bound" && message.rootCell === 0).length, 0);
+miss(1, [20]);
+assert.ok(FakeWorker.instances.every((worker) => worker.messages.some((message) =>
+    message.type === "threshold-root-bound" && message.rootCell === 0 && message.lower === 1)));
+assert.ok(FakeWorker.instances.every((worker) => worker.messages.some((message) =>
+    message.type === "threshold-cancel" && message.id === 7 &&
+    message.epoch === plan.epoch)),
+"completed coordinated frontier cancels every worker's local idle ladder");
+assert.deepEqual(thresholdEmitted.at(-1).moves.map(({ score, lower, exact }) =>
+    ({ score, lower, exact })), [
+    { score: 1, lower: 1, exact: true },
+    { score: 1, lower: 1, exact: true },
+]);
+const boundMessages = FakeWorker.instances[0].messages.filter((message) =>
+    message.type === "threshold-root-bound").length;
+miss(1, [20]); // stale completed-plan traffic is ignored
+assert.equal(FakeWorker.instances[0].messages.filter((message) =>
+    message.type === "threshold-root-bound").length, boundMessages);
+thresholdPool.terminate();
+
+// Commuting move orders that reach the exact same 144-byte board are one
+// threshold state. A single miss may discharge every participating root, but
+// the pool must retain one replayable prefix per root until that miss lands.
+FakeWorker.instances = [];
+const aliasPool = new EngineWorkerPool("https://example.test/worker.js", {
+    Worker: FakeWorker,
+    laneCount: 2,
+    mergeIntervalMs: 0, // synchronous merges keep these asserts step-by-step
+});
+const aliasEmitted = [];
+aliasPool.onmessage = (event) => aliasEmitted.push(event.data);
+aliasPool.postMessage({ type: "analyze", id: 7, board: new Uint8Array(144) });
+FakeWorker.instances[0].emit({ ...laneResult(0, thresholdMoves), remaining: 84 });
+FakeWorker.instances[1].emit({ ...laneResult(1, thresholdMoves), remaining: 84 });
+const aliasPlan = FakeWorker.instances[0].messages.find((message) =>
+    message.type === "threshold-plan");
+const aliasSplit = (lane, rootCell, child, boardState) =>
+    FakeWorker.instances[lane].emit({
+        type: "threshold-prefix-split",
+        id: 7,
+        epoch: aliasPlan.epoch,
+        target: 0,
+        round: 0,
+        rootCell,
+        prefix: [],
+        children: [{ cell: child, board: boardState }],
+    });
+const sharedState = proofBoard(3);
+aliasSplit(0, 0, 10, sharedState);
+aliasSplit(1, 1, 20, sharedState.slice());
+const aliasRound = FakeWorker.instances[0].messages.find((message) =>
+    message.type === "threshold-frontier" && message.round === 1);
+assert.deepEqual(aliasRound.tasks, [{ rootCell: 0, prefix: [10] }]);
+FakeWorker.instances[0].emit({
+    type: "threshold-prefix-miss",
+    id: 7,
+    epoch: aliasPlan.epoch,
+    target: 0,
+    round: 1,
+    rootCell: 0,
+    prefix: [10],
+});
+for (const rootCell of [0, 1]) {
+    assert.ok(FakeWorker.instances.every((worker) => worker.messages.some((message) =>
+        message.type === "threshold-root-bound" &&
+        message.rootCell === rootCell && message.lower === 1)));
+}
+assert.deepEqual(aliasEmitted.at(-1).moves.map(({ lower, exact }) => ({ lower, exact })), [
+    { lower: 1, exact: true },
+    { lower: 1, exact: true },
+]);
+aliasPool.terminate();
+
+// A CPU-only peer that has exhausted its search must release lane zero from
+// an otherwise unbounded GPU caretaker loop. This is a control message only;
+// it does not manufacture an exact result for the unresolved peer row.
+FakeWorker.instances = [];
+const caretakerPool = new EngineWorkerPool("https://example.test/worker.js", {
+    Worker: FakeWorker,
+    laneCount: 2,
+    mergeIntervalMs: 0, // synchronous merges keep these asserts step-by-step
+});
+caretakerPool.postMessage({ type: "analyze", id: 7, board: new Uint8Array(144) });
+FakeWorker.instances[0].emit(laneResult(0,
+    [move(0, 3, 2), move(1, 4, 1)], { settled: false }));
+FakeWorker.instances[1].emit(laneResult(1,
+    [move(0, 3, 2), move(1, 4, 1)], { settled: true }));
+assert.ok(FakeWorker.instances[0].messages.some((message) =>
+    message.type === "stop-caretaker" && message.id === 7));
+caretakerPool.terminate();
+
 // Losing a lane changes modulo ownership. The pool must restart every lane
 // at N-1 and replay the current position, never silently strand failed roots.
 FakeWorker.instances = [];
 const fallbackPool = new EngineWorkerPool("https://example.test/worker.js", {
     Worker: FakeWorker,
     laneCount: 3,
+    mergeIntervalMs: 0, // synchronous merges keep these asserts step-by-step
 });
 fallbackPool.postMessage({ type: "analyze", id: 8, board: new Uint8Array(144) });
 const firstGeneration = FakeWorker.instances.slice();
@@ -399,5 +412,40 @@ assert.equal(secondGeneration.length, 2);
 assert.ok(secondGeneration.every((worker) => worker.messages[0].id === 8));
 assert.ok(secondGeneration.every((worker) => worker.messages[0].lanes === 2));
 fallbackPool.terminate();
+
+// Merge coalescing: results arrive up to laneCount/POST_INTERVAL per second,
+// and running the merge/emit pipeline per arrival scales main-thread cost
+// with the lane count (a 16-lane pool visibly starves the page). A result
+// burst must produce one leading emission plus one trailing flush that
+// carries the final composite; the trailing flush must also latch terminal
+// snapshots so `proven` is never skipped by the rate limit.
+{
+    FakeWorker.instances = [];
+    const coalescingPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 2,
+        mergeIntervalMs: 25,
+    });
+    const coalesced = [];
+    coalescingPool.onmessage = (event) => {
+        if (event.data.type === "result") coalesced.push(event.data);
+    };
+    coalescingPool.postMessage({ type: "analyze", id: 7, board: new Uint8Array(144).fill(1) });
+    FakeWorker.instances[0].emit(laneResult(0, [move(0, 5, 0), move(1, 4, 1)]));
+    assert.equal(coalesced.length, 1); // leading edge: a lone result is not delayed
+    FakeWorker.instances[1].emit(laneResult(1, [move(0, 3, 2), move(1, 4, 4, true)]));
+    FakeWorker.instances[0].emit(laneResult(0, [move(0, 4, 0), move(1, 4, 1)]));
+    assert.equal(coalesced.length, 1); // burst inside the interval is coalesced
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(coalesced.length, 2); // one trailing flush for the whole burst
+    assert.equal(coalesced.at(-1).moves[0].score, 3); // composite of both lanes
+    FakeWorker.instances[0].emit(laneResult(0,
+        [move(0, 3, 3, true), move(1, 4, 4, true)], { settled: true }));
+    FakeWorker.instances[1].emit(laneResult(1,
+        [move(0, 3, 3, true), move(1, 4, 4, true)], { settled: true }));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(coalesced.at(-1).stats.state, "proven"); // terminal survives the limiter
+    coalescingPool.terminate();
+}
 
 console.log("ok    adaptive engine worker pool");

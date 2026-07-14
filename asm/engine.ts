@@ -130,6 +130,10 @@ const PLAYOUT_BOARD = new StaticArray<u8>(CELLS);
 const PLAYOUT_START = new StaticArray<u8>(CELLS);
 const PLAYOUT_LINE = new StaticArray<u8>(LINE_MAX);
 const PROBE_REPS = new StaticArray<u8>(MAX_ROOTS);
+// Tail moves of an arbitrary fixed prefix. JS writes moves after root k to
+// IO[0..prefixLen); validation copies them here before an API is allowed to
+// overwrite IO with a materialized board or other output.
+const PREFIX_MOVES = new StaticArray<u8>(LINE_MAX);
 
 // exact solver
 const EX_BOARDS = new StaticArray<u8>(EXACT_STACK * CELLS);
@@ -138,6 +142,9 @@ const EX_COUNT = new StaticArray<i32>(EXACT_STACK);
 const EX_CURSOR = new StaticArray<i32>(EXACT_STACK);
 const EX_MOVE = new StaticArray<u8>(EXACT_STACK);
 const EX_LINE = new StaticArray<u8>(LINE_MAX);
+// A live target seek must retain its own prefix: IO and PREFIX_MOVES are shared
+// scratch and may be reused between exactStep() slices.
+const EX_PREFIX_MOVES = new StaticArray<u8>(LINE_MAX);
 const EX_CHILD_LOWER = new StaticArray<u8>(EXACT_STACK * MAX_ROOTS);
 const EX_REMAINING = new StaticArray<u8>(EXACT_STACK);
 const TT_KEY = new StaticArray<u64>(TT_CAP);
@@ -591,6 +598,155 @@ function permanentLower(bd: usize): i32 {
     return forced;
 }
 
+// Sound delete-relaxation lower bound. A marked cell is only *potentially*
+// removable; the least fixed point deliberately ignores conflicts between
+// removals and therefore over-approximates every real play sequence.
+//
+// Seed cells which belong to a legal group now. A same-column pair may become
+// adjacent after all cells between it are potentially removable. Two cells in
+// different columns may meet after every intervening column is potentially
+// empty and their possible future row intervals overlap. Deductions are
+// applied in waves so they cannot justify one another circularly.
+//
+// To see why the complement is permanent, assume a real sequence removes an
+// unmarked cell for the first time. Its same-color group partner is vertically
+// adjacent after only previously marked intervening cells disappeared, or is
+// horizontally adjacent after only previously marked columns/cells changed
+// its column and row. The corresponding rule would have marked it: a
+// contradiction. Consequently every unmarked occupied cell contributes one
+// to an admissible terminal lower bound.
+function potentialRemovalLower(bd: usize): i32 {
+    // FORCED_CELL is scratch. permanentLower() has already returned before
+    // this complementary analysis is called, so the two meanings never
+    // overlap live.
+    memory.fill(pu8(FORCED_CELL), 0, CELLS);
+    let columns = 0;
+    while (columns < SIZE && cellAt(bd, columns * SIZE) != 0) columns++;
+
+    // Every member of a currently legal group has an equal-color neighbor.
+    for (let col = 0; col < columns; col++) {
+        for (let row = 0; row < SIZE; row++) {
+            const cell = col * SIZE + row;
+            const color = cellAt(bd, cell);
+            if (color == 0) break;
+            if ((row > 0 && cellAt(bd, cell - 1) == color) ||
+                (row + 1 < SIZE && cellAt(bd, cell + 1) == color) ||
+                (col > 0 && cellAt(bd, cell - SIZE) == color) ||
+                (col + 1 < columns && cellAt(bd, cell + SIZE) == color)) {
+                unchecked(FORCED_CELL[cell] = 1);
+            }
+        }
+    }
+
+    for (;;) {
+        // Build each column/color's union of possible future rows once per
+        // wave. POT_COL_FORCED means "the whole column is potentially
+        // removable" in this complementary analysis. This turns the former
+        // cell-pair/intervening-column scan into a handful of bit tests.
+        memory.fill(pu8(POT_COL_FORCED), 0, SIZE);
+        memory.fill(pu16(POT_COL_COLOR_ROWS), 0,
+            SIZE * (COLORS + 1) * sizeof<u16>());
+        for (let col = 0; col < columns; col++) {
+            let notPotentialBelow = 0;
+            let allPotential = true;
+            for (let row = 0; row < SIZE; row++) {
+                const cell = col * SIZE + row;
+                const color = <i32>cellAt(bd, cell);
+                if (color == 0) break;
+                const high = (<u32>1 << <u32>(row + 1)) - 1;
+                const low = (<u32>1 << <u32>notPotentialBelow) - 1;
+                const rows = <u16>(high ^ low);
+                unchecked(POT_ROW_MASK[cell] = rows);
+                const at = col * (COLORS + 1) + color;
+                unchecked(POT_COL_COLOR_ROWS[at] =
+                    unchecked(POT_COL_COLOR_ROWS[at]) | rows);
+                if (unchecked(FORCED_CELL[cell]) != 1) {
+                    notPotentialBelow++;
+                    allPotential = false;
+                }
+            }
+            if (allPotential) unchecked(POT_COL_FORCED[col] = 1);
+        }
+
+        let pending = 0;
+        for (let col = 0; col < columns; col++) {
+            for (let row = 0; row < SIZE; row++) {
+                const cell = col * SIZE + row;
+                const color = cellAt(bd, cell);
+                if (color == 0) break;
+                if (unchecked(FORCED_CELL[cell]) != 0) continue;
+                let canRemove = false;
+
+                // Scan vertically only until the first not-yet-potential
+                // blocker. Encountering the same color first supplies a
+                // partner; no quadratic between-pair scan is needed.
+                for (let otherRow = row - 1; otherRow >= 0; otherRow--) {
+                    const other = col * SIZE + otherRow;
+                    if (cellAt(bd, other) == color) {
+                        canRemove = true;
+                        break;
+                    }
+                    if (unchecked(FORCED_CELL[other]) != 1) break;
+                }
+                if (!canRemove) {
+                    for (let otherRow = row + 1; otherRow < SIZE; otherRow++) {
+                        const other = col * SIZE + otherRow;
+                        if (cellAt(bd, other) == 0) break;
+                        if (cellAt(bd, other) == color) {
+                            canRemove = true;
+                            break;
+                        }
+                        if (unchecked(FORCED_CELL[other]) != 1) break;
+                    }
+                }
+
+                // Non-potential columns are barriers. The first such column
+                // remains a possible partner; only fully potential columns
+                // permit looking farther. Row-mask overlap is exactly the
+                // relaxed interval test described above.
+                const rows = unchecked(POT_ROW_MASK[cell]);
+                if (!canRemove) {
+                    for (let otherCol = col - 1; otherCol >= 0; otherCol--) {
+                        const at = otherCol * (COLORS + 1) + <i32>color;
+                        if ((unchecked(POT_COL_COLOR_ROWS[at]) & rows) != 0) {
+                            canRemove = true;
+                            break;
+                        }
+                        if (!unchecked(POT_COL_FORCED[otherCol])) break;
+                    }
+                }
+                if (!canRemove) {
+                    for (let otherCol = col + 1; otherCol < columns; otherCol++) {
+                        const at = otherCol * (COLORS + 1) + <i32>color;
+                        if ((unchecked(POT_COL_COLOR_ROWS[at]) & rows) != 0) {
+                            canRemove = true;
+                            break;
+                        }
+                        if (!unchecked(POT_COL_FORCED[otherCol])) break;
+                    }
+                }
+
+                // Value 2 is invisible to every deduction in this wave.
+                if (canRemove) {
+                    unchecked(FORCED_CELL[cell] = 2);
+                    pending++;
+                }
+            }
+        }
+
+        if (pending == 0) break;
+        for (let cell = 0; cell < CELLS; cell++) {
+            if (unchecked(FORCED_CELL[cell]) == 2) unchecked(FORCED_CELL[cell] = 1);
+        }
+    }
+
+    let lower = 0;
+    for (let cell = 0; cell < CELLS; cell++) {
+        if (cellAt(bd, cell) != 0 && unchecked(FORCED_CELL[cell]) == 0) lower++;
+    }
+    return lower;
+}
+
 // heuristic value of a board, lower is better; fills evalRemaining, evalHash
 // and evalHasMoves as side products of the same scan
 function evalBoard(bd: usize, noiseSeed: u32): f32 {
@@ -883,12 +1039,10 @@ export function setBoard(): i32 {
     cpuPlayoutPositions = 0;
     cpuPlayouts = 0;
     passActive = false;
-    exActive = false;
-    exComplete = false;
-    exWholeBoard = false;
-    clearExactPrefix();
+    consumeExactPrefix();
     vsActive = false;
     vsPaused = false;
+    cancelThreshold();
     layerDepth = 0;
     passWidth = 0;
     rootRemaining = boardRemaining(pu8(ROOT_BOARD));
@@ -928,6 +1082,100 @@ export function getRemaining(): i32 {
     return rootRemaining;
 }
 
+// Copy and replay JS's IO tail prefix below root k. `prefixLen` excludes the
+// root move itself. Copying first is essential when `bd == IO`, because the
+// materialized board overwrites the input bytes. No caller may use an
+// unvalidated prefix to construct a result line.
+function materializeRootPrefix(k: i32, prefixLen: i32, bd: usize): bool {
+    if (k < 0 || k >= rootCount || prefixLen < 0 || prefixLen >= LINE_MAX) return false;
+    if (prefixLen > 0) memory.copy(pu8(PREFIX_MOVES), pu8(IO), prefixLen);
+
+    memory.copy(bd, pu8(ROOT_BOARD), CELLS);
+    if (applyMove(bd, <i32>unchecked(ROOT_REP[k])) < 2) return false;
+    for (let d = 0; d < prefixLen; d++) {
+        const move = <i32>unchecked(PREFIX_MOVES[d]);
+        if (move < 0 || move >= CELLS || applyMove(bd, move) < 2) return false;
+    }
+    return true;
+}
+
+function writeRootPrefixLine(k: i32, prefixLen: i32): i32 {
+    const len = prefixLen + 1;
+    unchecked(PLAYOUT_LINE[0] = unchecked(ROOT_REP[k]));
+    for (let d = 0; d < prefixLen; d++) {
+        unchecked(PLAYOUT_LINE[d + 1] = unchecked(PREFIX_MOVES[d]));
+    }
+    return len;
+}
+
+// A terminal fixed prefix is itself a complete constructive line.
+function reportPrefixTerminal(k: i32, prefixLen: i32, bd: usize): void {
+    const final = boardRemaining(bd);
+    if (final < unchecked(ROOT_BEST[k])) {
+        const len = writeRootPrefixLine(k, prefixLen);
+        unchecked(ROOT_BEST[k] = final);
+        unchecked(ROOT_LINE_LEN[k] = <u8>len);
+        memory.copy(pu8(ROOT_LINES) + <usize>(k * LINE_MAX), pu8(PLAYOUT_LINE), len);
+    }
+    maybeMarkRootExact(k);
+}
+
+// Materialize the board below [root k, IO tail prefix], enumerate its legal
+// next moves, and expose the same bridge layout as childGroupsToIO(): board at
+// IO, representatives at IO+256, sizes at IO+512. Returns -1 for an invalid
+// prefix; zero is a valid terminal prefix.
+export function prefixGroupsToIO(k: i32, prefixLen: i32): i32 {
+    if (!materializeRootPrefix(k, prefixLen, pu8(IO))) return -1;
+    const n = enumerateGroups(pu8(IO));
+    for (let g = 0; g < n; g++) {
+        store<u8>(pu8(IO) + 256 + <usize>g, unchecked(REPS[g]));
+        store<u8>(pu8(IO) + 512 + <usize>g, unchecked(REP_SIZES[g]));
+    }
+    return n;
+}
+
+// Give every legal move after a fixed prefix the same largest-group greedy
+// baseline it would receive as a visible root. Results remain attached to the
+// original root and include the complete prefix. A deeper branch cannot raise
+// the original root's lower bound; prefixLen==0 retains the old whole-child
+// lower-bound lift because it exhaustively covers every second move.
+export function probeRootPrefixTable(k: i32, prefixLen: i32): i32 {
+    if (k < 0 || k >= rootCount || unchecked(ROOT_EXACT[k]) != 0 ||
+        prefixLen < 0 || prefixLen + 2 > LINE_MAX) {
+        return k >= 0 && k < rootCount ? unchecked(ROOT_BEST[k]) : NO_SCORE;
+    }
+    if (!materializeRootPrefix(k, prefixLen, pu8(PLAYOUT_START))) {
+        return unchecked(ROOT_BEST[k]);
+    }
+
+    const n = enumerateGroups(pu8(PLAYOUT_START));
+    for (let g = 0; g < n; g++) unchecked(PROBE_REPS[g] = unchecked(REPS[g]));
+    if (n == 0) {
+        reportPrefixTerminal(k, prefixLen, pu8(PLAYOUT_START));
+        return unchecked(ROOT_BEST[k]);
+    }
+
+    let childLower = CELLS;
+    for (let g = 0; g < n; g++) {
+        memory.copy(pu8(PLAYOUT_BOARD), pu8(PLAYOUT_START), CELLS);
+        const next = <i32>unchecked(PROBE_REPS[g]);
+        const len = writeRootPrefixLine(k, prefixLen);
+        unchecked(PLAYOUT_LINE[len] = <u8>next);
+        if (applyMove(pu8(PLAYOUT_BOARD), next) < 2) continue;
+        scanExactStats(pu8(PLAYOUT_BOARD));
+        strengthenExactStats(pu8(PLAYOUT_BOARD));
+        if (statLower < childLower) childLower = statLower;
+        greedyContinue(k, len + 1);
+        if (unchecked(ROOT_EXACT[k]) != 0) break;
+    }
+    if (prefixLen == 0 && unchecked(ROOT_EXACT[k]) == 0 &&
+        childLower > <i32>unchecked(ROOT_LOWER[k])) {
+        unchecked(ROOT_LOWER[k] = <u8>childLower);
+        maybeMarkRootExact(k);
+    }
+    return unchecked(ROOT_BEST[k]);
+}
+
 // Lift the child position's instant baseline one ply into parent root k.
 // After applying k, try every legal second move and finish with the same
 // largest-group greedy rollout that setBoard() would give that move if the
@@ -935,38 +1183,7 @@ export function getRemaining(): i32 {
 // constructive line; a clear reaches the sound lower bound zero and therefore
 // proves the parent row immediately.
 export function probeRootChildTable(k: i32): i32 {
-    if (k < 0 || k >= rootCount || unchecked(ROOT_EXACT[k]) != 0) {
-        return k >= 0 && k < rootCount ? unchecked(ROOT_BEST[k]) : NO_SCORE;
-    }
-
-    memory.copy(pu8(PLAYOUT_START), pu8(ROOT_BOARD), CELLS);
-    if (applyMove(pu8(PLAYOUT_START), <i32>unchecked(ROOT_REP[k])) == 0) {
-        return unchecked(ROOT_BEST[k]);
-    }
-
-    const n = enumerateGroups(pu8(PLAYOUT_START));
-    for (let g = 0; g < n; g++) unchecked(PROBE_REPS[g] = unchecked(REPS[g]));
-
-    let childLower = CELLS;
-    for (let g = 0; g < n; g++) {
-        memory.copy(pu8(PLAYOUT_BOARD), pu8(PLAYOUT_START), CELLS);
-        const second = <i32>unchecked(PROBE_REPS[g]);
-        unchecked(PLAYOUT_LINE[0] = unchecked(ROOT_REP[k]));
-        unchecked(PLAYOUT_LINE[1] = <u8>second);
-        if (applyMove(pu8(PLAYOUT_BOARD), second) == 0) continue;
-        scanExactStats(pu8(PLAYOUT_BOARD));
-        strengthenExactStats(pu8(PLAYOUT_BOARD));
-        if (statLower < childLower) childLower = statLower;
-        greedyContinue(k, 2);
-        if (unchecked(ROOT_EXACT[k]) != 0) break;
-    }
-    if (unchecked(ROOT_EXACT[k]) == 0 && n > 0) {
-        if (childLower > <i32>unchecked(ROOT_LOWER[k])) {
-            unchecked(ROOT_LOWER[k] = <u8>childLower);
-        }
-        maybeMarkRootExact(k);
-    }
-    return unchecked(ROOT_BEST[k]);
+    return probeRootPrefixTable(k, 0);
 }
 
 // Admissible lower bound for a root child. The worker uses this to spend
@@ -1066,8 +1283,7 @@ function beamInit(width: i32, noiseSeed: u32, onlyRoot: i32, lane: i32, lanes: i
 
     for (let k = 0; k < rootCount; k++) {
         if (onlyRoot >= 0 && k != onlyRoot) continue;
-        if (onlyRoot < 0 && lanes > 1 &&
-            <i32>unchecked(ROOT_REP[k]) % lanes != lane) continue;
+        if (onlyRoot < 0 && lanes > 1 && k % lanes != lane) continue;
         if (unchecked(ROOT_EXACT[k])) continue;
         const bd = curBoards() + <usize>(curCount * CELLS);
         memory.copy(bd, pu8(ROOT_BOARD), CELLS);
@@ -1136,7 +1352,7 @@ function beamInitRootChildrenPartition(
         const second = <i32>unchecked(PROBE_REPS[g]);
         if (onlySecond >= 0) {
             if (second != onlySecond) continue;
-        } else if (lanes > 1 && second % lanes != lane) continue;
+        } else if (lanes > 1 && g % lanes != lane) continue;
 
         if (rootEdge == NO_EDGE) {
             rootEdge = <u32>edgeCount;
@@ -1168,14 +1384,66 @@ function beamInitRootChildrenPartition(
     passActive = curCount > 0 && unchecked(ROOT_EXACT[k]) == 0;
 }
 
+// Start one private beam at the board below an arbitrary validated fixed
+// prefix. Unlike a whole-root heap, this gives the prefix exactly the search
+// decomposition it receives after its earlier moves are played. The complete
+// edge chain is retained, so reportTerminal() records a line on ROOT_BOARD.
+function beamInitRootPrefix(k: i32, prefixLen: i32, width: i32, noiseSeed: u32): bool {
+    passActive = false;
+    passWidth = 0;
+    heapSize = 0;
+    curCount = 0;
+    curCursor = 0;
+    layerDepth = 0;
+    edgeCount = 0;
+
+    if (k < 0 || k >= rootCount || width < 1 ||
+        unchecked(ROOT_EXACT[k]) != 0 || prefixLen < 0 || prefixLen >= LINE_MAX) return false;
+    if (width > MAX_WIDTH) width = MAX_WIDTH;
+    if (!materializeRootPrefix(k, prefixLen, pu8(PLAYOUT_START))) return false;
+
+    passWidth = width;
+    passNoise = noiseSeed;
+    layerDepth = prefixLen + 1;
+    dedupStamp++;
+    curArena = 0;
+
+    let edge: u32 = NO_EDGE;
+    unchecked(EDGE_PAR[edgeCount] = NO_EDGE);
+    unchecked(EDGE_MOVE[edgeCount] = unchecked(ROOT_REP[k]));
+    edge = <u32>edgeCount;
+    edgeCount++;
+    for (let d = 0; d < prefixLen; d++) {
+        unchecked(EDGE_PAR[edgeCount] = edge);
+        unchecked(EDGE_MOVE[edgeCount] = unchecked(PREFIX_MOVES[d]));
+        edge = <u32>edgeCount;
+        edgeCount++;
+    }
+
+    evalBoard(pu8(PLAYOUT_START), 0);
+    if (!evalHasMoves) {
+        reportPrefixTerminal(k, prefixLen, pu8(PLAYOUT_START));
+        return true;
+    }
+
+    memory.copy(curBoards(), pu8(PLAYOUT_START), CELLS);
+    unchecked(META_ROOT_A[0] = <u8>k);
+    unchecked(META_EDGE_A[0] = edge);
+    unchecked(META_REMAIN_A[0] = <u8>evalRemaining);
+    curCount = 1;
+    passActive = true;
+    return true;
+}
+
 // starts an anytime pass; noiseSeed 0 = deterministic, else stochastic variant
 export function beamBegin(width: i32, noiseSeed: u32): void {
     restoreBeamWeights();
     beamInit(width, noiseSeed, -1, 0, 1);
 }
 
-// Multi-worker global pass. Root ownership is based on the stable board cell
-// rather than enumeration index, matching the main-thread result merger.
+// Multi-worker global pass. setBoard() enumerates roots deterministically by
+// ascending representative cell, so the ordinal partition is stable while
+// keeping every lane's root count within one of every other lane's count.
 export function beamBeginPartition(width: i32, noiseSeed: u32, lane: i32, lanes: i32): void {
     restoreBeamWeights();
     if (lanes < 1) lanes = 1;
@@ -1185,13 +1453,23 @@ export function beamBeginPartition(width: i32, noiseSeed: u32, lane: i32, lanes:
 }
 
 // Fair second-ply portfolio for one parent row. Ownership is based on the
-// representative of the second move, matching the root partition that the
-// same position receives after that parent move is played.
+// second move's enumeration ordinal, matching the root partition that the same
+// position receives after that parent move is played.
 export function beamBeginRootChildrenPartition(
     k: i32, width: i32, noiseSeed: u32, lane: i32, lanes: i32,
 ): void {
     restoreBeamWeights();
     beamInitRootChildrenPartition(k, width, noiseSeed, lane, lanes, -1);
+}
+
+// JS writes `prefixLen` tail moves after root k to IO. Returns 1 when the
+// prefix was legal (including an already terminal prefix), otherwise 0. A bad
+// request always abandons the prior beam pass.
+export function beamBeginRootPrefix(
+    k: i32, prefixLen: i32, width: i32, noiseSeed: u32,
+): i32 {
+    restoreBeamWeights();
+    return beamInitRootPrefix(k, prefixLen, width, noiseSeed) ? 1 : 0;
 }
 
 // Explicit single-prefix member. This is the exact parent-side equivalent of
@@ -1202,74 +1480,8 @@ export function beamBeginRootChild(
     k: i32, secondCell: i32, width: i32, noiseSeed: u32,
 ): void {
     restoreBeamWeights();
-    beamInitRootChildrenPartition(
-        k, width, noiseSeed, 0, 1,
-        secondCell >= 0 && secondCell < CELLS ? secondCell : CELLS,
-    );
-}
-
-// Start at depth three under one explicit [root, second, third] prefix — the
-// exact parent-side twin of the clicked child running beamBeginRootChild()
-// on its own (second, third) pair. The retained edge chain includes all
-// three prefix moves, so a terminal found by beamStep() remains a replayable
-// line on ROOT_BOARD.
-export function beamBeginRootGrandchild(
-    k: i32, secondCell: i32, thirdCell: i32, width: i32, noiseSeed: u32,
-): void {
-    restoreBeamWeights();
-    passActive = false;
-    passWidth = 0;
-    heapSize = 0;
-    curCount = 0;
-    curCursor = 0;
-    layerDepth = 0;
-    edgeCount = 0;
-
-    if (k < 0 || k >= rootCount || width < 1 || unchecked(ROOT_EXACT[k]) != 0) return;
-    if (secondCell < 0 || secondCell >= CELLS) return;
-    if (thirdCell < 0 || thirdCell >= CELLS) return;
-    if (width > MAX_WIDTH) width = MAX_WIDTH;
-
-    passWidth = width;
-    passNoise = noiseSeed;
-    layerDepth = 3;
-    dedupStamp++;
-    curArena = 0;
-
-    memory.copy(pu8(PLAYOUT_START), pu8(ROOT_BOARD), CELLS);
-    const first = <i32>unchecked(ROOT_REP[k]);
-    if (applyMove(pu8(PLAYOUT_START), first) == 0) return;
-    if (applyMove(pu8(PLAYOUT_START), secondCell) == 0) return;
-
-    const firstEdge: u32 = <u32>edgeCount;
-    unchecked(EDGE_PAR[edgeCount] = NO_EDGE);
-    unchecked(EDGE_MOVE[edgeCount] = <u8>first);
-    edgeCount++;
-    const secondEdge: u32 = <u32>edgeCount;
-    unchecked(EDGE_PAR[edgeCount] = firstEdge);
-    unchecked(EDGE_MOVE[edgeCount] = <u8>secondCell);
-    edgeCount++;
-
-    const bd = curBoards();
-    memory.copy(bd, pu8(PLAYOUT_START), CELLS);
-    if (applyMove(bd, thirdCell) == 0) return;
-    evalBoard(bd, 0);
-
-    if (!evalHasMoves) {
-        reportTerminal(k, evalRemaining, secondEdge, thirdCell);
-        return; // terminal prefix — recorded, nothing left to search
-    }
-
-    unchecked(EDGE_PAR[edgeCount] = secondEdge);
-    unchecked(EDGE_MOVE[edgeCount] = <u8>thirdCell);
-    unchecked(META_ROOT_A[0] = <u8>k);
-    unchecked(META_EDGE_A[0] = <u32>edgeCount);
-    unchecked(META_REMAIN_A[0] = <u8>evalRemaining);
-    edgeCount++;
-    curCount = 1;
-
-    heapSize = 0;
-    passActive = true;
+    store<u8>(pu8(IO), <u8>(secondCell >= 0 && secondCell < CELLS ? secondCell : 255));
+    beamInitRootPrefix(k, 1, width, noiseSeed);
 }
 
 // root-locked pass: the whole beam explores only the subtree of root move k,
@@ -1440,11 +1652,11 @@ function dominantColor(bd: usize): i32 {
 let playoutLastLen: i32 = 0;
 
 // one playout from PLAYOUT_BOARD with the given seed; returns final remaining;
-// when record is true, moves are appended to PLAYOUT_LINE starting at index 1
-// (index 0 is the caller's root move by convention)
-function playoutRun(seed: u32, record: bool, tabu: i32, soft: bool): i32 {
+// when record is true, moves are appended to PLAYOUT_LINE after the caller's
+// already-recorded root/prefix. The legacy root and direct-test paths pass 1.
+function playoutRun(seed: u32, record: bool, tabu: i32, soft: bool, lineStart: i32): i32 {
     rngSeed(seed);
-    let len = 1;
+    let len = lineStart;
     cpuPlayouts++;
 
     for (;;) {
@@ -1496,20 +1708,24 @@ function playoutRun(seed: u32, record: bool, tabu: i32, soft: bool): i32 {
     return boardRemaining(pu8(PLAYOUT_BOARD));
 }
 
-// n playouts under root k with seeds seedBase..seedBase+n-1; improves the
-// root's best score in place, returns the minimum final reached
-function playoutRootMode(k: i32, n: i32, seedBase: u32, soft: bool): i32 {
-    if (k < 0 || k >= rootCount) return NO_SCORE;
-
-    memory.copy(pu8(PLAYOUT_START), pu8(ROOT_BOARD), CELLS);
-    applyMove(pu8(PLAYOUT_START), <i32>unchecked(ROOT_REP[k]));
+// n playouts under [root k, IO tail prefix]. The tabu color is intentionally
+// recomputed only after the complete fixed prefix, exactly matching analysis
+// of that board after the user plays into it.
+function playoutRootPrefixMode(
+    k: i32, prefixLen: i32, n: i32, seedBase: u32, soft: bool,
+): i32 {
+    if (k < 0 || k >= rootCount || prefixLen < 0 || prefixLen >= LINE_MAX || n < 1) {
+        return NO_SCORE;
+    }
+    if (!materializeRootPrefix(k, prefixLen, pu8(PLAYOUT_START))) return NO_SCORE;
+    const lineStart = prefixLen + 1;
     const tabu = dominantColor(pu8(PLAYOUT_START));
 
     let minFinal = NO_SCORE;
     let minSeed: u32 = 0;
     for (let i = 0; i < n; i++) {
         memory.copy(pu8(PLAYOUT_BOARD), pu8(PLAYOUT_START), CELLS);
-        const final = playoutRun(seedBase + <u32>i, false, tabu, soft);
+        const final = playoutRun(seedBase + <u32>i, false, tabu, soft, lineStart);
         if (final < minFinal) {
             minFinal = final;
             minSeed = seedBase + <u32>i;
@@ -1519,8 +1735,8 @@ function playoutRootMode(k: i32, n: i32, seedBase: u32, soft: bool): i32 {
     if (minFinal < unchecked(ROOT_BEST[k])) {
         // replay the winning seed, recording the line
         memory.copy(pu8(PLAYOUT_BOARD), pu8(PLAYOUT_START), CELLS);
-        unchecked(PLAYOUT_LINE[0] = unchecked(ROOT_REP[k]));
-        const check = playoutRun(minSeed, true, tabu, soft);
+        writeRootPrefixLine(k, prefixLen);
+        const check = playoutRun(minSeed, true, tabu, soft, lineStart);
         if (check == minFinal) {
             unchecked(ROOT_BEST[k] = minFinal);
             unchecked(ROOT_LINE_LEN[k] = <u8>playoutLastLen);
@@ -1530,6 +1746,19 @@ function playoutRootMode(k: i32, n: i32, seedBase: u32, soft: bool): i32 {
     }
 
     return minFinal;
+}
+
+// Legacy root-only entry point.
+function playoutRootMode(k: i32, n: i32, seedBase: u32, soft: bool): i32 {
+    return playoutRootPrefixMode(k, 0, n, seedBase, soft);
+}
+
+export function playoutRootPrefix(k: i32, prefixLen: i32, n: i32, seedBase: u32): i32 {
+    return playoutRootPrefixMode(k, prefixLen, n, seedBase, false);
+}
+
+export function playoutRootPrefixSoft(k: i32, prefixLen: i32, n: i32, seedBase: u32): i32 {
+    return playoutRootPrefixMode(k, prefixLen, n, seedBase, true);
 }
 
 // Exploitation policy: preserves the original hard tabu-color rollout.
@@ -1552,7 +1781,7 @@ export function playoutVerify(k: i32, seed: u32, claimed: i32): i32 {
     memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
     applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k]));
     unchecked(PLAYOUT_LINE[0] = unchecked(ROOT_REP[k]));
-    const final = playoutRun(seed, true, dominantColor(pu8(PLAYOUT_BOARD)), false);
+    const final = playoutRun(seed, true, dominantColor(pu8(PLAYOUT_BOARD)), false, 1);
 
     if (final != claimed) return 0;
 
@@ -1621,6 +1850,24 @@ export function seedExactByCell(cell: i32, score: i32): i32 {
     return 0;
 }
 
+// Accept a caller-composed lower certificate for one root. The pool invokes
+// this only after every member of a canonical fixed-prefix manifest has
+// completed above the same threshold. Guard the interval here as a second
+// trust boundary: a lower bound can only rise and can never cross the root's
+// replayable constructive upper bound.
+export function seedRootLowerByCell(cell: i32, lower: i32): i32 {
+    if (lower < 0 || lower > CELLS) return 0;
+    for (let k = 0; k < rootCount; k++) {
+        if (<i32>unchecked(ROOT_REP[k]) != cell) continue;
+        if (lower < <i32>unchecked(ROOT_LOWER[k]) ||
+            lower > unchecked(ROOT_BEST[k])) return 0;
+        unchecked(ROOT_LOWER[k] = <u8>lower);
+        maybeMarkRootExact(k);
+        return 1;
+    }
+    return 0;
+}
+
 // writes the child board after root move k into IO (for the GPU pipeline)
 export function childToIO(k: i32): i32 {
     if (k < 0 || k >= rootCount) return 0;
@@ -1650,18 +1897,6 @@ export function grandchildToIO(k: i32, second: i32): i32 {
     return applyMove(pu8(IO), second) >= 2 ? 1 : 0;
 }
 
-// Legal third moves of the [root, second] grandchild — the move list the
-// clicked child's own virtual-child portfolio would enumerate for `second`.
-export function grandchildGroupsToIO(k: i32, second: i32): i32 {
-    if (grandchildToIO(k, second) == 0) return 0;
-    const n = enumerateGroups(pu8(IO));
-    for (let g = 0; g < n; g++) {
-        store<u8>(pu8(IO) + 256 + <usize>g, unchecked(REPS[g]));
-        store<u8>(pu8(IO) + 512 + <usize>g, unchecked(REP_SIZES[g]));
-    }
-    return n;
-}
-
 // ---------------------------------------------------------------------------
 // exact solver — budgeted branch & bound DFS with transposition table
 // ---------------------------------------------------------------------------
@@ -1676,18 +1911,28 @@ let exBudget: i32 = 0;
 let exComplete: bool = false;
 let exSeek: bool = false;
 let exSeekTarget: i32 = -1;
-// Distinguish a proof of ROOT_BOARD from a proof below one root. Only the
-// former may raise the shared lower bound of every root in exactMerge().
-let exWholeBoard: bool = false;
 let exPrefixRoot: i32 = -1;
-let exPrefixSecond: i32 = -1;
-let exPrefixThird: i32 = -1;
+let exPrefixLen: i32 = 0;
+let exPrefixToken: i32 = 0;
+let exNextPrefixToken: i32 = 0;
 let ttStamp: u32 = 0;
+// Whole-position threshold proofs on the primary lane can borrow the much
+// larger value-table key/stamp arrays as a transient seen set. Value entries
+// always carry stamp 1; generations 2..255 are therefore unambiguously seen
+// entries and can never be consumed as exact values.
+let exUseWideSeen: bool = false;
+let wideSeenStamp: u8 = 146;
 
 function clearExactPrefix(): void {
     exPrefixRoot = -1;
-    exPrefixSecond = -1;
-    exPrefixThird = -1;
+    exPrefixLen = 0;
+    exPrefixToken = 0;
+}
+
+function nextExactPrefixToken(): i32 {
+    exNextPrefixToken++;
+    if (exNextPrefixToken <= 0) exNextPrefixToken = 1;
+    return exNextPrefixToken;
 }
 
 // A committed or abandoned forced-prefix seek must not remain eligible for
@@ -1704,7 +1949,6 @@ function consumeExactPrefix(): void {
     exComplete = false;
     exSeek = false;
     exSeekTarget = -1;
-    exWholeBoard = false;
     clearExactPrefix();
 }
 
@@ -1771,6 +2015,8 @@ function exPush(bd: usize, forcedMove: i32): void {
 // buckets retain substantially more transpositions than direct mapping at
 // the same memory size; replacement can only cause extra work, never pruning.
 function ttSeen(hash: u64): bool {
+    if (exUseWideSeen) return wideTtSeen(hash);
+
     const base = <i32>(hash & <u64>TT_SET_MASK) * TT_WAYS;
     let empty = -1;
     for (let way = 0; way < TT_WAYS; way++) {
@@ -1789,12 +2035,12 @@ function ttSeen(hash: u64): bool {
 
 // starts an exact search on the analysis board; budget = max node expansions
 export function exactBegin(budget: i32): void {
-    clearExactPrefix();
+    consumeExactPrefix();
+    cancelThreshold();
     vsPaused = false;
     vsActive = false;
     exActive = true;
     exComplete = false;
-    exWholeBoard = true;
     exSeek = false;
     exBest = NO_SCORE;
     exBestLen = 0;
@@ -1803,6 +2049,7 @@ export function exactBegin(budget: i32): void {
     exBudget = budget;
     exDepth = 0;
     ttStamp++;
+    beginWideSeenPass();
 
     // the beam's best-known lines are the starting upper bound
     for (let k = 0; k < rootCount; k++) {
@@ -1907,9 +2154,9 @@ export function exactStep(chunk: i32): i32 {
 // improving) that single move's score; the move's best-known line is the
 // starting upper bound, so the search only explores what could beat it
 export function exactBeginChild(k: i32, budget: i32): i32 {
-    clearExactPrefix();
+    consumeExactPrefix();
+    cancelThreshold();
     exActive = false;
-    exWholeBoard = false;
     if (k < 0 || k >= rootCount) return 0;
 
     vsPaused = false;
@@ -1923,6 +2170,7 @@ export function exactBeginChild(k: i32, budget: i32): i32 {
     exNodes = 0;
     exBudget = budget;
     exDepth = 0;
+    exUseWideSeen = false;
     ttStamp++;
 
     memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
@@ -1938,7 +2186,7 @@ export function exactBeginChild(k: i32, budget: i32): i32 {
 // never an exactness claim. EX_LINE starts in the child position, so prepend
 // the root move. Returns the root's resulting best score.
 export function exactCommitChild(k: i32): i32 {
-    if (exWholeBoard || exPrefixRoot >= 0 || k < 0 || k >= rootCount) return NO_SCORE;
+    if (exPrefixRoot >= 0 || k < 0 || k >= rootCount) return NO_SCORE;
 
     if (exHasWitness && exBest < unchecked(ROOT_BEST[k])) {
         unchecked(ROOT_BEST[k] = exBest);
@@ -1956,8 +2204,7 @@ export function exactCommitChild(k: i32): i32 {
 // Merges a completed child search into root k: exhaustive completion proves
 // the move's value in addition to committing any improved witness.
 export function exactMergeChild(k: i32): i32 {
-    if (exWholeBoard || exPrefixRoot >= 0 || !exComplete ||
-        k < 0 || k >= rootCount) return NO_SCORE;
+    if (exPrefixRoot >= 0 || !exComplete || k < 0 || k >= rootCount) return NO_SCORE;
 
     exactCommitChild(k);
 
@@ -1970,9 +2217,9 @@ export function exactMergeChild(k: i32): i32 {
 // the value solver is cheap. exactStep completing with `target` means the
 // line was found and recorded (merge with exactMergeChild)
 export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
-    clearExactPrefix();
+    consumeExactPrefix();
+    cancelThreshold();
     exActive = false;
-    exWholeBoard = false;
     if (k < 0 || k >= rootCount) return 0;
 
     vsPaused = false;
@@ -1987,6 +2234,7 @@ export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
     exNodes = 0;
     exBudget = budget;
     exDepth = 0;
+    exUseWideSeen = false;
     ttStamp++;
 
     memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
@@ -2000,182 +2248,111 @@ export function exactChildSeek(k: i32, budget: i32, target: i32): i32 {
     return 1;
 }
 
-// Targeted exact seek below one explicit [root, second] prefix. Splitting the
-// child position this way prevents an expensive earlier second move from
-// consuming the whole parent-root budget before a cheap clearing sibling is
-// visited. Completion proves only this grandchild branch; the corresponding
-// commit remains a constructive upper-bound update unless it meets the
-// independently sound ROOT_LOWER bound.
+// Targeted exact seek below [root k, IO tail prefix]. The returned positive
+// token identifies this exact begin generation. A later begin invalidates it;
+// stale commits cannot attach a witness to a different prefix or consume the
+// newer live search. Completion proves only the fixed branch. Commit remains
+// a constructive upper-bound update unless it meets ROOT_LOWER.
+export function exactBeginRootPrefixSeek(
+    k: i32, prefixLen: i32, budget: i32, target: i32,
+): i32 {
+    consumeExactPrefix();
+    cancelThreshold();
+    vsPaused = false;
+    vsActive = false;
+    if (k < 0 || k >= rootCount || unchecked(ROOT_EXACT[k]) != 0 ||
+        prefixLen < 0 || prefixLen >= LINE_MAX || budget < 0 ||
+        target < 0 || target > CELLS || target < <i32>unchecked(ROOT_LOWER[k])) {
+        return 0;
+    }
+
+    if (!materializeRootPrefix(k, prefixLen, pu8(PLAYOUT_BOARD))) return 0;
+
+    exActive = true;
+    exComplete = false;
+    exSeek = true;
+    exSeekTarget = target;
+    exBest = target + 1;
+    exBestLen = 0;
+    exHasWitness = false;
+    exNodes = 0;
+    exBudget = budget;
+    exDepth = 0;
+    exUseWideSeen = false;
+    ttStamp++;
+    exPrefixRoot = k;
+    exPrefixLen = prefixLen;
+    exPrefixToken = nextExactPrefixToken();
+    if (prefixLen > 0) memory.copy(pu8(EX_PREFIX_MOVES), pu8(PREFIX_MOVES), prefixLen);
+
+    scanExactStats(pu8(PLAYOUT_BOARD));
+    strengthenExactStats(pu8(PLAYOUT_BOARD));
+    const rootLower = <i32>unchecked(ROOT_LOWER[k]);
+    if (statLower < rootLower) statLower = rootLower;
+    let forcedMove = -1;
+    const memo = vttLookup(statHash);
+    if (memo == target && vttHitMove != 255) forcedMove = vttHitMove;
+    exPush(pu8(PLAYOUT_BOARD), forcedMove);
+    return exPrefixToken;
+}
+
+// Commit only the matching live begin token. The full saved prefix is prepended
+// to EX_LINE; IO may have been reused since begin. A stale token is a pure
+// no-op and deliberately leaves a newer live seek intact.
+export function exactCommitRootPrefix(token: i32): i32 {
+    if (token <= 0 || exPrefixToken != token || exPrefixRoot < 0) return NO_SCORE;
+    if (!exHasWitness) {
+        consumeExactPrefix();
+        return NO_SCORE;
+    }
+
+    const k = exPrefixRoot;
+    const len = exBestLen + exPrefixLen + 1;
+    if (len > LINE_MAX) {
+        consumeExactPrefix();
+        return NO_SCORE;
+    }
+
+    if (exBest < unchecked(ROOT_BEST[k])) {
+        unchecked(ROOT_BEST[k] = exBest);
+        unchecked(ROOT_LINES[k * LINE_MAX] = unchecked(ROOT_REP[k]));
+        for (let d = 0; d < exPrefixLen; d++) {
+            unchecked(ROOT_LINES[k * LINE_MAX + 1 + d] = unchecked(EX_PREFIX_MOVES[d]));
+        }
+        for (let d = 0; d < exBestLen; d++) {
+            unchecked(ROOT_LINES[k * LINE_MAX + 1 + exPrefixLen + d] = unchecked(EX_LINE[d]));
+        }
+        unchecked(ROOT_LINE_LEN[k] = <u8>len);
+    }
+    maybeMarkRootExact(k);
+    const result = unchecked(ROOT_BEST[k]);
+    consumeExactPrefix();
+    return result;
+}
+
+// Backward-compatible fixed-child wrappers. The old begin contract returns 1
+// rather than exposing the generation token; identity is still checked against
+// the durable saved prefix before delegating to the token commit.
 export function exactBeginRootChildSeek(
     k: i32, secondCell: i32, budget: i32, target: i32,
 ): i32 {
-    consumeExactPrefix();
-    vsPaused = false;
-    vsActive = false;
-    if (k < 0 || k >= rootCount || unchecked(ROOT_EXACT[k]) != 0 ||
-        secondCell < 0 || secondCell >= CELLS || budget < 0 ||
-        target < 0 || target > CELLS || target < <i32>unchecked(ROOT_LOWER[k])) {
-        return 0;
-    }
-
-    memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
-    if (applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k])) < 2 ||
-        applyMove(pu8(PLAYOUT_BOARD), secondCell) < 2) {
-        return 0;
-    }
-
-    exActive = true;
-    exComplete = false;
-    exSeek = true;
-    exSeekTarget = target;
-    exBest = target + 1;
-    exBestLen = 0;
-    exHasWitness = false;
-    exNodes = 0;
-    exBudget = budget;
-    exDepth = 0;
-    ttStamp++;
-    exPrefixRoot = k;
-    exPrefixSecond = secondCell;
-
-    scanExactStats(pu8(PLAYOUT_BOARD));
-    strengthenExactStats(pu8(PLAYOUT_BOARD));
-    const rootLower = <i32>unchecked(ROOT_LOWER[k]);
-    if (statLower < rootLower) statLower = rootLower;
-    let forcedMove = -1;
-    const memo = vttLookup(statHash);
-    if (memo == target && vttHitMove != 255) forcedMove = vttHitMove;
-    exPush(pu8(PLAYOUT_BOARD), forcedMove);
-    return 1;
+    store<u8>(pu8(IO), <u8>(secondCell >= 0 && secondCell < CELLS ? secondCell : 255));
+    return exactBeginRootPrefixSeek(k, 1, budget, target) > 0 ? 1 : 0;
 }
 
-// Targeted exact seek below one explicit [root, second, third] prefix — the
-// exact parent-side twin of the (second, third) pair seek the clicked child
-// runs in its own virtual-child portfolio. One more forced ply is what keeps
-// pre-play proof effort comparable to the portfolio the child re-runs the
-// moment the move is played: a single ply of free DFS depth costs more than
-// an order of magnitude in budget.
-export function exactBeginRootChildSeek3(
-    k: i32, secondCell: i32, thirdCell: i32, budget: i32, target: i32,
-): i32 {
-    consumeExactPrefix();
-    vsPaused = false;
-    vsActive = false;
-    if (k < 0 || k >= rootCount || unchecked(ROOT_EXACT[k]) != 0 ||
-        secondCell < 0 || secondCell >= CELLS ||
-        thirdCell < 0 || thirdCell >= CELLS || budget < 0 ||
-        target < 0 || target > CELLS || target < <i32>unchecked(ROOT_LOWER[k])) {
-        return 0;
-    }
-
-    memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
-    if (applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[k])) < 2 ||
-        applyMove(pu8(PLAYOUT_BOARD), secondCell) < 2 ||
-        applyMove(pu8(PLAYOUT_BOARD), thirdCell) < 2) {
-        return 0;
-    }
-
-    exActive = true;
-    exComplete = false;
-    exSeek = true;
-    exSeekTarget = target;
-    exBest = target + 1;
-    exBestLen = 0;
-    exHasWitness = false;
-    exNodes = 0;
-    exBudget = budget;
-    exDepth = 0;
-    ttStamp++;
-    exPrefixRoot = k;
-    exPrefixSecond = secondCell;
-    exPrefixThird = thirdCell;
-
-    scanExactStats(pu8(PLAYOUT_BOARD));
-    strengthenExactStats(pu8(PLAYOUT_BOARD));
-    const rootLower = <i32>unchecked(ROOT_LOWER[k]);
-    if (statLower < rootLower) statLower = rootLower;
-    let forcedMove = -1;
-    const memo = vttLookup(statHash);
-    if (memo == target && vttHitMove != 255) forcedMove = vttHitMove;
-    exPush(pu8(PLAYOUT_BOARD), forcedMove);
-    return 1;
-}
-
-// Commits only the live [root, second, third] seek. A target hit supplies a
-// replayable line; maybeMarkRootExact() remains the sole proof transition.
-export function exactCommitRootChild3(
-    k: i32, secondCell: i32, thirdCell: i32,
-): i32 {
-    if (k < 0 || k >= rootCount || exPrefixRoot != k ||
-        exPrefixSecond != secondCell || exPrefixThird != thirdCell) {
-        return NO_SCORE;
-    }
-    if (!exHasWitness) {
-        consumeExactPrefix();
-        return NO_SCORE;
-    }
-
-    const len = exBestLen + 3;
-    if (len > LINE_MAX) {
-        consumeExactPrefix();
-        return NO_SCORE;
-    }
-
-    if (exBest < unchecked(ROOT_BEST[k])) {
-        unchecked(ROOT_BEST[k] = exBest);
-        unchecked(ROOT_LINES[k * LINE_MAX] = unchecked(ROOT_REP[k]));
-        unchecked(ROOT_LINES[k * LINE_MAX + 1] = <u8>secondCell);
-        unchecked(ROOT_LINES[k * LINE_MAX + 2] = <u8>thirdCell);
-        for (let d = 0; d < exBestLen; d++) {
-            unchecked(ROOT_LINES[k * LINE_MAX + 3 + d] = unchecked(EX_LINE[d]));
-        }
-        unchecked(ROOT_LINE_LEN[k] = <u8>len);
-    }
-    maybeMarkRootExact(k);
-    const result = unchecked(ROOT_BEST[k]);
-    consumeExactPrefix();
-    return result;
-}
-
-// Commits only the live seek whose prefix exactly matches the arguments. A
-// target hit supplies a replayable line, but one solved second branch cannot
-// prove the whole parent child table by itself. maybeMarkRootExact() is the
-// sole proof transition and fires only when the witness meets ROOT_LOWER.
 export function exactCommitRootChild(k: i32, secondCell: i32): i32 {
-    if (k < 0 || k >= rootCount || exPrefixRoot != k ||
-        exPrefixSecond != secondCell || exPrefixThird >= 0) {
+    if (k < 0 || k >= rootCount || exPrefixRoot != k || exPrefixLen != 1 ||
+        secondCell < 0 || secondCell >= CELLS ||
+        <i32>unchecked(EX_PREFIX_MOVES[0]) != secondCell) {
         return NO_SCORE;
     }
-    if (!exHasWitness) {
-        consumeExactPrefix();
-        return NO_SCORE;
-    }
-
-    const len = exBestLen + 2;
-    if (len > LINE_MAX) {
-        consumeExactPrefix();
-        return NO_SCORE;
-    }
-
-    if (exBest < unchecked(ROOT_BEST[k])) {
-        unchecked(ROOT_BEST[k] = exBest);
-        unchecked(ROOT_LINES[k * LINE_MAX] = unchecked(ROOT_REP[k]));
-        unchecked(ROOT_LINES[k * LINE_MAX + 1] = <u8>secondCell);
-        for (let d = 0; d < exBestLen; d++) {
-            unchecked(ROOT_LINES[k * LINE_MAX + 2 + d] = unchecked(EX_LINE[d]));
-        }
-        unchecked(ROOT_LINE_LEN[k] = <u8>len);
-    }
-    maybeMarkRootExact(k);
-    const result = unchecked(ROOT_BEST[k]);
-    consumeExactPrefix();
-    return result;
+    return exactCommitRootPrefix(exPrefixToken);
 }
 
 // merges a completed exact result into the root table: roots whose best equals
 // the proven optimum are flagged exact; returns the optimum (or NO_SCORE)
 export function exactMerge(): i32 {
-    if (!exWholeBoard || exPrefixRoot >= 0 || !exComplete) return NO_SCORE;
+    if (exPrefixRoot >= 0 || !exComplete) return NO_SCORE;
 
     // the proven-optimal line also improves its root move if it is better
     if (exBestLen > 0) {
@@ -2221,7 +2398,10 @@ export function exactMerge(): i32 {
 // independent lanes use a smaller table: their job is diversified beam/root
 // work, and duplicating the primary's 96 MiB memo would make phones and
 // notebooks unsafe. ENGINE_LITE is supplied at build time through asc --use.
-const VTT_CAP: i32 = ENGINE_LITE != 0 ? 1 << 18 : 1 << 23;
+// Satellites also run the threshold proof described below. One million
+// entries is the smallest useful completed-state memo on hard positive
+// endgames; the primary retains eight million entries.
+const VTT_CAP: i32 = ENGINE_LITE != 0 ? 1 << 20 : 1 << 23;
 const VTT_WAYS: i32 = 4;
 const VTT_SETS: i32 = VTT_CAP / VTT_WAYS;
 const VTT_SET_MASK: i32 = VTT_SETS - 1;
@@ -2242,11 +2422,53 @@ let vsNodes: i32 = 0;
 let vsBudget: i32 = 0;
 let vttHitMove: i32 = -1;
 
+// The primary engine owns an 8M-entry value table. Before any value solve has
+// started for a position, whole-board B&B can use its key/stamp storage as an
+// 8x larger duplicate filter without allocating another phone-hostile table.
+// Compact satellite engines retain the dedicated 1M-entry exact table because
+// their value table is smaller. On generation wrap, preserve stamp-1 value
+// entries and threshold certificates. Stamps 147..255 are reserved for this
+// transient pass; 2..146 persistently encode `value > stamp-2` certificates.
+function beginWideSeenPass(): void {
+    exUseWideSeen = ENGINE_LITE == 0;
+    if (!exUseWideSeen) return;
+
+    wideSeenStamp++;
+    if (wideSeenStamp < 147) {
+        for (let at = 0; at < VTT_CAP; at++) {
+            if (unchecked(VTT_STAMP[at]) >= 147) unchecked(VTT_STAMP[at] = 0);
+        }
+        wideSeenStamp = 147;
+    }
+}
+
+function wideTtSeen(hash: u64): bool {
+    const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
+    let empty = -1;
+    for (let way = 0; way < VTT_WAYS; way++) {
+        const at = base + way;
+        const stamp = unchecked(VTT_STAMP[at]);
+        if (stamp == 0 || (stamp >= 147 && stamp != wideSeenStamp)) {
+            if (empty < 0) empty = at;
+        }
+        if (stamp == wideSeenStamp && unchecked(VTT_KEY[at]) == hash) {
+            return true;
+        }
+    }
+    // A bucket full of exact values/certificates remains useful after this
+    // one traversal. Failing open merely re-expands this state.
+    if (empty < 0) return false;
+    const at = empty;
+    unchecked(VTT_STAMP[at] = wideSeenStamp);
+    unchecked(VTT_KEY[at] = hash);
+    return false;
+}
+
 function vttLookup(hash: u64): i32 {
     const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
     for (let way = 0; way < VTT_WAYS; way++) {
         const at = base + way;
-        if (unchecked(VTT_STAMP[at]) != 0 && unchecked(VTT_KEY[at]) == hash) {
+        if (unchecked(VTT_STAMP[at]) == 1 && unchecked(VTT_KEY[at]) == hash) {
             const data = unchecked(VTT_DATA[at]);
             vttHitMove = <i32>(data >> 8);
             return <i32>(data & 255);
@@ -2263,7 +2485,7 @@ function vttStore(hash: u64, value: i32, move: i32, remaining: i32): void {
     for (let way = 0; way < VTT_WAYS; way++) {
         const probe = base + way;
         const stamp = unchecked(VTT_STAMP[probe]);
-        if (stamp == 0 || unchecked(VTT_KEY[probe]) == hash) {
+        if (stamp != 1 || unchecked(VTT_KEY[probe]) == hash) {
             at = probe;
             break;
         }
@@ -2284,6 +2506,385 @@ function vttStore(hash: u64, value: i32, move: i32, remaining: i32): void {
     unchecked(VTT_KEY[at] = hash);
     unchecked(VTT_DATA[at] = <u16>(value | (move << 8)));
     unchecked(VTT_REMAINING[at] = <u8>remaining);
+}
+
+// ---------------------------------------------------------------------------
+// threshold solver — persistent proof that no line reaches `target`
+//
+// Whole-value enumeration answers much more than a positive position needs.
+// If the incumbent is 1, the proof obligation is only "does a clearing line
+// exist?" This resumable OR-DFS stores a state only after every child has
+// failed that threshold. Such certificates are context-free and survive
+// root changes and clicks; stamp 2+t means the exact statement value > t.
+// ---------------------------------------------------------------------------
+
+let tsActive: bool = false;
+let tsPaused: bool = false;
+let tsComplete: bool = false;
+let tsFound: bool = false;
+let tsTarget: i32 = -1;
+let tsRoot: i32 = -1; // -1 whole position, otherwise child below this root
+// -1 searches the whole board/whole root child. A non-negative value searches
+// only [root, saved prefix]. Such a branch can contribute a witness
+// immediately, but its miss is only one part of a caller-side coverage proof
+// and must never raise ROOT_LOWER by itself.
+let tsPrefixLen: i32 = -1;
+let tsDepth: i32 = 0;
+let tsNodes: i32 = 0;
+let tsBudget: i32 = 0;
+let tsFoundScore: i32 = NO_SCORE;
+let tsFoundLen: i32 = 0;
+
+function cancelThreshold(): void {
+    tsActive = false;
+    tsPaused = false;
+    tsComplete = false;
+    tsFound = false;
+    tsRoot = -1;
+    tsPrefixLen = -1;
+    tsDepth = 0;
+    tsNodes = 0;
+    tsBudget = 0;
+    tsFoundScore = NO_SCORE;
+    tsFoundLen = 0;
+}
+
+// A paused threshold frontier owns the exact prefix bytes that created it.
+// IO is shared scratch, so callers must rewrite the prefix before every begin;
+// comparing it here prevents a retry for branch B from resuming branch A.
+function thresholdPrefixMatches(prefixLen: i32): bool {
+    if (tsPrefixLen != prefixLen) return false;
+    if (prefixLen < 0) return true;
+    for (let d = 0; d < prefixLen; d++) {
+        if (load<u8>(pu8(IO) + <usize>d) != unchecked(EX_PREFIX_MOVES[d])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+let thresholdForcedMove: i32 = -1;
+
+// One bucket probe handles both exact values and threshold certificates.
+// Returns true when the state is already known above target; an exact value
+// at/below target supplies a policy move for witness-first ordering.
+function thresholdMemoDead(hash: u64, target: i32): bool {
+    thresholdForcedMove = -1;
+    const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
+    for (let way = 0; way < VTT_WAYS; way++) {
+        const at = base + way;
+        const stamp = <i32>unchecked(VTT_STAMP[at]);
+        if (unchecked(VTT_KEY[at]) != hash) continue;
+        if (stamp == 1) {
+            const data = unchecked(VTT_DATA[at]);
+            if (<i32>(data & 255) > target) return true;
+            thresholdForcedMove = <i32>(data >> 8);
+            return false;
+        }
+        if (stamp >= 2 && stamp <= 146 && stamp - 2 >= target) return true;
+    }
+    return false;
+}
+
+function thresholdStoreCertificate(hash: u64, target: i32, remaining: i32): void {
+    const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
+    let at = -1;
+    let victim = -1;
+    let victimRemaining = 255;
+    const wanted = target + 2;
+
+    for (let way = 0; way < VTT_WAYS; way++) {
+        const probe = base + way;
+        const stamp = <i32>unchecked(VTT_STAMP[probe]);
+        if (stamp != 0 && unchecked(VTT_KEY[probe]) == hash) {
+            if (stamp == 1) return; // an exact value is strictly stronger
+            if (stamp >= 2 && stamp <= 146) {
+                if (stamp < wanted) unchecked(VTT_STAMP[probe] = <u8>wanted);
+                if (<i32>unchecked(VTT_REMAINING[probe]) < remaining) {
+                    unchecked(VTT_REMAINING[probe] = <u8>remaining);
+                }
+                return;
+            }
+        }
+        if ((stamp == 0 || stamp >= 147) && at < 0) {
+            at = probe;
+        }
+        if (stamp >= 2 && stamp <= 146) {
+            const keptRemaining = <i32>unchecked(VTT_REMAINING[probe]);
+            if (keptRemaining < victimRemaining) {
+                victimRemaining = keptRemaining;
+                victim = probe;
+            }
+        }
+    }
+
+    // Preserve buckets containing four exact values. As with every cache
+    // miss, declining to store causes only safe re-expansion.
+    if (at < 0) at = victim;
+    if (at < 0) return;
+    unchecked(VTT_KEY[at] = hash);
+    unchecked(VTT_STAMP[at] = <u8>wanted);
+    unchecked(VTT_REMAINING[at] = <u8>remaining);
+}
+
+function thresholdCapture(score: i32): void {
+    tsFound = true;
+    tsFoundScore = score;
+    tsFoundLen = tsDepth;
+    for (let d = 0; d < tsDepth; d++) {
+        unchecked(EX_LINE[d] = unchecked(EX_MOVE[d]));
+    }
+}
+
+// Returns -1 when a frame was pushed, 0 for a certified dead state and 1
+// after recording a threshold witness.
+function thresholdPush(bd: usize, inheritedLower: i32, parentRemaining: i32): i32 {
+    scanExactStats(bd);
+    if (parentRemaining < 0) {
+        strengthenExactStats(bd);
+    } else if (statRemaining <= PERMANENT_EXACT_REMAINING &&
+        parentRemaining > PERMANENT_EXACT_REMAINING) {
+        statLower = permanentLower(bd);
+    }
+    if (statLower < inheritedLower) statLower = inheritedLower;
+
+    const hash = statHash;
+    if (statLower > tsTarget) {
+        return 0;
+    }
+    if (thresholdMemoDead(hash, tsTarget)) return 0;
+    const forcedMove = thresholdForcedMove;
+
+    const frame = tsDepth;
+    const frameBd = pu8(EX_BOARDS) + <usize>(frame * CELLS);
+    if (frameBd != bd) memory.copy(frameBd, bd, CELLS);
+    let n = enumerateGroups(frameBd);
+    if (n == 0) {
+        if (statRemaining <= tsTarget) {
+            thresholdCapture(statRemaining);
+            return 1;
+        }
+        return 0;
+    }
+
+    if (forcedMove >= 0) {
+        for (let g = 0; g < n; g++) {
+            if (<i32>unchecked(REPS[g]) == forcedMove) {
+                unchecked(REPS[0] = unchecked(REPS[g]));
+                n = 1;
+                break;
+            }
+        }
+    }
+    memory.copy(pu8(EX_REPS) + <usize>(frame * MAX_ROOTS), pu8(REPS), n);
+    unchecked(EX_COUNT[frame] = n);
+    unchecked(EX_CURSOR[frame] = 0);
+    unchecked(EX_HASH[frame] = hash);
+    unchecked(EX_LOWER[frame] = <u8>statLower);
+    unchecked(EX_REMAINING[frame] = <u8>statRemaining);
+    tsDepth++;
+    return -1;
+}
+
+// Starts a fresh whole-position threshold decision or resumes the retained
+// frontier after a budget stop. Returns -1 while running, -2 only for an
+// invalid request, `target` or less for a witness, and target+1 for a complete
+// no-target certificate.
+function thresholdStart(root: i32, prefixLen: i32, target: i32, budget: i32): i32 {
+    if (target < 0 || target > CELLS || budget < 0 ||
+        root < -1 || root >= rootCount || prefixLen < -1 ||
+        prefixLen >= LINE_MAX || (prefixLen >= 0 && root < 0)) {
+        cancelThreshold();
+        return -2;
+    }
+    consumeExactPrefix();
+    vsActive = false;
+    vsPaused = false;
+
+    if (tsPaused && tsTarget == target && tsRoot == root &&
+        thresholdPrefixMatches(prefixLen)) {
+        tsPaused = false;
+        tsActive = true;
+        tsNodes = 0;
+        tsBudget = budget;
+        return -1;
+    }
+
+    cancelThreshold();
+    tsTarget = target;
+    tsRoot = root;
+    tsPrefixLen = prefixLen;
+    tsBudget = budget;
+    tsActive = true;
+    let start = pu8(ROOT_BOARD);
+    let inheritedLower = 0;
+    let parentRemaining = -1;
+    if (root >= 0) {
+        if (prefixLen >= 0) {
+            if (!materializeRootPrefix(root, prefixLen, pu8(PLAYOUT_BOARD))) {
+                cancelThreshold();
+                return -2;
+            }
+            if (prefixLen > 0) {
+                memory.copy(pu8(EX_PREFIX_MOVES), pu8(PREFIX_MOVES), prefixLen);
+            }
+        } else {
+            memory.copy(pu8(PLAYOUT_BOARD), pu8(ROOT_BOARD), CELLS);
+            if (applyMove(pu8(PLAYOUT_BOARD), <i32>unchecked(ROOT_REP[root])) < 2) {
+                cancelThreshold();
+                return -2;
+            }
+        }
+        start = pu8(PLAYOUT_BOARD);
+        inheritedLower = <i32>unchecked(ROOT_LOWER[root]);
+        parentRemaining = rootRemaining;
+    }
+    const immediate = thresholdPush(start, inheritedLower, parentRemaining);
+    if (immediate == 1) {
+        tsActive = false;
+        tsComplete = true;
+        return tsFoundScore;
+    }
+    if (immediate == 0) {
+        tsActive = false;
+        tsComplete = true;
+        return tsTarget + 1;
+    }
+    return -1;
+}
+
+export function thresholdBegin(target: i32, budget: i32): i32 {
+    return thresholdStart(-1, -1, target, budget);
+}
+
+export function thresholdBeginChild(k: i32, target: i32, budget: i32): i32 {
+    return thresholdStart(k, -1, target, budget);
+}
+
+// JS writes `prefixLen` legal moves after root k to IO. The decision result
+// uses the ordinary threshold contract, but a completed miss remains local to
+// this fixed branch. Only the pool, after covering every legal sibling prefix,
+// may compose those misses into a root lower bound.
+export function thresholdBeginRootPrefix(
+    k: i32, prefixLen: i32, target: i32, budget: i32,
+): i32 {
+    return thresholdStart(k, prefixLen, target, budget);
+}
+
+export function thresholdCancel(): void {
+    cancelThreshold();
+}
+
+// Runs a bounded slice. Budget exhaustion retains the exact DFS frontier;
+// completed certificates already stored in VTT are never rolled back.
+export function thresholdStep(chunk: i32): i32 {
+    if (!tsActive) return -2;
+    let spent = 0;
+    while (spent < chunk) {
+        if (tsDepth == 0) {
+            tsActive = false;
+            tsComplete = true;
+            return tsTarget + 1;
+        }
+
+        const frame = tsDepth - 1;
+        const cursor = unchecked(EX_CURSOR[frame]);
+        const count = unchecked(EX_COUNT[frame]);
+        if (cursor >= count) {
+            thresholdStoreCertificate(unchecked(EX_HASH[frame]), tsTarget,
+                <i32>unchecked(EX_REMAINING[frame]));
+            tsDepth--;
+            continue;
+        }
+        if (tsNodes >= tsBudget) {
+            tsActive = false;
+            tsPaused = true;
+            return -2;
+        }
+        if (tsDepth >= EXACT_STACK) {
+            tsActive = false;
+            tsPaused = false;
+            return -2;
+        }
+
+        unchecked(EX_CURSOR[frame] = cursor + 1);
+        const child = pu8(EX_BOARDS) + <usize>(tsDepth * CELLS);
+        memory.copy(child, pu8(EX_BOARDS) + <usize>(frame * CELLS), CELLS);
+        const move = unchecked(EX_REPS[frame * MAX_ROOTS + cursor]);
+        unchecked(EX_MOVE[frame] = move);
+        applyMove(child, <i32>move);
+        tsNodes++;
+        spent++;
+        nodesExpanded++;
+        exactPositions++;
+
+        const result = thresholdPush(child, <i32>unchecked(EX_LOWER[frame]),
+            <i32>unchecked(EX_REMAINING[frame]));
+        if (result == 1) {
+            tsActive = false;
+            tsPaused = false;
+            tsComplete = true;
+            return tsFoundScore;
+        }
+    }
+    return -1;
+}
+
+// Merge only a completed decision. A witness is a constructive line. A miss
+// proves the searched whole position—or the selected child root—is above
+// target. When every root incumbent was target+1, the merged row bounds
+// compose into the global optimum without enumerating larger values.
+export function thresholdMerge(): i32 {
+    if (!tsComplete) return NO_SCORE;
+    if (tsFound) {
+        if (tsRoot >= 0) {
+            const k = tsRoot;
+            const prefixLen = tsPrefixLen >= 0 ? tsPrefixLen : 0;
+            const len = tsFoundLen + prefixLen + 1;
+            if (len <= LINE_MAX && tsFoundScore < unchecked(ROOT_BEST[k])) {
+                unchecked(ROOT_BEST[k] = tsFoundScore);
+                unchecked(ROOT_LINES[k * LINE_MAX] = unchecked(ROOT_REP[k]));
+                for (let d = 0; d < prefixLen; d++) {
+                    unchecked(ROOT_LINES[k * LINE_MAX + 1 + d] =
+                        unchecked(EX_PREFIX_MOVES[d]));
+                }
+                for (let d = 0; d < tsFoundLen; d++) {
+                    unchecked(ROOT_LINES[k * LINE_MAX + 1 + prefixLen + d] =
+                        unchecked(EX_LINE[d]));
+                }
+                unchecked(ROOT_LINE_LEN[k] = <u8>len);
+            }
+            maybeMarkRootExact(k);
+        } else if (tsFoundLen > 0) {
+            const first = unchecked(EX_LINE[0]);
+            for (let k = 0; k < rootCount; k++) {
+                if (<i32>unchecked(ROOT_REP[k]) != <i32>first) continue;
+                if (tsFoundScore < unchecked(ROOT_BEST[k])) {
+                    unchecked(ROOT_BEST[k] = tsFoundScore);
+                    unchecked(ROOT_LINE_LEN[k] = <u8>tsFoundLen);
+                    memory.copy(pu8(ROOT_LINES) + <usize>(k * LINE_MAX),
+                        pu8(EX_LINE), tsFoundLen);
+                }
+                maybeMarkRootExact(k);
+                break;
+            }
+        }
+        return tsFoundScore;
+    }
+
+    const lower = tsTarget + 1;
+    // Exhausting one fixed prefix proves only that branch. Raising the parent
+    // here would turn a single sibling miss into a false minimax certificate.
+    if (tsPrefixLen >= 0) return lower;
+    const firstRoot = tsRoot >= 0 ? tsRoot : 0;
+    const lastRoot = tsRoot >= 0 ? tsRoot + 1 : rootCount;
+    for (let k = firstRoot; k < lastRoot; k++) {
+        if (<i32>unchecked(ROOT_LOWER[k]) < lower) {
+            unchecked(ROOT_LOWER[k] = <u8>lower);
+        }
+        maybeMarkRootExact(k);
+    }
+    return lower;
 }
 
 // Pushes a board, resolves it immediately, or proves that it cannot improve
@@ -2354,10 +2955,8 @@ function vsPush(bd: usize, cutoff: i32, inheritedLower: i32, parentRemaining: i3
 // all earlier work. Returns -3 on a bad k, -1 when running (drive with
 // vsStep), or the immediate value
 export function vsBegin(k: i32, budget: i32): i32 {
-    clearExactPrefix();
-    exActive = false;
-    exComplete = false;
-    exWholeBoard = false;
+    consumeExactPrefix();
+    cancelThreshold();
     if (k < 0 || k >= rootCount) return -3;
 
     // A budget retry of the same root resumes the explicit DFS frontier.
@@ -2605,12 +3204,18 @@ export function testLowerBound(): i32 {
     return statLower;
 }
 
+// Delete-relaxation twin exposed only so the Node suite can compare the
+// admissible result with brute-force game values on complete small domains.
+export function testPotentialLowerBound(): i32 {
+    return potentialRemovalLower(pu8(IO));
+}
+
 // one recorded playout on the IO board (no root move); returns final remaining,
 // move line at IO+257 prefixed by its length at IO+256
 export function testPlayout(seed: u32): i32 {
     memory.copy(pu8(PLAYOUT_BOARD), pu8(IO), CELLS);
     unchecked(PLAYOUT_LINE[0] = 0);
-    const final = playoutRun(seed, true, dominantColor(pu8(PLAYOUT_BOARD)), false);
+    const final = playoutRun(seed, true, dominantColor(pu8(PLAYOUT_BOARD)), false, 1);
     const len = playoutLastLen > 0 ? playoutLastLen - 1 : 0;
     store<u8>(pu8(IO) + 256, <u8>len);
     memory.copy(pu8(IO) + 257, pu8(PLAYOUT_LINE) + 1, len);
@@ -2622,7 +3227,7 @@ export function testPlayout(seed: u32): i32 {
 export function testPlayoutSoft(seed: u32): i32 {
     memory.copy(pu8(PLAYOUT_BOARD), pu8(IO), CELLS);
     unchecked(PLAYOUT_LINE[0] = 0);
-    const final = playoutRun(seed, true, dominantColor(pu8(PLAYOUT_BOARD)), true);
+    const final = playoutRun(seed, true, dominantColor(pu8(PLAYOUT_BOARD)), true, 1);
     const len = playoutLastLen > 0 ? playoutLastLen - 1 : 0;
     store<u8>(pu8(IO) + 256, <u8>len);
     memory.copy(pu8(IO) + 257, pu8(PLAYOUT_LINE) + 1, len);
