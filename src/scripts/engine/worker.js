@@ -29,11 +29,17 @@
  *      move is proved; threatening roots within one child move of the exact
  *      gate get the same escalating value attempts pre-play (capped per
  *      root) that their child would run right after being played; farther
- *      above the gate (boards ≤ 120), every (first, second, third) prefix
+ *      above the gate (boards ≤ 132), every (first, second, third) prefix
  *      gets the clicked child's own virtual-child schedule — 100k/1M target
  *      seeks plus deterministic and diversified prefix beams — running
  *      back-to-back once the position value is certified; both audits
- *      block settlement until finished or proved
+ *      block settlement until finished or proved; ladder attempts rotate
+ *      least-invested-budget first, so one un-enumerable child cannot
+ *      starve siblings of their first bounded attempt, and once lane
+ *      zero's own roots are exact it adopts unproven satellite-owned
+ *      in-band roots on its full-size value memo (satellite memos are 32x
+ *      smaller and can thrash for minutes on children the primary proves
+ *      in seconds; any lane's proof merges soundly in the pool)
  *
  * Analysis ends in exactly three ways: a new position arrives, EVERY move is
  * proven optimal ("proven"), or SETTLE_PASSES unchanged *global* max-width
@@ -53,19 +59,20 @@
  * Released under the MIT license.
  * https://opensource.org/licenses/MIT
  *
- * Date: Sun Jul 12, 2026
+ * Date: Tue Jul 14, 2026
  */
 
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260714-parity3";
+import { createGpu, dominantColor } from "./gpu.js?build=20260714-pairband1";
 import {
-    analysisState, canTransferExactSuffix, createSearchProgress, pairAuditCandidates,
-    parityProofCandidates, positionProofCandidates, recordSearchPass, remainingAfterMove,
-    roundRobinPrefixTasks, settlementReady, shouldGpuCaretake, summarizePositionProof,
-} from "./schedule.js?build=20260714-parity3";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260714-parity3";
+    analysisState, canTransferExactSuffix, caretakerProofCandidates, createSearchProgress,
+    exactCandidateOrder, pairAuditCandidates, parityProofCandidates, positionProofCandidates,
+    recordSearchPass, remainingAfterMove, roundRobinPrefixTasks, settlementReady,
+    shouldGpuCaretake, summarizePositionProof,
+} from "./schedule.js?build=20260714-pairband1";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260714-pairband1";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
@@ -103,13 +110,18 @@ const EXACT_PARITY_BUDGET = 32000000;
 // child's 1M seeks / width-2048 beams find quickly. Give threatening
 // parents the identical (first, second, third) turns: same subtrees, same
 // budgets, same widths. Only boards a played child could plausibly prove
-// fast participate.
+// fast participate. 120 was miscalibrated: on a measured 127-cell position
+// two rows stuck at 1/0 through the full (first, second) schedule while
+// their played children proved zero from the (second, third) tiers — the
+// same rounds below prove them pre-play (one at the 1M seek, one at the
+// width-512 prefix beam). 132 covers that whole one-move band; audits stay
+// bounded by the threat filter, gap-first ordering and round rotation.
 const PAIR_AUDIT_ROUNDS = [
     { seek: 100000 }, { seek: 1000000 },
     { width: 128, seed: 0 }, { width: 512, seed: 0 },
     { width: 2048, seed: 0 }, { width: 2048, seed: 1 }, { width: 2048, seed: 2 },
 ];
-const PAIR_AUDIT_REMAINING = 120;
+const PAIR_AUDIT_REMAINING = 132;
 const LINE_BUDGET = 64000000;   // initial memo-guided line seek; rare retries escalate ×4
 const WIDEN_WIDTHS = [8, 32, 128, 512, 2048];
 // A clicked child receives deterministic lane-partitioned beams, then private
@@ -617,6 +629,14 @@ async function analyze(myJob, isStale) {
     const lockedMaxWidths = new Map(); // cell -> widest private pass already run
     for (let s = 1; ; s++) {
         if (isStale()) return;
+
+        // Peer lanes stream replay-validated proofs in through "merge" while
+        // this lane may be deep inside an exact grind whose cycles never
+        // reach a post. Re-read the WASM tables every cycle so an externally
+        // proven root cancels its redundant local solve within one quantum
+        // and a fully proven table stops this lane instead of letting it run
+        // hot behind an all-checkmarked display.
+        moves = collectResults().moves;
 
         if (moves.length > 0 && await finishLaneIfComplete(moves)) return;
 
@@ -1131,9 +1151,23 @@ function createExactLadder(isStale, postIfDue) {
             });
         },
 
+        // Unproven in-band roots owned by satellite lanes. Their compact
+        // value memos can thrash indefinitely on children this lane's full
+        // table proves in seconds, so once lane zero's own roots are exact
+        // it adopts them; the pool merges any lane's proof soundly.
+        caretakerCandidates(moves) {
+            return caretakerProofCandidates(moves, {
+                lane: LANE,
+                owns,
+                childRemainingOf: childRemaining,
+                gate: EXACT_TRY_REMAINING,
+            });
+        },
+
         // Pre-play proof work still owed before this lane may settle.
         pendingProofCount(moves) {
-            return this.parityCandidates(moves).length + this.pairCandidates(moves).length;
+            return this.parityCandidates(moves).length + this.pairCandidates(moves).length +
+                this.caretakerCandidates(moves).length;
         },
 
         // Begins the next (first, second, third) audit turn, advancing the
@@ -1201,7 +1235,11 @@ function createExactLadder(isStale, postIfDue) {
         },
 
         shouldPrioritize(moves) {
-            const unresolved = moves.filter((move) => owns(move) && !move.exact);
+            // Adopted satellite roots are in-band by construction, so they
+            // extend the back-to-back case without changing the mixed-board
+            // rule for this lane's own above-gate children.
+            const unresolved = moves.filter((move) => owns(move) && !move.exact)
+                .concat(this.caretakerCandidates(moves));
             // When every owned child is under the exact gate, finish the
             // retained value frontier back-to-back. On mixed boards, give the
             // eligible children one bounded quantum per cycle without letting
@@ -1220,16 +1258,20 @@ function createExactLadder(isStale, postIfDue) {
             if (active && moves.find((m) => m.cell === active.cell)?.exact) active = null;
 
             if (!active) {
-                // Prove the broadest child first (smallest removed root
-                // group). Its exact traversal reaches the most shared
-                // descendants and warms the persistent value memo for the
-                // narrower siblings; score order is only the tie-breaker.
-                // On the hard corpus this changes all-root completion from
-                // repeated table-thrashing traversals into one broad solve
-                // followed by mostly memo-backed proofs.
-                const next = moves.filter((m) => owns(m) && !m.exact &&
-                    childRemaining(m) <= EXACT_TRY_REMAINING)
-                    .sort((a, b) => a.size - b.size || a.score - b.score || a.cell - b.cell)[0] ??
+                // Least-invested budget first, then the broadest child
+                // (smallest removed root group): fresh roots all get their
+                // first bounded attempt — in the memo-warming broad order —
+                // before any hard sibling escalates a tier. One un-enumerable
+                // child can otherwise monopolize the lane for minutes while
+                // a root behind it is provable within its very first budget.
+                const investedOf = (move) => exhausted.get(move.cell) ?? 0;
+                const next = exactCandidateOrder(
+                    moves.filter((m) => owns(m) && !m.exact &&
+                        childRemaining(m) <= EXACT_TRY_REMAINING), investedOf)[0] ??
+                    // Adopt stuck satellite-owned in-band roots before the
+                    // speculative near-gate parity attempts: they are proofs
+                    // the position certainly owes, on the full value memo.
+                    exactCandidateOrder(this.caretakerCandidates(moves), investedOf)[0] ??
                     // Proof parity: with no compact child left, spend the
                     // capped escalating attempts on near-gate threats.
                     this.parityCandidates(moves)[0];
@@ -1453,7 +1495,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260714-parity3");
+            wasmURL.searchParams.set("build", "20260714-pairband1");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();

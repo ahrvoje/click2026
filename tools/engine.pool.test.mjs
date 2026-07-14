@@ -12,10 +12,55 @@ import {
 import assert from "node:assert/strict";
 import {
     canTransferExactSuffix,
+    caretakerProofCandidates,
+    exactCandidateOrder,
     pairAuditCandidates,
     parityProofCandidates,
     roundRobinPrefixTasks,
 } from "../src/scripts/engine/schedule.js";
+
+// Ladder rotation: least-invested budget first, so every in-band root gets
+// its bounded value attempt before any hard sibling escalates a tier; fresh
+// roots keep the memo-warming broadest-child order among themselves.
+{
+    const ladderMoves = [
+        { cell: 4, score: 2, size: 3 }, // hard root, one 8M tier already spent
+        { cell: 7, score: 6, size: 3 }, // fresh, provable within its first tier
+        { cell: 9, score: 3, size: 2 }, // fresh, broadest child goes first
+    ];
+    const invested = new Map([[4, 8000000]]);
+    assert.deepEqual(exactCandidateOrder(ladderMoves,
+        (move) => invested.get(move.cell) ?? 0).map((move) => move.cell), [9, 7, 4]);
+    invested.set(9, 8000000).set(7, 32000000);
+    assert.deepEqual(exactCandidateOrder(ladderMoves,
+        (move) => invested.get(move.cell) ?? 0).map((move) => move.cell), [9, 4, 7]);
+    assert.deepEqual(ladderMoves.map((move) => move.cell), [4, 7, 9]); // input untouched
+}
+
+// Primary-lane proof caretaking: only lane zero, only once its own roots are
+// exact, and only for unproven satellite-owned roots inside the exact band.
+{
+    const owns = (move) => move.cell % 4 === 0;
+    const caretakerMoves = [
+        { cell: 4, score: 0, size: 2, exact: true },  // owned, proved
+        { cell: 3, score: 2, size: 3, exact: false }, // satellite, in band
+        { cell: 5, score: 1, size: 2, exact: true },  // satellite, already proved
+        { cell: 6, score: 3, size: 2, exact: false }, // satellite, above the band
+    ];
+    const options = {
+        lane: 0,
+        owns,
+        childRemainingOf: (move) => (move.cell === 6 ? 100 : 81),
+        gate: 88,
+    };
+    assert.deepEqual(caretakerProofCandidates(caretakerMoves, options)
+        .map((move) => move.cell), [3]);
+    assert.deepEqual(caretakerProofCandidates(caretakerMoves,
+        { ...options, lane: 1 }), []);
+    const ownedUnproven = caretakerMoves.map((move) =>
+        (move.cell === 4 ? { ...move, exact: false } : move));
+    assert.deepEqual(caretakerProofCandidates(ownedUnproven, options), []);
+}
 
 // Escalating pair-seek audit: above-gate threatening roots qualify on boards
 // a played child could prove fast; exhausted rounds, sound-nonzero rows

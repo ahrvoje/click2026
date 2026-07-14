@@ -14,7 +14,7 @@
  */
 
 import { canonicalBlock, LETTERS } from "./board.js";
-import { EngineWorkerPool } from "./engine/pool.js?build=20260714-parity3";
+import { EngineWorkerPool } from "./engine/pool.js?build=20260714-pairband1";
 
 const TOP_N = 5;
 const SUGGESTED_MODE_TOP_5 = "top5";
@@ -23,7 +23,7 @@ const SUGGESTED_MODE_ALL = "all";
 // Keep the module worker, its static imports and the compiled WASM on one
 // cache generation. A stale dependency makes a module worker fail before any
 // of its error-reporting code can run, yielding only an opaque ErrorEvent.
-const ENGINE_ASSET_VERSION = "20260714-parity3";
+const ENGINE_ASSET_VERSION = "20260714-pairband1";
 
 // rank accent colors, shared by the list rows and the board outlines; picked
 // to stay distinguishable from the five play colors and the replay highlight

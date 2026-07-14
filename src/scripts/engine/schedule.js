@@ -181,6 +181,30 @@ export function pairAuditCandidates(moves, {
             a.score - b.score || b.size - a.size || a.cell - b.cell);
 }
 
+// Exact-ladder rotation: every in-band root gets its bounded value attempt
+// before any sibling escalates a tier further. vsBegin resumes only the most
+// recently paused root's DFS frontier, so switching roots costs one
+// VTT-accelerated re-descent per tier — bounded by the geometric budgets —
+// while head-of-line blocking on one hard root starves siblings that are
+// provable in seconds the moment they are played.
+export function exactCandidateOrder(moves, investedOf) {
+    return moves.slice().sort((a, b) => investedOf(a) - investedOf(b) ||
+        a.size - b.size || a.score - b.score || a.cell - b.cell);
+}
+
+// Primary-lane proof caretaking. Satellite lanes run a much smaller value
+// memo and can thrash for minutes on a ~80-cell child the primary's full
+// table proves in seconds. Once the primary's own roots are exact it adopts
+// every unproven in-band root: exact proofs are lane-independent — the pool
+// accepts one proof from any lane and broadcasts it back as a seed, so the
+// stuck owner simply drops its grind when the adopted proof arrives.
+export function caretakerProofCandidates(moves, { lane, owns, childRemainingOf, gate }) {
+    if (lane !== 0) return [];
+    if (!moves.filter(owns).every((move) => move.exact)) return [];
+    return moves.filter((move) => !owns(move) && !move.exact &&
+        childRemainingOf(move) <= gate);
+}
+
 // One fair bounded proof probe is useful only for roots that can still beat
 // the incumbent. Tight score/lower gaps go first, but no threatening root is
 // omitted; the caller owns the per-root budget and can stop as soon as the

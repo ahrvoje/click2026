@@ -18,7 +18,7 @@
 
 import { Game } from "./game.js";
 import { LETTERS } from "./board.js";
-import { EngineUI } from "./engine-ui.js?build=20260714-parity3";
+import { EngineUI } from "./engine-ui.js?build=20260714-pairband1";
 import { TreeUI } from "./tree-ui.js";
 
 const examples = [
