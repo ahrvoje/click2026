@@ -29,8 +29,6 @@ if (!executablePath) {
 
 const shot = process.argv.includes("--shot");
 const baseURL = (process.env.BASE_URL || "http://localhost:8123").replace(/\/$/, "");
-const recursiveTimeoutMs = Number(process.env.RECURSIVE_TIMEOUT_MS || 90000);
-const compactObservationMs = Number(process.env.COMPACT_OBSERVATION_MS || 15000);
 let failures = 0;
 const check = (ok, title, detail) => {
     console.log(`${ok ? "ok  " : "FAIL"}  ${title}${detail ? "  " + JSON.stringify(detail) : ""}`);
@@ -40,7 +38,6 @@ const check = (ok, title, detail) => {
 const browser = await puppeteer.launch({
     executablePath,
     headless: "new",
-    protocolTimeout: 120000,
     args: ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--no-sandbox"],
 });
 
@@ -118,7 +115,7 @@ try {
     // play the engine's #1 suggestion by clicking its group cell on the canvas
     const target = await page.evaluate(async () => {
         // reach into the module graph via a dynamic import of the same URL
-        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260713-proof13");
+        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260713-proof8");
         return EngineUI.isOn();
     });
     check(target === true, "EngineUI singleton shared with page modules");
@@ -246,10 +243,8 @@ try {
     // continuous analysis: on a full board (no proofs possible) the engine
     // must keep working indefinitely — nodes strictly increasing, no idle-out
     const nodesOf = async () => page.$eval("#engineStatus .engineStNodes", (s) => {
-        const m = s.textContent.match(/([\d.]+)([BMk]?)/);
-        const scale = m?.[2] === "B" ? 1e9 : m?.[2] === "M" ? 1e6 :
-            m?.[2] === "k" ? 1e3 : 1;
-        return m ? parseFloat(m[1]) * scale : -1;
+        const m = s.textContent.match(/([\d.]+)([Mk]?)/);
+        return m ? parseFloat(m[1]) * (m[2] === "M" ? 1e6 : m[2] === "k" ? 1e3 : 1) : -1;
     });
     await new Promise((r) => setTimeout(r, 6000));
     const nodesA = await nodesOf();
@@ -309,135 +304,6 @@ try {
         await page.click("#engineButton");
     }
 
-    // Recursive pre/post-click consistency regression. At move 6 select the
-    // JH variant (the second branch). FA and DC used to remain at 1 for tens
-    // of seconds, although entering either child exposed a zero almost
-    // immediately through one more virtual-child split.
-    const recursiveCase = "?v=5&g=c8_xC_qbkOmoL9PZI-OPrF1IvXT0gZS4-eB6ANOq1WKyA6e1WMZK-_U0qw4HFOrYA0HyOF3Gd0XWMZZfgVegxTEykEHwefiPh";
-    await page.goto(`${baseURL}/src/index.html${recursiveCase}`, { waitUntil: "networkidle0" });
-    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
-        await page.click("#engineButton");
-    }
-    await page.click("#settingsButton");
-    await page.click('input[name="suggestedMovesMode"][value="all"]');
-    await page.click("#settingsDialog .settingsClose");
-    const selectedJHVariant = await page.evaluate(() => {
-        const candidates = [...document.querySelectorAll("#treeScroll .treeNode")]
-            .filter((node) => node.querySelector(".treeLabel")?.textContent === "JH");
-        const positioned = candidates.map((node) => {
-            const match = node.getAttribute("transform")?.match(/translate\(([-\d.]+)/);
-            return { node, x: match ? Number(match[1]) : -Infinity };
-        }).sort((a, b) => b.x - a.x);
-        const variant = positioned[0]?.node;
-        variant?.dispatchEvent(new MouseEvent("mousedown", {
-            bubbles: true, cancelable: true, button: 0,
-        }));
-        return { count: candidates.length, selected: Boolean(variant) };
-    });
-    const recursiveSelection = await page.evaluate(() => ({
-        move: document.getElementById("moveValue").textContent,
-        remaining: document.getElementById("scoreValue").textContent,
-        focus: document.querySelector("#treeScroll .treeNode.focus .treeLabel")?.textContent,
-    }));
-    check(selectedJHVariant.count === 2 && selectedJHVariant.selected &&
-        recursiveSelection.move === "6 / 15" && recursiveSelection.remaining === "103" &&
-        recursiveSelection.focus === "JH",
-    "recursive consistency regression selects move 6 JH variant");
-    if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
-        await page.click("#engineButton");
-    }
-    const recursiveStart = performance.now();
-    await page.waitForFunction(() => {
-        const rows = [...document.querySelectorAll("#engineList .engineRow")];
-        return ["FA", "DC"].every((location) => rows.some((row) =>
-            row.querySelector(".engineLoc")?.textContent === location &&
-            parseInt(row.querySelector(".engineScore")?.textContent ?? "9999", 10) === 0 &&
-            row.querySelector(".engineExact")?.textContent === "✓"));
-    }, { timeout: recursiveTimeoutMs });
-    const recursiveResult = await page.evaluate(() => ({
-        rows: [...document.querySelectorAll("#engineList .engineRow")].map((row) => ({
-            location: row.querySelector(".engineLoc")?.textContent,
-            score: parseInt(row.querySelector(".engineScore")?.textContent ?? "9999", 10),
-            exact: row.querySelector(".engineExact")?.textContent,
-        })),
-        status: document.getElementById("engineStatus").textContent,
-    }));
-    recursiveResult.elapsedMs = Math.round(performance.now() - recursiveStart);
-    check(["FA", "DC"].every((location) => recursiveResult.rows.some((row) =>
-        row.location === location && row.score === 0 && row.exact === "✓")),
-    "parent analysis resolves FA/DC without playing either move", recursiveResult);
-    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
-        await page.click("#engineButton");
-    }
-
-    // The G7 link stores a tree but not its selected node. Reproduce the only
-    // recorded positive leaf explicitly: move 15, 84 cells. This remains a
-    // hard universal proof, so the regression is deliberately bounded: it
-    // checks that the intended position is analyzed, work advances, and any
-    // certification exposed by the UI agrees with the row-level exact marks.
-    // This checks progress/certification semantics, not peak throughput. Four
-    // lanes keep headless Chrome's DevTools thread responsive while the hard
-    // universal proof runs; the supplied 16-lane performance case is covered
-    // independently by the focused regression above.
-    const compactProofCase = "?v=5&g=G7hGDfQ_u8-RuUiNwlBPWQYGCitOqgY9Zi1Z-F0sf3WHSpfuQsGhchAYNCVsfRfGbplq37oZTqDrFgFqovNPzrBidRg_D&engineWorkers=4";
-    await page.goto(`${baseURL}/src/index.html${compactProofCase}`, { waitUntil: "networkidle0" });
-    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
-        await page.click("#engineButton");
-    }
-    await page.evaluate(() => {
-        const slider = document.getElementById("movesSlider");
-        slider.value = slider.max;
-        slider.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    const compactSelection = await page.evaluate(() => ({
-        move: document.getElementById("moveValue").textContent,
-        remaining: document.getElementById("scoreValue").textContent,
-        focus: document.querySelector("#treeScroll .treeNode.focus .treeLabel")?.textContent,
-    }));
-    check(compactSelection.move === "15 / 15" && compactSelection.remaining === "84" &&
-        compactSelection.focus === "DC",
-        "compact positive-proof regression selects the recorded move-15 leaf");
-    await page.click("#settingsButton");
-    await page.click('input[name="suggestedMovesMode"][value="all"]');
-    await page.click("#settingsDialog .settingsClose");
-    if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
-        await page.click("#engineButton");
-    }
-    const compactStart = performance.now();
-    await page.waitForFunction(() =>
-        document.querySelectorAll("#engineList .engineRow").length === 15 &&
-        /pos\/s/.test(document.getElementById("engineStatus").textContent),
-    { timeout: 20000 });
-    const compactInitialNodes = await nodesOf();
-    await new Promise((resolve) => setTimeout(resolve, compactObservationMs));
-    const compactResult = await page.evaluate(() => ({
-        rows: [...document.querySelectorAll("#engineList .engineRow")].map((row) => ({
-            location: row.querySelector(".engineLoc")?.textContent,
-            score: parseInt(row.querySelector(".engineScore")?.textContent ?? "9999", 10),
-            exact: row.querySelector(".engineExact")?.textContent === "✓",
-        })),
-        status: document.getElementById("engineStatus").textContent,
-    }));
-    compactResult.initialNodes = compactInitialNodes;
-    compactResult.finalNodes = await nodesOf();
-    compactResult.elapsedMs = Math.round(performance.now() - compactStart);
-    const compactExactRows = compactResult.rows.filter((row) => row.exact);
-    const compactBestScore = Math.min(...compactResult.rows.map((row) => row.score));
-    const compactCertificationConsistent = /proven ✓/.test(compactResult.status)
-        ? compactExactRows.length === compactResult.rows.length
-        : /optimal ✓/.test(compactResult.status)
-            ? compactExactRows.some((row) => row.score === compactBestScore)
-            : true;
-    check(compactResult.rows.length === 15 &&
-        compactResult.finalNodes > compactResult.initialNodes,
-    "hard positive position makes bounded analysis progress", compactResult);
-    check(compactCertificationConsistent,
-        "hard positive position never advertises certification without matching exact rows",
-        compactResult);
-    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
-        await page.click("#engineButton");
-    }
-
     // Regression: this full-board position has an easy-to-certify clearing
     // move mixed with a much harder positive alternative. The position value
     // must be reported as optimal without waiting for every row to be exact.
@@ -470,9 +336,6 @@ try {
     // replayable/proven zero before the normal heuristic can settle at 2.
     const fragmentationCase = "?v=5&g=BanJkAhMlxgvWGHOJNM7B0JS-20PRwJU6AfudCmzcF3cYlDaHIhRydZ8xoRe7e3Hxd2HzIMOEa_X26eg_wQQA5waAY4ZYkm_Oa-pX8KVh3Xa73NcBt2VpwT9tkxjGcluEc34dyGau_uyeWIs6ESM-bdaaxMfG3CKk8PUIEmUrQawuUVtAd8Xp98UWFLIIJuKpFkoL6sMzQGB_h0mSn9";
     await page.goto(`${baseURL}/${fragmentationCase}`, { waitUntil: "networkidle0" });
-    if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
-        await page.click("#engineButton");
-    }
     await page.evaluate(() => {
         const canvas = document.getElementById("gameCanvas");
         for (let i = 0; i < 25; i++) {

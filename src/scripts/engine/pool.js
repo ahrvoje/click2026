@@ -10,14 +10,7 @@
 
 const DEFAULT_MAX_LANES = 16;
 const PRIMARY_MEMORY_MIB = 178;
-const SATELLITE_MEMORY_MIB = 46;
-const COORDINATED_THRESHOLD_REMAINING = 88;
-// State-deduplicated fixed-prefix frontiers remain bounded on the compact
-// proof gate. Never truncate a larger frontier: omitted branches would turn
-// an incomplete search into an unsound lower bound. The plan is abandoned and
-// blacklisted for that position instead.
-const MAX_COORDINATED_THRESHOLD_FRONTIER = 8192;
-const MAX_COORDINATED_THRESHOLD_ALIASES = 65536;
+const SATELLITE_MEMORY_MIB = 37;
 
 function finiteNumber(value, fallback = 0) {
     return Number.isFinite(value) ? Number(value) : fallback;
@@ -43,7 +36,7 @@ export function detectParallelCapabilities(nav = globalThis.navigator ?? {}) {
  * Pick a safe number of full WASM instances.
  *
  * The primary exact-capable instance reserves about 178 MiB. Each beam/root
- * satellite uses the compact 46 MiB build, so phones stay at one lane while
+ * satellite uses the compact 37 MiB build, so phones stay at one lane while
  * many-core desktops can safely reach sixteen. Callers may lower maxLanes, and
  * tests/developer tools may explicitly force a count.
  */
@@ -71,10 +64,10 @@ export function selectLaneCount(capabilities, options = {}) {
     // Navigator.deviceMemory is privacy-rounded and capped (commonly at
     // 8 GiB), so it is useful for detecting small devices, not large ones.
     // Reserve no more than roughly 10% for the 178 MiB primary plus compact
-    // 46 MiB satellites. This is intentionally only a low-memory guard:
+    // 37 MiB satellites. This is intentionally only a low-memory guard:
     // Navigator.deviceMemory is commonly capped at 8 even on large desktops.
     let byMemory = maxLanes;
-    if (memoryGiB > 0 && memoryGiB < 8) {
+    if (memoryGiB > 0) {
         const budgetMiB = memoryGiB * 1024 * 0.10;
         byMemory = budgetMiB < PRIMARY_MEMORY_MIB ? 1 :
             1 + Math.floor((budgetMiB - PRIMARY_MEMORY_MIB) / SATELLITE_MEMORY_MIB);
@@ -82,14 +75,14 @@ export function selectLaneCount(capabilities, options = {}) {
     return Math.max(1, Math.min(maxLanes, byCores, byMemory));
 }
 
-/** A stable, exhaustive and count-balanced root partition across worker lanes. */
-export function rootOwner(rootIndex, laneCount) {
+/** A stable, exhaustive and disjoint root partition across worker lanes. */
+export function rootOwner(cell, laneCount) {
     const lanes = Math.max(1, Math.floor(laneCount));
-    return ((Math.floor(rootIndex) % lanes) + lanes) % lanes;
+    return ((Math.floor(cell) % lanes) + lanes) % lanes;
 }
 
-export function laneOwnsRoot(rootIndex, lane, laneCount) {
-    return rootOwner(rootIndex, laneCount) === lane;
+export function laneOwnsRoot(cell, lane, laneCount) {
+    return rootOwner(cell, laneCount) === lane;
 }
 
 /**
@@ -107,57 +100,6 @@ export function laneSeed(baseSeed, lane, pass = 0) {
     x ^= x >>> 16;
     return (x >>> 0) || 1;
 }
-
-function thresholdPlanMatches(plan, message) {
-    return plan !== null && message.id === plan.id && message.epoch === plan.epoch &&
-        message.target === plan.target;
-}
-
-function canonicalThresholdChildren(children) {
-    if (!Array.isArray(children)) throw new Error("threshold children are not an array");
-    const canonical = children.map((entry) => {
-        const cell = Math.floor(finiteNumber(entry?.cell, -1));
-        const source = entry?.board;
-        const board = source instanceof Uint8Array ? source :
-            Array.isArray(source) ? Uint8Array.from(source) : null;
-        if (cell < 0 || cell >= 144 || !board || board.length !== 144 ||
-            board.some((value) => value > 5)) {
-            throw new Error("threshold child has an invalid cell or board");
-        }
-        // Exact byte equality is the proof identity. Hash-only grouping would
-        // make a collision capable of certifying an unrelated branch.
-        let stateKey = "";
-        for (let at = 0; at < board.length; at += 48) {
-            stateKey += String.fromCharCode(...board.subarray(at, at + 48));
-        }
-        return { cell, stateKey };
-    });
-    if (canonical.some((entry, index) => index > 0 &&
-        entry.cell <= canonical[index - 1].cell)) {
-        throw new Error("threshold children are not strictly canonical");
-    }
-    return canonical;
-}
-
-function sameThresholdChildren(left, right) {
-    if (left === null || right === null) return left === right;
-    return left.length === right.length && left.every((entry, index) =>
-        entry.cell === right[index].cell && entry.stateKey === right[index].stateKey);
-}
-
-function canonicalPrefix(prefix) {
-    if (!Array.isArray(prefix) || prefix.length >= 80) {
-        throw new Error("threshold prefix is not a bounded array");
-    }
-    const canonical = prefix.map((cell) => Math.floor(finiteNumber(cell, -1)));
-    if (canonical.some((cell) => cell < 0 || cell >= 144)) {
-        throw new Error("threshold prefix contains an invalid cell");
-    }
-    return canonical;
-}
-
-const thresholdTaskKey = (rootCell, prefix) => `${rootCell}/${prefix.join(",")}`;
-const thresholdAttemptKey = (id, target) => `${id}/${target}`;
 
 function proofOf(moves) {
     if (moves.length === 0) {
@@ -363,7 +305,7 @@ export function mergeLaneResults(laneResults, expectedLanes = laneResults.length
 /**
  * Worker-compatible facade owned by the main thread. Lane zero owns WebGPU
  * and the full exact engine; all satellite lanes are CPU-only. A failed lane causes a full,
- * smaller-pool restart so no ordinal-owned roots are silently abandoned.
+ * smaller-pool restart so no modulo-owned roots are silently abandoned.
  */
 export class EngineWorkerPool {
     constructor(workerURL, options = {}) {
@@ -384,16 +326,6 @@ export class EngineWorkerPool {
         this._lastAnalyze = null;
         this._sharedSignature = "";
         this._terminalId = null;
-        this._caretakerStopId = null;
-        this._thresholdEpoch = 0;
-        this._thresholdPlan = null;
-        this._thresholdFrontier = [];
-        this._thresholdFrontierIndex = new Map();
-        this._thresholdRootPending = new Map();
-        this._thresholdOutcomes = new Map();
-        this._thresholdRound = -1;
-        this._certifiedLowers = new Map();
-        this._thresholdUnplannable = new Set();
         this._generation = 0;
         this._terminated = false;
         this._spawn();
@@ -403,12 +335,6 @@ export class EngineWorkerPool {
         const generation = ++this._generation;
         this._ready.clear();
         this._latest.clear();
-        this._cancelThresholdPlan(false);
-        this._certifiedLowers.clear();
-        this._thresholdUnplannable.clear();
-        this._sharedSignature = "";
-        this._terminalId = null;
-        this._caretakerStopId = null;
         this._workers = Array.from({ length: this.laneCount }, (_, lane) => {
             const url = new URL(this._baseURL);
             url.searchParams.set("lane", String(lane));
@@ -432,360 +358,7 @@ export class EngineWorkerPool {
         this.onmessage?.({ data });
     }
 
-    _resetThresholdCoverage() {
-        this._thresholdFrontier = [];
-        this._thresholdFrontierIndex.clear();
-        this._thresholdRootPending.clear();
-        this._thresholdOutcomes.clear();
-        this._thresholdRound = -1;
-    }
-
-    _cancelThresholdPlan(notify = true) {
-        const previous = this._thresholdPlan;
-        this._thresholdPlan = null;
-        this._thresholdEpoch++;
-        this._resetThresholdCoverage();
-        if (notify && previous) {
-            for (const worker of this._workers) {
-                worker.postMessage({
-                    type: "threshold-cancel",
-                    id: previous.id,
-                    epoch: previous.epoch,
-                });
-            }
-        }
-    }
-
-    _applyCertifiedLowers(merged) {
-        if (!merged) return merged;
-        for (const move of merged.moves) {
-            const certified = this._certifiedLowers.get(move.cell);
-            if (!Number.isFinite(certified) || certified <= move.lower) continue;
-            if (certified > move.score) {
-                throw new Error(`threshold certificate contradicts root ${move.cell}`);
-            }
-            move.lower = certified;
-            if (move.lower === move.score) move.exact = true;
-        }
-        merged.moves.sort((a, b) => a.score - b.score || b.size - a.size || a.cell - b.cell);
-        const proof = proofOf(merged.moves);
-        Object.assign(merged.stats, proof);
-        merged.stats.state = proof.allMovesExact && merged.stats.settled ? "proven" :
-            proof.positionExact ? "optimal" :
-            merged.stats.settled ? "settled" : "analyzing";
-        return merged;
-    }
-
-    _latestMerged() {
-        if (this._latest.size === 0) return null;
-        return this._applyCertifiedLowers(
-            mergeLaneResults([...this._latest.values()], this.laneCount));
-    }
-
-    _ensureThresholdPlan(merged) {
-        if (!merged || this._latest.size !== this.laneCount ||
-            merged.stats.positionUpper <= 0 || merged.stats.positionExact) {
-            if (this._thresholdPlan) this._cancelThresholdPlan();
-            return;
-        }
-
-        const target = merged.stats.positionUpper - 1;
-        if (this._thresholdUnplannable.has(
-            thresholdAttemptKey(merged.id, target))) return;
-        if (this._thresholdPlan) {
-            if (this._thresholdPlan.id === merged.id &&
-                this._thresholdPlan.target === target &&
-                this._thresholdPlan.roots.every((cell) => {
-                    const row = merged.moves.find((move) => move.cell === cell);
-                    return row && !row.exact && row.lower <= target && row.score > target;
-                })) {
-                return;
-            }
-            this._cancelThresholdPlan();
-        }
-
-        const candidates = merged.moves
-            .filter((move) => !move.exact && move.lower <= target && move.score > target &&
-                merged.remaining - move.size <= COORDINATED_THRESHOLD_REMAINING)
-            .sort((a, b) => a.cell - b.cell);
-        if (candidates.length === 0) return;
-
-        this._resetThresholdCoverage();
-        const plan = {
-            id: merged.id,
-            epoch: ++this._thresholdEpoch,
-            target,
-            roots: candidates.map((move) => move.cell),
-        };
-        this._thresholdPlan = plan;
-        this._thresholdRound = 0;
-        if (!this._setThresholdFrontier(
-            plan.roots.map((rootCell) => ({ rootCell, prefix: [] })))) {
-            this._thresholdUnplannable.add(thresholdAttemptKey(plan.id, plan.target));
-            this._cancelThresholdPlan();
-            return;
-        }
-        for (const worker of this._workers) {
-            worker.postMessage({ type: "threshold-plan", ...plan });
-        }
-        this._broadcastThresholdFrontier();
-    }
-
-    _thresholdMessageError(error) {
-        const plan = this._thresholdPlan;
-        if (plan) this._thresholdUnplannable.add(
-            thresholdAttemptKey(plan.id, plan.target));
-        this._emit({ type: "error", message: String(error?.stack ?? error) });
-        this._cancelThresholdPlan();
-    }
-
-    _broadcastThresholdFrontier() {
-        const plan = this._thresholdPlan;
-        if (!plan) return;
-        const message = {
-            type: "threshold-frontier",
-            id: plan.id,
-            epoch: plan.epoch,
-            target: plan.target,
-            round: this._thresholdRound,
-            tasks: this._thresholdFrontier.map(({ rootCell, prefix }) => ({
-                rootCell,
-                prefix: prefix.slice(),
-            })),
-        };
-        for (const worker of this._workers) worker.postMessage(message);
-    }
-
-    _setThresholdFrontier(tasks) {
-        if (tasks.length > MAX_COORDINATED_THRESHOLD_FRONTIER) {
-            return false;
-        }
-        let aliasCount = 0;
-        this._thresholdFrontier = tasks.map((task) => {
-            const aliases = Array.isArray(task.aliases) && task.aliases.length > 0 ?
-                task.aliases.map((alias) => ({
-                    rootCell: Math.floor(finiteNumber(alias.rootCell, -1)),
-                    prefix: canonicalPrefix(alias.prefix),
-                })) : [{
-                    rootCell: Math.floor(finiteNumber(task.rootCell, -1)),
-                    prefix: canonicalPrefix(task.prefix),
-                }];
-            if (aliases.some((alias) => alias.rootCell < 0 || alias.rootCell >= 144) ||
-                new Set(aliases.map((alias) => alias.rootCell)).size !== aliases.length) {
-                throw new Error("threshold task aliases are invalid or duplicate a root");
-            }
-            aliasCount += aliases.length;
-            const representative = aliases[0];
-            return {
-                rootCell: representative.rootCell,
-                prefix: representative.prefix.slice(),
-                aliases,
-                stateKey: typeof task.stateKey === "string" ? task.stateKey : null,
-            };
-        });
-        if (aliasCount > MAX_COORDINATED_THRESHOLD_ALIASES) {
-            this._thresholdFrontier = [];
-            return false;
-        }
-        this._thresholdFrontierIndex.clear();
-        this._thresholdRootPending.clear();
-        for (let index = 0; index < this._thresholdFrontier.length; index++) {
-            const task = this._thresholdFrontier[index];
-            const key = thresholdTaskKey(task.rootCell, task.prefix);
-            if (this._thresholdFrontierIndex.has(key)) {
-                throw new Error(`duplicate threshold frontier task ${key}`);
-            }
-            this._thresholdFrontierIndex.set(key, index);
-            for (const alias of task.aliases) {
-                this._thresholdRootPending.set(alias.rootCell,
-                    (this._thresholdRootPending.get(alias.rootCell) ?? 0) + 1);
-            }
-        }
-        return true;
-    }
-
-    _onThresholdMiss(lane, message) {
-        this._acceptThresholdOutcome(lane, message, "miss");
-    }
-
-    _onThresholdSplit(lane, message) {
-        this._acceptThresholdOutcome(lane, message, "split");
-    }
-
-    _certifyThresholdRoot(rootCell) {
-        const plan = this._thresholdPlan;
-        if (!plan || !plan.roots.includes(rootCell)) return false;
-        const lower = plan.target + 1;
-        this._certifiedLowers.set(rootCell,
-            Math.max(lower, this._certifiedLowers.get(rootCell) ?? 0));
-        plan.roots = plan.roots.filter((cell) => cell !== rootCell);
-        for (const worker of this._workers) {
-            worker.postMessage({
-                type: "threshold-root-bound",
-                id: plan.id,
-                epoch: plan.epoch,
-                rootCell,
-                lower,
-            });
-        }
-        return true;
-    }
-
-    _nextThresholdFrontier() {
-        const byState = new Map();
-        let aliasCount = 0;
-        for (const task of this._thresholdFrontier) {
-            const outcome = this._thresholdOutcomes.get(
-                thresholdTaskKey(task.rootCell, task.prefix));
-            if (outcome.type !== "split") continue;
-            for (const child of outcome.children) {
-                let grouped = byState.get(child.stateKey);
-                if (!grouped) {
-                    grouped = {
-                        stateKey: child.stateKey,
-                        aliases: [],
-                        roots: new Set(),
-                    };
-                    byState.set(child.stateKey, grouped);
-                    if (byState.size > MAX_COORDINATED_THRESHOLD_FRONTIER) return null;
-                }
-                // Every alias is the same exact board before this move, so the
-                // canonical child cell produces the same exact successor. One
-                // replayable prefix per participating root is sufficient; all
-                // other commuting paths have the identical future game.
-                for (const alias of task.aliases) {
-                    if (grouped.roots.has(alias.rootCell)) continue;
-                    grouped.roots.add(alias.rootCell);
-                    aliasCount++;
-                    if (aliasCount > MAX_COORDINATED_THRESHOLD_ALIASES) return null;
-                    grouped.aliases.push({
-                        rootCell: alias.rootCell,
-                        prefix: [...alias.prefix, child.cell],
-                    });
-                }
-            }
-        }
-        return [...byState.values()].map(({ stateKey, aliases }) => ({
-            stateKey,
-            aliases,
-        }));
-    }
-
-    _emitThresholdProgress() {
-        const merged = this._latestMerged();
-        if (!merged) return;
-        this._emit(merged);
-        if (merged.id === this._lastAnalyze?.id) this._ensureThresholdPlan(merged);
-    }
-
-    _acceptThresholdOutcome(lane, message, type) {
-        if (!thresholdPlanMatches(this._thresholdPlan, message)) return;
-        if (message.round !== this._thresholdRound) return;
-        const rootCell = Math.floor(finiteNumber(message.rootCell, -1));
-        const prefix = canonicalPrefix(message.prefix);
-        const key = thresholdTaskKey(rootCell, prefix);
-        const index = this._thresholdFrontierIndex.get(key);
-        if (index === undefined) {
-            throw new Error(`threshold outcome ${key} is outside the frontier`);
-        }
-        if (index % this.laneCount !== lane) {
-            throw new Error(`lane ${lane} does not own threshold task ${key}`);
-        }
-        let children = null;
-        if (type === "split") {
-            children = canonicalThresholdChildren(message.children);
-            if (children.length === 0 || prefix.length + 1 >= 80) {
-                throw new Error(`threshold task ${key} has an invalid split`);
-            }
-        }
-        const previous = this._thresholdOutcomes.get(key);
-        if (previous) {
-            if (previous.type !== type ||
-                !sameThresholdChildren(previous.children, children)) {
-                throw new Error(`threshold task ${key} changed its completed outcome`);
-            }
-            return; // an identical duplicate must not discharge aliases twice
-        }
-        this._thresholdOutcomes.set(key, { type, children });
-
-        let certified = false;
-        if (type === "miss") {
-            const task = this._thresholdFrontier[index];
-            for (const alias of task.aliases) {
-                const pending = (this._thresholdRootPending.get(alias.rootCell) ?? 0) - 1;
-                if (pending < 0) {
-                    throw new Error(`threshold root ${alias.rootCell} over-completed`);
-                }
-                this._thresholdRootPending.set(alias.rootCell, pending);
-                // A split is never decremented, so zero means the root's
-                // complete current dependency set consists only of misses.
-                if (pending === 0) {
-                    certified = this._certifyThresholdRoot(alias.rootCell) || certified;
-                }
-            }
-        }
-        if (this._thresholdOutcomes.size !== this._thresholdFrontier.length) {
-            if (certified) this._emitThresholdProgress();
-            return;
-        }
-
-        const plan = this._thresholdPlan;
-        const next = this._nextThresholdFrontier();
-        if (next === null) {
-            this._thresholdUnplannable.add(
-                thresholdAttemptKey(plan.id, plan.target));
-            this._cancelThresholdPlan();
-            this._emitThresholdProgress();
-            return;
-        }
-        const unresolvedRoots = new Set(next.flatMap((task) =>
-            task.aliases.map((alias) => alias.rootCell)));
-        const resolvedRoots = plan.roots.filter((cell) => !unresolvedRoots.has(cell));
-        for (const rootCell of resolvedRoots) {
-            this._certifyThresholdRoot(rootCell);
-        }
-
-        this._thresholdOutcomes.clear();
-        if (next.length === 0) {
-            // The workers keep their own copy of the coordinated plan. Merely
-            // clearing the pool state leaves each lane alive with an empty
-            // task queue, producing periodic idle results forever after the
-            // proof completed. Use the normal protocol transition so every
-            // lane cancels its local ladder before final progress is emitted.
-            this._cancelThresholdPlan();
-        } else {
-            plan.roots = [...unresolvedRoots].sort((a, b) => a - b);
-            if (!this._setThresholdFrontier(next)) {
-                this._thresholdUnplannable.add(
-                    thresholdAttemptKey(plan.id, plan.target));
-                this._cancelThresholdPlan();
-                this._emitThresholdProgress();
-                return;
-            }
-            this._thresholdRound++;
-            this._broadcastThresholdFrontier();
-        }
-
-        this._emitThresholdProgress();
-    }
-
     _onLaneMessage(lane, message) {
-        if (message.type === "threshold-prefix-miss") {
-            try {
-                this._onThresholdMiss(lane, message);
-            } catch (error) {
-                this._thresholdMessageError(error);
-            }
-            return;
-        }
-        if (message.type === "threshold-prefix-split") {
-            try {
-                this._onThresholdSplit(lane, message);
-            } catch (error) {
-                this._thresholdMessageError(error);
-            }
-            return;
-        }
         if (message.type === "ready") {
             this._ready.set(lane, message);
             if (this._ready.size === this.laneCount) {
@@ -803,19 +376,11 @@ export class EngineWorkerPool {
             if (message.id === this._terminalId) return;
             this._latest.set(lane, message);
             try {
-                const merged = this._applyCertifiedLowers(
-                    mergeLaneResults([...this._latest.values()], this.laneCount));
+                const merged = mergeLaneResults([...this._latest.values()], this.laneCount);
                 if (merged.stats.settled) {
                     this._terminalId = merged.id;
                 }
                 this._emit(merged);
-                if (merged.id !== this._lastAnalyze?.id) return;
-                if (this.laneCount > 1 && this._caretakerStopId !== merged.id &&
-                    Array.from({ length: this.laneCount - 1 }, (_, index) => index + 1)
-                        .every((peer) => this._latest.get(peer)?.stats?.settled === true)) {
-                    this._caretakerStopId = merged.id;
-                    this._workers[0]?.postMessage({ type: "stop-caretaker", id: merged.id });
-                }
                 const signature = merged.moves.map((move) =>
                     `${move.cell}:${move.score}:${move.exact ? 1 : 0}:${move.line?.join(",") ?? ""}`)
                     .join("|");
@@ -832,7 +397,6 @@ export class EngineWorkerPool {
                         worker.postMessage({ type: "merge", id: merged.id, seeds });
                     }
                 }
-                this._ensureThresholdPlan(merged);
             } catch (error) {
                 this._emit({ type: "error", message: String(error?.stack ?? error) });
             }
@@ -850,7 +414,7 @@ export class EngineWorkerPool {
             return;
         }
 
-        // Ordinal-modulo ownership depends on N. Restart every lane with N-1 rather
+        // Modulo ownership depends on N. Restart every lane with N-1 rather
         // than leaving one failed lane's roots permanently unsearched.
         for (const worker of this._workers) worker.terminate();
         this.laneCount--;
@@ -878,10 +442,6 @@ export class EngineWorkerPool {
             this._latest.clear();
             this._sharedSignature = "";
             this._terminalId = null;
-            this._caretakerStopId = null;
-            this._cancelThresholdPlan(false);
-            this._certifiedLowers.clear();
-            this._thresholdUnplannable.clear();
             this._lastAnalyze = {
                 ...message,
                 board: message.board instanceof Uint8Array ?

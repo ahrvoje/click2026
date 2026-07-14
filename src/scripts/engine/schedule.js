@@ -69,54 +69,6 @@ export function roundRobinPrefixTasks(parents) {
     return tasks;
 }
 
-// Reconstruct the task order and lane identity a position receives after its
-// parent move is actually played. `branches` must be in the clicked board's
-// stable root-index order; tasks within a branch are already in that root's
-// preferred order. Ownership is the parent-major ordinal, while execution is
-// diagonal/round-robin across roots. Keeping both values is what makes a
-// receding parent search comparable to the post-click search.
-export function mirrorClickedPrefixTasks(branches, limit = Infinity) {
-    let ordinal = 0;
-    const indexed = Array.from(branches ?? [], (branch) =>
-        Array.from(branch?.tasks ?? [], (task) => ({
-            ...task,
-            postClickOrdinal: ordinal++,
-        })));
-    const rounds = indexed.reduce((max, tasks) => Math.max(max, tasks.length), 0);
-    const ordered = [];
-    const bounded = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : Infinity;
-    for (let round = 0; round < rounds && ordered.length < bounded; round++) {
-        for (const tasks of indexed) {
-            if (round < tasks.length) ordered.push(tasks[round]);
-            if (ordered.length >= bounded) break;
-        }
-    }
-    return ordered;
-}
-
-// Stable ownership for a fixed search context. Unlike a sequential ordinal,
-// this does not change when another lane has already proved and omitted an
-// unrelated parent. That lets workers build only their still-live context
-// queues without duplicating work or leaving a prefix unassigned.
-export function prefixTaskOwner(cell, prefix, laneCount) {
-    const lanes = Math.max(1, Math.floor(Number(laneCount) || 1));
-    let hash = (Math.floor(Number(cell) || 0) + 1) >>> 0;
-    for (const move of prefix ?? []) {
-        hash ^= (Math.floor(Number(move) || 0) + 1) >>> 0;
-        hash = Math.imul(hash, 0x45D9F3B) >>> 0;
-        hash ^= hash >>> 16;
-    }
-    return hash % lanes;
-}
-
-// A suffix of an exact root line is exact in the next position only when that
-// position is the actual board produced by the root move. Replaying the suffix
-// on some other board validates a constructive score, never its lower bound.
-export function canTransferExactSuffix(previous, move, nextBoardKey) {
-    return move?.exact === true && previous?.childKeys instanceof Map &&
-        previous.childKeys.get(move.cell) === nextBoardKey;
-}
-
 // A move's constructive score is an upper bound. Its admissible lower bound
 // normally supplies the other side; once that move is exact, its exact score
 // is the stronger lower bound even when the static bound itself stayed weak.
@@ -157,7 +109,7 @@ export function analysisState(proof, stopped) {
     return stopped ? "settled" : "analyzing";
 }
 
-// Lane zero owns the only WebGPU device. Its ordinal-owned CPU roots can be
+// Lane zero owns the only WebGPU device.  Its modulo-owned CPU roots can be
 // finished before satellite workers have proved their roots; stopping that
 // worker at that point also stops otherwise useful, position-wide GPU
 // playouts.  Keep it alive only while there is genuine unresolved work.  The
