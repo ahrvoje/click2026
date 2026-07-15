@@ -54,14 +54,14 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260715-engine1";
+import { createGpu, dominantColor } from "./gpu.js?build=20260715-engine2";
 import {
     analysisState, canTransferExactSuffix, caretakerProofCandidates, createSearchProgress,
     exactCandidateOrder, mirrorClickedPrefixTasks, positionProofCandidates, recordSearchPass,
     remainingAfterMove, roundRobinPrefixTasks, settlementReady, shouldGpuCaretake,
     summarizePositionProof,
-} from "./schedule.js?build=20260715-engine1";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-engine1";
+} from "./schedule.js?build=20260715-engine2";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-engine2";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
@@ -349,6 +349,16 @@ async function analyze(myJob, isStale) {
     const post = (settled) => {
         const { moves, nodes, depth, width, remaining, cpu } = collectResults();
         latestGpuMoves = moves;
+        // Coalesce to the shared cadence at the source. Several stages post
+        // per completed pass/task; on a warm cache those complete in
+        // microseconds and sixteen lanes posting per iteration can flood the
+        // main thread with tens of thousands of messages per second — enough
+        // to starve clicks and the next analyze indefinitely. A suppressed
+        // snapshot is never lost: every stage posts again within the interval
+        // and the terminal (settled) snapshot always goes through.
+        if (settled !== true && performance.now() - lastPost < POST_INTERVAL_MS) {
+            return moves;
+        }
         const proof = summarizePositionProof(moves, (move) => move.lower);
         const elapsed = performance.now() - t0;
         const rawGpu = gpu?.getStats?.() ?? {};
@@ -770,6 +780,19 @@ async function analyze(myJob, isStale) {
         // already supplied constructive incumbents; exact chunks still yield
         // between slices, so position changes remain promptly preemptible.
         if (ladder.shouldPrioritize(moves)) {
+            postIfDue();
+            continue;
+        }
+
+        // An owned-complete lane held open only because a coordinated proof
+        // may still be assigned has no beam or playout of its own left: its
+        // partition heap exhausts instantly and the pass loop degenerates
+        // into a hot spin that burns a full core for minutes. Idle at the
+        // post cadence instead — frontier tasks, peer proofs and position
+        // changes all arrive by message, and every exit condition above is
+        // re-checked each beat.
+        if (ownedMoves(moves).every((move) => move.exact)) {
+            await new Promise((resolve) => setTimeout(resolve, POST_INTERVAL_MS));
             postIfDue();
             continue;
         }
@@ -1866,7 +1889,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260715-engine1");
+            wasmURL.searchParams.set("build", "20260715-engine2");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();

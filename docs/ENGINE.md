@@ -374,7 +374,12 @@ heuristic or malformed line into a score or proof.
 Each worker runs search in ~10 ms WASM slices (`beamStep(16000)`) and yields
 through a `MessageChannel` macrotask between slices, so a new `analyze`
 message preempts within milliseconds. Results are posted at most every
-150 ms plus once per completed stage, then incrementally merged by the pool.
+150 ms — the cap is enforced inside `post()` itself, because on a warm cache
+whole passes complete in microseconds and per-stage posts from sixteen lanes
+once flooded the main thread with tens of thousands of messages per second,
+starving clicks and the next `analyze` indefinitely. Only the terminal
+(settled) snapshot bypasses the cap. Posted results are incrementally merged
+by the pool.
 An already-submitted GPU dispatch cannot be cancelled, but stale CPU analysis
 returns immediately and the new position resumes GPU submissions after the
 shared device resources become available.
