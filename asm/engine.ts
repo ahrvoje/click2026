@@ -1032,6 +1032,17 @@ export function setBoard(): i32 {
     // A stale worker job may abandon a portfolio pass between beam slices.
     // Restore the tuned objective before initializing the new position.
     restoreBeamWeights();
+    // A genuinely new position starts a new memo generation, so untouched
+    // leftovers from earlier positions age and become reclaimable. Re-issuing
+    // the same board (e.g. a settings change) keeps the current generation.
+    let sameBoard = true;
+    for (let cell = 0; cell < CELLS; cell++) {
+        if (load<u8>(pu8(ROOT_BOARD) + <usize>cell) != load<u8>(pu8(IO) + <usize>cell)) {
+            sameBoard = false;
+            break;
+        }
+    }
+    if (!sameBoard) vttGeneration = (vttGeneration + 1) & 255;
     memory.copy(pu8(ROOT_BOARD), pu8(IO), CELLS);
     nodesExpanded = 0;
     beamPositions = 0;
@@ -2409,6 +2420,22 @@ const VTT_KEY = new StaticArray<u64>(VTT_CAP);
 const VTT_DATA = new StaticArray<u16>(VTT_CAP); // low byte value, high byte best move (255 terminal)
 const VTT_STAMP = new StaticArray<u8>(VTT_CAP); // 0 empty, 1 occupied
 const VTT_REMAINING = new StaticArray<u8>(VTT_CAP);
+// Analysis generation of the last store or hit. Entries persist across
+// positions by design, but an entry no earlier position ever reused must not
+// crowd out the live analysis: certificates could not be stored at all in
+// buckets holding four older exact values, so the coordinated threshold
+// rotation retained no progress and re-expanded the same subtrees forever on
+// a sequentially played game. Ages saturate at the u8 wrap distance; an alias
+// merely delays one eviction and can never make a lookup unsound.
+const VTT_GEN = new StaticArray<u8>(VTT_CAP);
+let vttGeneration: i32 = 0;
+
+// Age of a persistent entry in analysis generations, 0 = touched during the
+// current position's analysis.
+// @inline
+function vttAge(at: i32): i32 {
+    return (vttGeneration - <i32>unchecked(VTT_GEN[at])) & 255;
+}
 const EX_MIN = new StaticArray<i32>(EXACT_STACK);
 const EX_BEST_MOVE = new StaticArray<u8>(EXACT_STACK);
 const EX_HASH = new StaticArray<u64>(EXACT_STACK);
@@ -2471,6 +2498,7 @@ function vttLookup(hash: u64): i32 {
         if (unchecked(VTT_STAMP[at]) == 1 && unchecked(VTT_KEY[at]) == hash) {
             const data = unchecked(VTT_DATA[at]);
             vttHitMove = <i32>(data >> 8);
+            unchecked(VTT_GEN[at] = <u8>vttGeneration); // reused: keep it live
             return <i32>(data & 255);
         }
     }
@@ -2479,33 +2507,62 @@ function vttLookup(hash: u64): i32 {
 
 function vttStore(hash: u64, value: i32, move: i32, remaining: i32): void {
     const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
-    let at = -1;
+    let sameKey = -1;
+    let free = -1;
+    let deadEntry = -1;
+    let stale = -1;
+    let staleAge = 0;
+    let liveCert = -1;
     let victim = base;
     let victimRemaining = 255;
     for (let way = 0; way < VTT_WAYS; way++) {
         const probe = base + way;
         const stamp = unchecked(VTT_STAMP[probe]);
-        if (stamp != 1 || unchecked(VTT_KEY[probe]) == hash) {
-            at = probe;
+        if (stamp == 0 || stamp >= 147) {
+            if (free < 0) free = probe;
+            continue;
+        }
+        if (unchecked(VTT_KEY[probe]) == hash) {
+            sameKey = probe;
             break;
         }
         const keptRemaining = <i32>unchecked(VTT_REMAINING[probe]);
-        if (keptRemaining < victimRemaining) {
+        if (keptRemaining > rootRemaining) {
+            // Remaining counts only ever shrink, so an entry above the
+            // current analysis root's count can never be looked up again.
+            if (deadEntry < 0) deadEntry = probe;
+            continue;
+        }
+        const age = vttAge(probe);
+        if (age > staleAge) {
+            // Persisted but never reused this analysis: reclaimable, oldest
+            // first. Cross-position memory may help, never crowd out the
+            // live sub-DAG.
+            staleAge = age;
+            stale = probe;
+        } else if (age == 0 && stamp != 1) {
+            if (liveCert < 0) liveCert = probe;
+        } else if (age == 0 && keptRemaining < victimRemaining) {
             victimRemaining = keptRemaining;
             victim = probe;
         }
     }
-    if (at < 0) {
-        // Retain the state with more cells: it roots a larger sub-DAG and is
-        // much more expensive to reconstruct. Random replacement at the same
-        // capacity proved only 1/10 hard roots in 60 s; depth preference
-        // proved all 10 in 45 s.
-        at = victim;
-    }
+    // Among entries of the current analysis, retain the state with more
+    // cells: it roots a larger sub-DAG and is much more expensive to
+    // reconstruct. Random replacement at the same capacity proved only 1/10
+    // hard roots in 60 s; depth preference proved all 10 in 45 s. Provably
+    // unreachable entries go first, then the stalest generation, then live
+    // certificates, then the shallowest live value.
+    const at = sameKey >= 0 ? sameKey :
+        free >= 0 ? free :
+        deadEntry >= 0 ? deadEntry :
+        stale >= 0 ? stale :
+        liveCert >= 0 ? liveCert : victim;
     unchecked(VTT_STAMP[at] = 1);
     unchecked(VTT_KEY[at] = hash);
     unchecked(VTT_DATA[at] = <u16>(value | (move << 8)));
     unchecked(VTT_REMAINING[at] = <u8>remaining);
+    unchecked(VTT_GEN[at] = <u8>vttGeneration);
 }
 
 // ---------------------------------------------------------------------------
@@ -2577,11 +2634,15 @@ function thresholdMemoDead(hash: u64, target: i32): bool {
         if (unchecked(VTT_KEY[at]) != hash) continue;
         if (stamp == 1) {
             const data = unchecked(VTT_DATA[at]);
+            unchecked(VTT_GEN[at] = <u8>vttGeneration); // reused: keep it live
             if (<i32>(data & 255) > target) return true;
             thresholdForcedMove = <i32>(data >> 8);
             return false;
         }
-        if (stamp >= 2 && stamp <= 146 && stamp - 2 >= target) return true;
+        if (stamp >= 2 && stamp <= 146 && stamp - 2 >= target) {
+            unchecked(VTT_GEN[at] = <u8>vttGeneration);
+            return true;
+        }
     }
     return false;
 }
@@ -2589,6 +2650,9 @@ function thresholdMemoDead(hash: u64, target: i32): bool {
 function thresholdStoreCertificate(hash: u64, target: i32, remaining: i32): void {
     const base = <i32>(hash & <u64>VTT_SET_MASK) * VTT_WAYS;
     let at = -1;
+    let deadEntry = -1;
+    let stale = -1;
+    let staleAge = 0;
     let victim = -1;
     let victimRemaining = 255;
     const wanted = target + 2;
@@ -2603,13 +2667,31 @@ function thresholdStoreCertificate(hash: u64, target: i32, remaining: i32): void
                 if (<i32>unchecked(VTT_REMAINING[probe]) < remaining) {
                     unchecked(VTT_REMAINING[probe] = <u8>remaining);
                 }
+                unchecked(VTT_GEN[probe] = <u8>vttGeneration);
                 return;
             }
         }
         if ((stamp == 0 || stamp >= 147) && at < 0) {
             at = probe;
+            continue;
         }
-        if (stamp >= 2 && stamp <= 146) {
+        if (<i32>unchecked(VTT_REMAINING[probe]) > rootRemaining) {
+            // Unreachable from the current analysis root (see vttStore):
+            // stale values and certificates from earlier positions must not
+            // block the live position's certificates — rotation-based
+            // coordinated proofs retain progress only through these stores.
+            if (deadEntry < 0) deadEntry = probe;
+            continue;
+        }
+        const age = vttAge(probe);
+        if (age > staleAge) {
+            // Untouched since an earlier position: reclaimable, oldest first
+            // — even when it is an exact value. Without this, buckets filled
+            // by previously played positions permanently reject the live
+            // position's certificates.
+            staleAge = age;
+            stale = probe;
+        } else if (age == 0 && stamp >= 2 && stamp <= 146) {
             const keptRemaining = <i32>unchecked(VTT_REMAINING[probe]);
             if (keptRemaining < victimRemaining) {
                 victimRemaining = keptRemaining;
@@ -2618,13 +2700,17 @@ function thresholdStoreCertificate(hash: u64, target: i32, remaining: i32): void
         }
     }
 
-    // Preserve buckets containing four exact values. As with every cache
-    // miss, declining to store causes only safe re-expansion.
+    // Preserve buckets containing four exact values of the current analysis.
+    // As with every cache miss, declining to store causes only safe
+    // re-expansion.
+    if (at < 0) at = deadEntry;
+    if (at < 0) at = stale;
     if (at < 0) at = victim;
     if (at < 0) return;
     unchecked(VTT_KEY[at] = hash);
     unchecked(VTT_STAMP[at] = <u8>wanted);
     unchecked(VTT_REMAINING[at] = <u8>remaining);
+    unchecked(VTT_GEN[at] = <u8>vttGeneration);
 }
 
 function thresholdCapture(score: i32): void {

@@ -557,6 +557,20 @@ supplies witness-first move ordering. Four-way replacement prefers durable
 exact entries and larger completed sub-DAGs; declining or losing a cache entry
 causes only safe re-expansion.
 
+Replacement is additionally **live-analysis-first** across positions. Every
+entry carries the analysis generation of its last store or lookup hit
+(`setBoard` on a different board starts a new generation). Eviction takes, in
+order: entries whose remaining count exceeds the current root's (provably
+unreachable — counts only ever shrink), then the stalest untouched generation
+— even a stale exact value — then the normal within-analysis preferences.
+Without this, a sequentially played game filled satellite tables with earlier
+positions' entries that won every eviction contest: the played position's
+threshold certificates could not be stored at all, the rotation-based
+coordinated frontier retained no progress between budgeted retries, and the
+same 53-cell endgame that a fresh page proves in half a second was still
+unproven after 70+ billion positions. Entries the new analysis actually
+reuses are refreshed on hit and keep the cross-position warm start intact.
+
 For a positive incumbent `U`, the pool coordinates a complete fixed-prefix
 frontier at target `U - 1` for every row with
 `lower ≤ U - 1 < score` whose child has at most 88 cells. The initial frontier
@@ -602,9 +616,12 @@ frame normally evaluates every child, but finalizes early when a resolved
 child reaches that board's admissible lower bound: no remaining child can do
 better, so the stored value is still exact. Values, a best move and the
 state's remaining count are stored in a persistent, four-way memo. The primary
-lane uses 2^23 entries (`VTT`, 96 MiB across keys/data/occupancy/depth); compact
-satellites use 2^20 entries. Full exact-value buckets evict the
-lowest-remaining state, retaining the larger sub-DAG that is more expensive to
+lane uses 2^23 entries (`VTT`, 104 MiB across
+keys/data/occupancy/depth/generation); compact
+satellites use 2^20 entries. Full buckets first reclaim entries that are
+unreachable from the current analysis root or untouched since an earlier
+position (the generation policy above), then evict the lowest-remaining live
+state, retaining the larger sub-DAG that is more expensive to
 reconstruct. Entries are shared within one worker
 
 * across that lane's owned root moves and budget escalations,
@@ -1061,7 +1078,9 @@ the former unbounded heap-starvation tail is gone.
   Exact flags transfer only for the same cached board, an actual recorded
   one-ply child, or a proved cached-child composition; a replayable suffix on
   an unrelated board remains an upper bound. Exact VTT values and threshold
-  certificates do persist within each worker across positions. True beam
+  certificates do persist within each worker across positions, with
+  recency-based reclamation so leftovers can never crowd out the live
+  analysis (Section 6). True beam
   pondering (searching the expected child while the player thinks) is the next
   step up.
 * **Parallelism is mostly root-level**: bounded second- and third-ply virtual

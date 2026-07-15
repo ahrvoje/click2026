@@ -54,14 +54,14 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260715-engine2";
+import { createGpu, dominantColor } from "./gpu.js?build=20260715-engine3";
 import {
     analysisState, canTransferExactSuffix, caretakerProofCandidates, createSearchProgress,
     exactCandidateOrder, mirrorClickedPrefixTasks, positionProofCandidates, recordSearchPass,
     remainingAfterMove, roundRobinPrefixTasks, settlementReady, shouldGpuCaretake,
     summarizePositionProof,
-} from "./schedule.js?build=20260715-engine2";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-engine2";
+} from "./schedule.js?build=20260715-engine3";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-engine3";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
@@ -1889,7 +1889,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260715-engine2");
+            wasmURL.searchParams.set("build", "20260715-engine3");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();
