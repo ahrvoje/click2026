@@ -18,7 +18,7 @@
 
 import { Game } from "./game.js";
 import { LETTERS } from "./board.js";
-import { EngineUI } from "./engine-ui.js?build=20260715-hwmodel2";
+import { EngineUI } from "./engine-ui.js?build=20260715-mobile1";
 import { TreeUI } from "./tree-ui.js";
 
 const examples = [
@@ -244,10 +244,12 @@ function gameFromString(gameString) {
 }
 
 function getMousePos(event) {
+    // CSS px -> canvas px; the board is CSS-scaled on small screens
     const rect = canvas.getBoundingClientRect();
+    const scale = canvas.width / rect.width;
     return {
-        x: Math.floor((event.clientX - rect.left - BOARD_MARGIN) / FIELD_PITCH),
-        y: 11 - Math.floor((event.clientY - rect.top - BOARD_MARGIN) / FIELD_PITCH),
+        x: Math.floor(((event.clientX - rect.left) * scale - BOARD_MARGIN) / FIELD_PITCH),
+        y: 11 - Math.floor(((event.clientY - rect.top) * scale - BOARD_MARGIN) / FIELD_PITCH),
     };
 }
 

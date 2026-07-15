@@ -14,7 +14,7 @@
  */
 
 import { canonicalBlock, LETTERS } from "./board.js";
-import { EngineWorkerPool } from "./engine/pool.js?build=20260715-hwmodel2";
+import { EngineWorkerPool } from "./engine/pool.js?build=20260715-mobile1";
 
 const TOP_N = 5;
 const SUGGESTED_MODE_TOP_5 = "top5";
@@ -23,7 +23,7 @@ const SUGGESTED_MODE_ALL = "all";
 // Keep the module worker, its static imports and the compiled WASM on one
 // cache generation. A stale dependency makes a module worker fail before any
 // of its error-reporting code can run, yielding only an opaque ErrorEvent.
-const ENGINE_ASSET_VERSION = "20260715-hwmodel2";
+const ENGINE_ASSET_VERSION = "20260715-mobile1";
 
 // rank accent colors, shared by the list rows and the board outlines; picked
 // to stay distinguishable from the five play colors and the replay highlight
@@ -320,7 +320,7 @@ function renderStats() {
     speed.title = `combined wall-average throughput: ${Math.round(totalPps).toLocaleString()} positions/s`;
     const total = span("engineStNodes engineStTotal", `${formatCount(totalPositions)} pos`);
     total.title = `combined positions evaluated: ${Math.round(totalPositions).toLocaleString()}`;
-    const elapsed = span("engineStTime", `time ${elapsedLabel}`);
+    const elapsed = span("engineStTime", elapsedLabel);
     elapsed.title = `analysis elapsed time: ${elapsedLabel}`;
     overview.append(
         span("engineStState", stateLabel),
@@ -362,7 +362,8 @@ function renderStats() {
             gpuActiveMs > 0 ? `active time: ${formatDuration(gpuActiveMs)}` : "",
         ].filter(Boolean).join("; ");
         gpuAccessible = gpuTitle;
-        gpuRow = processorRow("engineHwGpu", gpuModel ? `GPU/${gpuModel}` : "GPU",
+        gpuRow = processorRow("engineHwGpu",
+            gpuModel && gpuModel.toUpperCase() !== "GPU" ? `GPU/${gpuModel}` : "GPU",
             gpuPps ?? 0, gpuPositions ?? 0, gpuShare, gpuTitle);
     } else {
         const failed = s.gpu === "failed";

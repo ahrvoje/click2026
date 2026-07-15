@@ -16,7 +16,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Click2026</title>
     <meta name="author" content="Hrvoje Abraham">
     <meta name="description" content="Color clicking puzzle.">
@@ -26,8 +26,8 @@
     <meta property="og:description" content="Color clicking puzzle.">
 
     <link rel="icon" type="image/png" href="images/click2014_favicon.png">
-    <link rel="stylesheet" href="css/click2026.css?build=20260715-hwmodel2">
-    <script type="module" src="scripts/main.js?build=20260715-hwmodel2"></script>
+    <link rel="stylesheet" href="css/click2026.css?build=20260715-mobile1">
+    <script type="module" src="scripts/main.js?build=20260715-mobile1"></script>
 </head>
 <body>
 <div id="mainDiv">
@@ -74,7 +74,13 @@
     </dialog>
     <main id="mainTop">
         <div id="mainLeft">
-            <div id="logo"><img id="logoImage" src="images/click2014_favicon.png" alt="">Click2026</div>
+            <div id="logoRow">
+                <div id="logo"><img id="logoImage" src="images/click2014_favicon.png" alt="">Click2026</div>
+                <div id="logoCopy" aria-hidden="true">
+                    <div>Copyright 2014&ndash;2026 &copy; Hrvoje Abraham</div>
+                    <div>ahrvoje@gmail.com</div>
+                </div>
+            </div>
             <nav id="gameExamples">
                 <button id="example0" class="example" type="button">Example 1</button>
                 <button id="example1" class="example" type="button">Example 2</button>
@@ -193,6 +199,7 @@
         <div id="leftFooter">
             <button id="settingsButton" type="button">settings</button>
             <label id="testsToggle"><input type="checkbox" id="testsCheckbox"> examples &amp; tests</label>
+            <label id="treeToggle"><input type="checkbox" id="treeCheckbox"> tree view</label>
         </div>
         <div id="rightFooter">
             <div id="copy">Copyright 2014&ndash;2026 &copy; Hrvoje Abraham</div>

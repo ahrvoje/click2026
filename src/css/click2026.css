@@ -106,7 +106,8 @@ body {
 }
 
 #settingsButton,
-#testsToggle {
+#testsToggle,
+#treeToggle {
     font-size: 12px;
     white-space: nowrap;
     opacity: 0.2;
@@ -116,6 +117,12 @@ body {
         opacity: 1;
         cursor: pointer;
     }
+}
+
+/* mobile-only elements: the header copyright twin and the footer tree toggle */
+#logoCopy,
+#treeToggle {
+    display: none;
 }
 
 #settingsButton {
@@ -227,25 +234,27 @@ body {
     color: rgb(0 0 0 / 0.4);
 }
 
+/* the 5px board margin and 25px field pitch, expressed as fractions of the
+   board so the labels keep tracking the columns when the board is CSS-scaled */
 #boardColLabels {
     top: -15px;
-    left: 5px; /* the 5px board margin — one label centered over each column */
+    left: calc(var(--board-size) * 5 / 310); /* one label centered over each column */
 
     span {
-        width: 25px;
+        width: calc(var(--board-size) * 25 / 310);
         text-align: center;
     }
 }
 
 #boardRowLabels {
-    top: 5px;
+    top: calc(var(--board-size) * 5 / 310);
     left: -15px;
     flex-direction: column; /* rendered top-down, letters supplied L..A — A sits at the bottom */
 
     span {
         width: 12px;
-        height: 25px;
-        line-height: 25px;
+        height: calc(var(--board-size) * 25 / 310);
+        line-height: calc(var(--board-size) * 25 / 310);
         text-align: center;
     }
 }
@@ -779,5 +788,205 @@ body {
 
     &:hover {
         background-color: red;
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* mobile — one non-scrolling page: header with small branding plus the
+   copyright to its right, the board scaled to the width, controls, and
+   the leftover space under the buttons holding either the engine
+   analysis or the position tree (footer toggle), never both */
+@media (max-width: 700px) {
+    :root {
+        /* fill the width, but always leave the controls, the suggestion
+           space and the footer inside the viewport; the height term is
+           what guarantees the page never needs to scroll */
+        --board-size: min(calc(100vw - 36px), calc(100dvh - 325px), 360px);
+    }
+
+    html,
+    body {
+        overflow: hidden;
+        overscroll-behavior: none;
+    }
+
+    #mainDiv {
+        height: 100dvh;
+        min-height: 0;
+    }
+
+    #mainTop {
+        flex: 1 1 auto;
+        min-height: 0;
+        flex-direction: column;
+    }
+
+    #mainRight,
+    #mainFiller,
+    #rightFooter {
+        display: none;
+    }
+
+    /* header: small branding, the two copyright lines to its full right
+       kept within the branding height */
+    #mainLeft {
+        flex: 0 0 auto;
+        min-width: 0;
+    }
+
+    #logoRow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 6px 12px 0 10px;
+    }
+
+    #logo {
+        padding: 0;
+        font-size: 20px;
+
+        #logoImage {
+            height: 20px;
+            vertical-align: -4px;
+        }
+    }
+
+    #logoCopy {
+        display: block;
+        font-size: 9px;
+        line-height: 10px;
+        text-align: right;
+        opacity: 0.5;
+    }
+
+    /* the examples & tests panel floats over the page instead of pushing it */
+    #gameExamples {
+        position: fixed;
+        right: 10px;
+        bottom: calc(34px + env(safe-area-inset-bottom));
+        margin: 0;
+        padding: 2px 6px;
+        background-color: oldlace;
+        z-index: 10;
+    }
+
+    #game {
+        margin-top: 2px;
+        flex: 1 1 auto;
+        min-height: 0;
+        flex-direction: column;
+        align-items: center;
+        gap: 0;
+    }
+
+    #gameMain {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+
+    #boardWrap {
+        margin-top: 14px; /* room for the column labels above the board */
+    }
+
+    #control {
+        width: var(--board-size);
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .rowDiv {
+        line-height: 26px;
+    }
+
+    /* the suggested moves share the leftover space under the game: the
+       list fills it and wraps into as many columns as fit, so every
+       suggestion stays on the page instead of scrolling it */
+    #engineSection {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+    }
+
+    #engineList {
+        flex: 1 1 auto;
+        min-height: 0;
+        max-height: none;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        grid-auto-rows: min-content;
+        align-content: start;
+        column-gap: 10px;
+        overscroll-behavior: contain;
+    }
+
+    .engineRow {
+        gap: 6px;
+        line-height: 20px;
+    }
+
+    #engineStatus {
+        flex: 0 0 auto;
+    }
+
+    /* the tree replaces the engine block in the space under the buttons */
+    #treePanel {
+        display: none;
+        width: auto;
+        height: auto;
+        align-self: stretch;
+        flex: 1 1 auto;
+        min-height: 0;
+        margin: 4px 8px 0;
+    }
+
+    #treeScroll {
+        overscroll-behavior: contain;
+    }
+
+    #mainDiv:has(#treeCheckbox:checked) {
+        #treePanel {
+            display: block;
+        }
+
+        #engineSection {
+            display: none;
+        }
+
+        /* the game column stops stretching, the tree takes the leftover */
+        #gameMain,
+        #control {
+            flex: 0 0 auto;
+        }
+    }
+
+    /* footer: settings, examples & tests, tree view toggle */
+    #footer {
+        flex: 0 0 auto;
+        padding: 4px 0 calc(5px + env(safe-area-inset-bottom));
+    }
+
+    #leftFooter {
+        width: 100%;
+        justify-content: center;
+        gap: 22px;
+        padding: 0;
+    }
+
+    #settingsButton,
+    #testsToggle,
+    #treeToggle {
+        opacity: 0.55; /* no hover on touch — the resting state must be visible */
+    }
+
+    #treeToggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
     }
 }
