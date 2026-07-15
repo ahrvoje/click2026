@@ -26,8 +26,8 @@
     <meta property="og:description" content="Color clicking puzzle.">
 
     <link rel="icon" type="image/png" href="images/click2014_favicon.png">
-    <link rel="stylesheet" href="css/click2026.css?build=20260715-mobile1">
-    <script type="module" src="scripts/main.js?build=20260715-mobile1"></script>
+    <link rel="stylesheet" href="css/click2026.css?build=20260715-engine1">
+    <script type="module" src="scripts/main.js?build=20260715-engine1"></script>
 </head>
 <body>
 <div id="mainDiv">
@@ -55,6 +55,35 @@
                     <label class="settingsOption">
                         <input type="radio" name="suggestedMovesMode" value="all">
                         All
+                    </label>
+                </fieldset>
+                <fieldset class="settingsGroup">
+                    <legend>Engine</legend>
+                    <label class="settingsOption">
+                        <input type="checkbox" id="engineUseCpu">
+                        Use CPU
+                    </label>
+                    <label class="settingsOption">
+                        <input type="checkbox" id="engineUseGpu">
+                        Use GPU
+                    </label>
+                    <label class="settingsOption">
+                        <input type="checkbox" id="engineStopOnZero">
+                        Stop at first zero resolution
+                    </label>
+                    <label class="settingsOption">
+                        <input type="checkbox" id="engineMaxTimeEnabled">
+                        Max analysis time
+                        <span class="settingsLimitValue">
+                            <input type="number" id="engineMaxTimeS" min="1" max="86400" step="1"> s
+                        </span>
+                    </label>
+                    <label class="settingsOption">
+                        <input type="checkbox" id="engineMaxPositionsEnabled">
+                        Max positions
+                        <span class="settingsLimitValue">
+                            <input type="number" id="engineMaxPositionsM" min="1" max="1000000" step="1"> M
+                        </span>
                     </label>
                 </fieldset>
             </div>

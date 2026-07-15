@@ -14,7 +14,7 @@
  */
 
 import { canonicalBlock, LETTERS } from "./board.js";
-import { EngineWorkerPool } from "./engine/pool.js?build=20260715-mobile1";
+import { EngineWorkerPool } from "./engine/pool.js?build=20260715-engine1";
 
 const TOP_N = 5;
 const SUGGESTED_MODE_TOP_5 = "top5";
@@ -23,7 +23,7 @@ const SUGGESTED_MODE_ALL = "all";
 // Keep the module worker, its static imports and the compiled WASM on one
 // cache generation. A stale dependency makes a module worker fail before any
 // of its error-reporting code can run, yielding only an opaque ErrorEvent.
-const ENGINE_ASSET_VERSION = "20260715-mobile1";
+const ENGINE_ASSET_VERSION = "20260715-engine1";
 
 // rank accent colors, shared by the list rows and the board outlines; picked
 // to stay distinguishable from the five play colors and the replay highlight
@@ -45,6 +45,15 @@ let result = null;         // latest worker result for the current position
 let gpuState = "off";
 let hoverIndex = null;
 let suggestedMovesMode = SUGGESTED_MODE_TOP_5;
+// user-selected processors and stop conditions; maxTimeMs/maxPositions of 0
+// mean unlimited — the engine's own proven/settled stops always apply
+let engineSettings = {
+    useCpu: true,
+    useGpu: true,
+    stopOnZero: false,
+    maxTimeMs: 0,
+    maxPositions: 0,
+};
 
 const el = (id) => document.getElementById(id);
 
@@ -80,13 +89,24 @@ function onWorkerMessage(event) {
     }
 }
 
+function analysisLimits() {
+    return {
+        stopOnZero: engineSettings.stopOnZero,
+        maxTimeMs: engineSettings.maxTimeMs,
+        maxPositions: engineSettings.maxPositions,
+    };
+}
+
 function startWorker() {
     const workerURL = new URL("./engine/worker.js", import.meta.url);
     workerURL.searchParams.set("build", ENGINE_ASSET_VERSION);
     const requested = Number.parseInt(new URL(location.href).searchParams.get("engineWorkers") ?? "", 10);
-    worker = new EngineWorkerPool(workerURL, Number.isFinite(requested)
-        ? { laneCount: Math.max(1, Math.min(16, requested)) }
-        : undefined);
+    worker = new EngineWorkerPool(workerURL, {
+        ...(Number.isFinite(requested)
+            ? { laneCount: Math.max(1, Math.min(16, requested)) } : {}),
+        cpuSearch: engineSettings.useCpu,
+        gpuAllowed: engineSettings.useGpu,
+    });
     worker.onmessage = onWorkerMessage;
     worker.onerror = (event) => {
         renderStatus("engine failed to start — see console");
@@ -185,10 +205,11 @@ let cpuModelTag = "";
 function processorRow(className, label, pps, positions, share, title) {
     const row = span(`engineStatusRow engineProcessorRow ${className}`);
     row.title = title;
+    // n/s and n — number of evaluated position-tree nodes, as in the tree view
     row.append(
         span("engineHwLabel", label),
-        span("engineHwRate", pps === null ? "—" : `${formatCount(pps)} pos/s`),
-        span("engineHwPositions", positions === null ? "—" : `${formatCount(positions)} pos`),
+        span("engineHwRate", pps === null ? "—" : `${formatCount(pps)} n/s`),
+        span("engineHwPositions", positions === null ? "—" : `${formatCount(positions)} n`),
         span("engineHwShare", `${share}%`),
     );
     return row;
@@ -314,16 +335,24 @@ function renderStats() {
         optimal: "optimal ✓",
         proven: "proven ✓",
         settled: "settled",
+        stopped: "stopped",
     }[s.state] ?? "analyzing…";
+    const stopReasonLabel = {
+        zero: "stopped at the first zero-score line",
+        time: "stopped at the analysis time limit",
+        positions: "stopped at the position count limit",
+    }[s.stopReason];
     const overview = span("engineStatusRow engineStatusOverview");
-    const speed = span("engineStRate", `${formatCount(totalPps)} pos/s`);
+    const state = span("engineStState", stateLabel);
+    if (stopReasonLabel) state.title = stopReasonLabel;
+    const speed = span("engineStRate", `${formatCount(totalPps)} n/s`);
     speed.title = `combined wall-average throughput: ${Math.round(totalPps).toLocaleString()} positions/s`;
-    const total = span("engineStNodes engineStTotal", `${formatCount(totalPositions)} pos`);
+    const total = span("engineStNodes engineStTotal", `${formatCount(totalPositions)} n`);
     total.title = `combined positions evaluated: ${Math.round(totalPositions).toLocaleString()}`;
     const elapsed = span("engineStTime", elapsedLabel);
     elapsed.title = `analysis elapsed time: ${elapsedLabel}`;
     overview.append(
-        span("engineStState", stateLabel),
+        state,
         speed,
         total,
         elapsed,
@@ -333,6 +362,8 @@ function renderStats() {
     const cpuLabel = `CPU${workerSuffix}${cpuModelTag ? `/${cpuModelTag}` : ""}`;
     const cpuTitle = [
         `CPU${cpuWorkers !== null ? ` workers: ${Math.round(cpuWorkers)}` : ""}`,
+        engineSettings.useCpu ? ""
+            : "CPU search disabled in settings — baselines and replay validation only",
         cpuModelTag ? `architecture: ${cpuModelTag}` : "",
         `search positions: ${Math.round(cpuPositions).toLocaleString()} (work visits, not unique states)`,
         `wall-average throughput: ${Math.round(cpuPps).toLocaleString()} positions/s`,
@@ -367,16 +398,20 @@ function renderStats() {
             gpuPps ?? 0, gpuPositions ?? 0, gpuShare, gpuTitle);
     } else {
         const failed = s.gpu === "failed";
-        gpuAccessible = failed
-            ? "GPU off after an initialization or verification failure" : "GPU off; WebGPU unavailable";
+        gpuAccessible = !engineSettings.useGpu ? "GPU disabled in settings" :
+            failed ? "GPU off after an initialization or verification failure" :
+            "GPU off; WebGPU unavailable";
         gpuRow = processorRow("engineHwGpu engineHwGpuOff", "GPU",
             null, null, gpuShare,
-            failed ? "GPU disabled after an initialization or verification failure" : "WebGPU unavailable");
+            !engineSettings.useGpu ? "GPU disabled in settings" :
+            failed ? "GPU disabled after an initialization or verification failure" :
+            "WebGPU unavailable");
     }
 
     const status = el("engineStatus");
     status.setAttribute("aria-label", [
         stateLabel,
+        stopReasonLabel ?? "",
         `width ${s.width}`,
         `depth ${s.depth}`,
         `total positions: ${Math.round(totalPositions).toLocaleString()}`,
@@ -384,7 +419,7 @@ function renderStats() {
         `analysis elapsed time: ${elapsedLabel}`,
         cpuTitle,
         gpuAccessible,
-    ].join("; "));
+    ].filter(Boolean).join("; "));
     status.replaceChildren(overview, cpuRow, gpuRow);
 }
 
@@ -462,7 +497,7 @@ export const EngineUI = {
         result = null; // old suggestions no longer match the board — drop them
         clearList();
         renderStatus("analyzing…");
-        worker.postMessage({ type: "analyze", id: positionId, board });
+        worker.postMessage({ type: "analyze", id: positionId, board, limits: analysisLimits() });
     },
 
     // group-outline markers on the board can be switched off for real play
@@ -470,6 +505,40 @@ export const EngineUI = {
         markersOn = !markersOn;
         el("markersButton").classList.toggle("active", markersOn);
         hooks.redraw();
+    },
+
+    // engine preferences from the settings dialog: processors and stop
+    // conditions; a hardware change restarts the pool, a limit change only
+    // re-issues the analysis (warm-start caches make both cheap)
+    setEngineSettings(value) {
+        const next = {
+            useCpu: value?.engineUseCpu !== false,
+            useGpu: value?.engineUseGpu !== false,
+            stopOnZero: value?.engineStopOnZero === true,
+            maxTimeMs: value?.engineMaxTimeEnabled === true
+                ? Math.round(value.engineMaxTimeS * 1000) : 0,
+            maxPositions: value?.engineMaxPositionsEnabled === true
+                ? Math.round(value.engineMaxPositionsM * 1e6) : 0,
+        };
+        if (!next.useCpu && !next.useGpu) next.useCpu = true;
+
+        const hardwareChanged = next.useCpu !== engineSettings.useCpu ||
+            next.useGpu !== engineSettings.useGpu;
+        const limitsChanged = next.stopOnZero !== engineSettings.stopOnZero ||
+            next.maxTimeMs !== engineSettings.maxTimeMs ||
+            next.maxPositions !== engineSettings.maxPositions;
+        engineSettings = next;
+        if (!enabled || (!hardwareChanged && !limitsChanged)) return;
+
+        if (hardwareChanged) {
+            worker?.terminate();
+            startWorker();
+        }
+        lastKey = null;
+        result = null;
+        clearList();
+        renderStatus(hardwareChanged ? "starting engine…" : "analyzing…");
+        this.onPositionChanged();
     },
 
     setSuggestedMovesMode(mode) {

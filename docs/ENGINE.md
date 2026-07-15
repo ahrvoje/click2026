@@ -767,7 +767,7 @@ witness candidates; it is never trusted as an exact value or proof.
 ## 8. Worker protocol
 
 ```
-UI → pool       {type:"analyze", id, board}      // Uint8Array(144), col-major, cell = col*12+row
+UI → pool       {type:"analyze", id, board, limits}  // Uint8Array(144), col-major, cell = col*12+row
 pool → lane     {type:"analyze", id, board, lane, lanes, gpu}
 pool → lane     {type:"merge", id, seeds}        // merged lines/proofs; replay-validated in WASM
 pool → lane     {type:"threshold-plan", id, epoch, target, roots}
@@ -776,10 +776,29 @@ lane → pool     {type:"threshold-prefix-split", ..., rootCell, prefix, childre
 lane → pool     {type:"threshold-prefix-miss", ..., rootCell, prefix}
 pool → lane     {type:"threshold-root-bound" | "threshold-cancel", ...}
 pool → lane 0   {type:"stop-caretaker", id}      // CPU-only peers settled; stop the GPU pump
+pool → lane     {type:"stop", id}                // user limit reached; drop the job, sleep
 pool → UI       {type:"ready", gpu, workers}      // gpu = "on" | "off" | "failed"
                 {type:"result", id, remaining, moves, stats}
                 {type:"error", message}
 ```
+
+`limits` carries the user's optional stop conditions from the settings dialog:
+`{stopOnZero, maxTimeMs, maxPositions}`, any combination, falsy = unlimited.
+The pool enforces them centrally on each merged snapshot (`stopOnZero` fires
+when the best merged score reaches 0, i.e. a full-clear line was found; the
+other two compare merged `elapsed` and `totalPositions`). The first satisfied
+limit latches that snapshot as terminal with `settled:true`,
+`state:"stopped"` (or `"proven"` when the table happened to be all-exact) and
+`stats.stopReason` = `"zero" | "time" | "positions"`, then broadcasts `stop`
+so every lane abandons the job exactly like a position change.
+
+Two worker URL parameters mirror the settings-dialog processor checkboxes in
+addition to `lane`/`lanes`: `gpu=0` (settings **Use GPU** off) never requests
+a WebGPU adapter, and `cpu=0` (settings **Use CPU** off) collapses the pool to
+one lane whose sustained search is the replay-validated GPU playout pump —
+the WASM core still supplies the instant greedy baselines and one-ply child
+tables and validates every GPU line. When WebGPU is unavailable or fails,
+`cpu=0` falls back to the normal CPU schedule so analysis always runs.
 
 `moves` is the full sorted list (best first, ties to larger groups):
 `{k, cell, x, y, color(1-5), size, score, lower, exact, cells:[[x,y]…], line:[cell…]}`
@@ -847,6 +866,18 @@ in sync.
   moves can show **Top 5** (default), **Top 5 and first non-zero**, or **All**.
   The middle mode adds the first positive-score move only when the top five
   are all zero, so it contains at most six rows.
+  The **Engine** group selects processors and stop conditions: **Use CPU**
+  and **Use GPU** checkboxes (both on by default; unchecking the last enabled
+  one turns the other on, so the engine always has a processor),
+  **Stop at first zero resolution** (analysis ends the moment a full-clear
+  line is found), **Max analysis time** (seconds) and **Max positions**
+  (millions of evaluated positions). The two numeric limits and the zero stop
+  are independent and may be enabled simultaneously — the first one reached
+  stops the analysis. Toggling a processor restarts the worker pool; changing
+  a limit only re-issues the current analysis, which warm-starts from the
+  worker result caches. Limits are enforced by the pool on merged snapshots
+  (see §8), so the displayed list at the stop is exactly the best merged
+  result found so far.
 * **Moves slider** `#movesSlider`: located immediately below the board and
   above **NEW GAME**. It tracks the current/maximum move and navigates the
   selected replay route continuously. Using it has the same official-time
@@ -862,15 +893,21 @@ in sync.
   changes, so a click can never land on a row that was just swapped out by
   a telemetry update.
 * **Three-row telemetry** `#engineStatus`: the overview row shows state
-  (`analyzing…` / `optimal ✓` / `proven ✓` / `settled`),
+  (`analyzing…` / `optimal ✓` / `proven ✓` / `settled` / `stopped` — the
+  latter after a user limit, with the reason in its tooltip and aria-label),
   combined wall-average throughput, combined positions and elapsed analysis
   time. Separate,
   vertically aligned CPU and GPU rows attribute rates and exact position totals
-  to `CPU×N` and `GPU`. Rate occupies column two and position total occupies
+  to `CPU×N` and `GPU`. Rates and totals use the compact `n/s` and `n` units —
+  the number of evaluated position-tree nodes, matching the position tree's
+  node terminology; the tooltips spell out full `positions/s` values. Rate
+  occupies column two and position total occupies
   column three in both processor rows, placing both totals directly under the
   combined total. Column four places each processor's share of evaluated
   positions directly under wall time; the displayed CPU and GPU percentages
-  are complementary and therefore always total 100%. The row labels carry a
+  are complementary and therefore always total 100%. The numeric columns are
+  fixed-width and deliberately narrow so all spare row width goes to
+  column one's silicon-tagged labels. The row labels carry a
   compact silicon tag: `GPU/RTX4080` — derived from the WebGPU adapter
   identity, falling back to the WebGL renderer string when it names the same
   vendor, then to the architecture — so a dual-GPU machine reveals at a

@@ -18,7 +18,7 @@
 
 import { Game } from "./game.js";
 import { LETTERS } from "./board.js";
-import { EngineUI } from "./engine-ui.js?build=20260715-mobile1";
+import { EngineUI } from "./engine-ui.js?build=20260715-engine1";
 import { TreeUI } from "./tree-ui.js";
 
 const examples = [
@@ -526,6 +526,10 @@ export function setMovesSliderVisible(show) {
 
 export function setSuggestedMovesMode(mode) {
     EngineUI.setSuggestedMovesMode(mode);
+}
+
+export function setEngineSettings(value) {
+    EngineUI.setEngineSettings(value);
 }
 
 export function showMoveFromSlider(moveIndex) {

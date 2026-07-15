@@ -380,11 +380,15 @@ export class EngineWorkerPool {
         if (!this._Worker) throw new Error("Web Workers are unavailable");
         this._baseURL = new URL(String(workerURL), globalThis.location?.href ?? import.meta.url);
         this._maxLanes = Math.max(1, Math.floor(options.maxLanes ?? DEFAULT_MAX_LANES));
+        // cpuSearch=false keeps a single lane whose sustained work is the GPU
+        // playout pump; gpuAllowed=false never grants lane zero WebGPU access
+        this._cpuSearch = options.cpuSearch !== false;
+        this._gpuAllowed = options.gpuAllowed !== false;
         const requestedLanes = options.laneCount ?? selectLaneCount(
             options.capabilities ?? detectParallelCapabilities(options.navigator),
             { maxLanes: this._maxLanes });
-        this.laneCount = Math.max(1, Math.min(this._maxLanes,
-            Math.floor(finiteNumber(requestedLanes, 1))));
+        this.laneCount = this._cpuSearch ? Math.max(1, Math.min(this._maxLanes,
+            Math.floor(finiteNumber(requestedLanes, 1)))) : 1;
         this._workers = [];
         this._ready = new Map();
         this._latest = new Map();
@@ -424,7 +428,8 @@ export class EngineWorkerPool {
             const url = new URL(this._baseURL);
             url.searchParams.set("lane", String(lane));
             url.searchParams.set("lanes", String(this.laneCount));
-            url.searchParams.set("gpu", lane === 0 ? "1" : "0");
+            url.searchParams.set("gpu", lane === 0 && this._gpuAllowed ? "1" : "0");
+            url.searchParams.set("cpu", this._cpuSearch ? "1" : "0");
             const worker = new this._Worker(url, {
                 type: "module",
                 name: `click2026-engine-${lane + 1}-of-${this.laneCount}`,
@@ -494,6 +499,8 @@ export class EngineWorkerPool {
     }
 
     _ensureThresholdPlan(merged) {
+        // coordinated proofs are CPU B&B ladders — meaningless without CPU search
+        if (!this._cpuSearch) return;
         if (!merged || this._latest.size !== this.laneCount ||
             merged.stats.positionUpper <= 0 || merged.stats.positionExact) {
             if (this._thresholdPlan) this._cancelThresholdPlan();
@@ -845,7 +852,7 @@ export class EngineWorkerPool {
                 board,
                 lane,
                 lanes: this.laneCount,
-                gpu: lane === 0,
+                gpu: lane === 0 && this._gpuAllowed,
             });
         }
     }
@@ -878,6 +885,28 @@ export class EngineWorkerPool {
         this._lastMergeFlushAt = -Infinity;
     }
 
+    /**
+     * User-configured stop conditions from the analyze message. Any may be
+     * combined; the first one satisfied names the stop reason. Falsy/absent
+     * fields mean unlimited, so old callers keep the engine's own stops only.
+     */
+    _limitReached(merged) {
+        const limits = this._lastAnalyze?.limits;
+        if (!limits) return null;
+        if (limits.stopOnZero && merged.moves.length > 0 &&
+            merged.moves[0].score === 0) {
+            return "zero";
+        }
+        if (limits.maxTimeMs > 0 && merged.stats.elapsed >= limits.maxTimeMs) {
+            return "time";
+        }
+        if (limits.maxPositions > 0 &&
+            merged.stats.totalPositions >= limits.maxPositions) {
+            return "positions";
+        }
+        return null;
+    }
+
     _flushResults() {
         this._lastMergeFlushAt = Date.now();
         if (this._terminated || this._latest.size === 0) return;
@@ -887,10 +916,26 @@ export class EngineWorkerPool {
         try {
             const merged = this._applyCertifiedLowers(
                 mergeLaneResults(snapshots, this.laneCount));
+            const stopReason = merged.stats.settled ? null : this._limitReached(merged);
+            if (stopReason) {
+                // a user limit ends the analysis: latch this merged snapshot
+                // as terminal and put every lane to sleep; the moves shown are
+                // the best found so far, exactly like a settled stop
+                merged.stats.settled = true;
+                merged.stats.stopReason = stopReason;
+                merged.stats.state = merged.stats.allMovesExact ? "proven" : "stopped";
+            }
             if (merged.stats.settled) {
                 this._terminalId = merged.id;
             }
             this._emit(merged);
+            if (stopReason) {
+                for (const worker of this._workers) {
+                    worker.postMessage({ type: "stop", id: merged.id });
+                }
+                this._cancelThresholdPlan(false);
+                return;
+            }
             if (merged.id !== this._lastAnalyze?.id) return;
             if (this.laneCount > 1 && this._caretakerStopId !== merged.id &&
                 Array.from({ length: this.laneCount - 1 }, (_, index) => index + 1)

@@ -582,8 +582,9 @@ body {
     .engineStatusOverview,
     .engineProcessorRow {
         display: grid;
-        /* column one fits the silicon-tagged labels (GPU/RTX4080, CPU×16/x64) */
-        grid-template-columns: 80px 78px 76px minmax(0, 1fr);
+        /* the compact n/s and n numeric columns cede all spare width to
+           column one — the silicon-tagged labels (GPU/RTX4080, CPU×16/x64) */
+        grid-template-columns: minmax(0, 1fr) 62px 50px 40px;
         column-gap: 4px;
     }
 
@@ -630,7 +631,7 @@ body {
 
         .engineStatusOverview,
         .engineProcessorRow {
-            grid-template-columns: 76px 76px 74px minmax(0, 1fr);
+            grid-template-columns: minmax(0, 1fr) 58px 46px 38px;
         }
     }
 }
@@ -692,6 +693,30 @@ body {
         margin: 0;
         accent-color: var(--accent);
         cursor: pointer;
+    }
+}
+
+/* numeric limit value + unit trailing an enabling checkbox */
+.settingsLimitValue {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+
+    input[type="number"] {
+        width: 72px;
+        height: 22px;
+        padding: 0 4px;
+        border: 1px solid rgb(0 0 0 / 0.35);
+        border-radius: 3px;
+        font: inherit;
+        text-align: right;
+        cursor: text;
+
+        &:disabled {
+            opacity: 0.45;
+            cursor: default;
+        }
     }
 }
 

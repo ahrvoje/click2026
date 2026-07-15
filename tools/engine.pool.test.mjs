@@ -448,4 +448,94 @@ fallbackPool.terminate();
     coalescingPool.terminate();
 }
 
+// Processor selection: gpuAllowed=false never grants lane zero WebGPU, and
+// cpuSearch=false collapses the pool to a single GPU-pump lane regardless of
+// the requested lane count. Both are advertised to workers via URL params.
+{
+    FakeWorker.instances = [];
+    const noGpuPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 2,
+        gpuAllowed: false,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(FakeWorker.instances[0].url.searchParams.get("gpu"), "0");
+    assert.equal(FakeWorker.instances[0].url.searchParams.get("cpu"), "1");
+    noGpuPool.postMessage({ type: "analyze", id: 1, board: new Uint8Array(144) });
+    assert.equal(FakeWorker.instances[0].messages[0].gpu, false);
+    noGpuPool.terminate();
+
+    FakeWorker.instances = [];
+    const noCpuPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 8,
+        cpuSearch: false,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(noCpuPool.laneCount, 1);
+    assert.equal(FakeWorker.instances.length, 1);
+    assert.equal(FakeWorker.instances[0].url.searchParams.get("gpu"), "1");
+    assert.equal(FakeWorker.instances[0].url.searchParams.get("cpu"), "0");
+    // no CPU search means no coordinated CPU B&B threshold plans
+    noCpuPool.postMessage({ type: "analyze", id: 7, board: new Uint8Array(144) });
+    FakeWorker.instances[0].emit({
+        ...laneResult(0, [move(0, 1, 0), move(1, 1, 0)]), remaining: 84 });
+    assert.ok(!FakeWorker.instances[0].messages.some((message) =>
+        message.type === "threshold-plan"));
+    noCpuPool.terminate();
+}
+
+// User stop conditions: the first satisfied limit latches the merged snapshot
+// as terminal ("stopped", with a reason), broadcasts a stop so every lane
+// sleeps, and ignores any later same-position traffic.
+{
+    const stopCases = [
+        { limits: { stopOnZero: true }, moves: [move(0, 0, 0), move(1, 4, 1)],
+            reason: "zero" },
+        { limits: { maxTimeMs: 500 }, moves: [move(0, 5, 0)], reason: "time" },
+        { limits: { maxPositions: 10000 }, moves: [move(0, 5, 0)],
+            reason: "positions" },
+    ];
+    for (const { limits, moves, reason } of stopCases) {
+        FakeWorker.instances = [];
+        const limitPool = new EngineWorkerPool("https://example.test/worker.js", {
+            Worker: FakeWorker,
+            laneCount: 2,
+            mergeIntervalMs: 0,
+        });
+        const limitEmitted = [];
+        limitPool.onmessage = (event) => limitEmitted.push(event.data);
+        limitPool.postMessage({ type: "analyze", id: 7,
+            board: new Uint8Array(144), limits });
+        FakeWorker.instances[0].emit(laneResult(0, moves));
+        const stopped = limitEmitted.at(-1);
+        assert.equal(stopped.stats.settled, true);
+        assert.equal(stopped.stats.state, "stopped");
+        assert.equal(stopped.stats.stopReason, reason);
+        assert.ok(FakeWorker.instances.every((worker) => worker.messages.some(
+            (message) => message.type === "stop" && message.id === 7)));
+        const emissions = limitEmitted.length;
+        FakeWorker.instances[1].emit(laneResult(1, moves)); // ignored: terminal
+        assert.equal(limitEmitted.length, emissions);
+        limitPool.terminate();
+    }
+
+    // no limits (or an unlimited analyze) never stops on its own
+    FakeWorker.instances = [];
+    const freePool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 1,
+        mergeIntervalMs: 0,
+    });
+    const freeEmitted = [];
+    freePool.onmessage = (event) => freeEmitted.push(event.data);
+    freePool.postMessage({ type: "analyze", id: 7, board: new Uint8Array(144),
+        limits: { stopOnZero: false, maxTimeMs: 0, maxPositions: 0 } });
+    FakeWorker.instances[0].emit(laneResult(0, [move(0, 0, 0)]));
+    assert.equal(freeEmitted.at(-1).stats.settled, false);
+    assert.ok(!FakeWorker.instances[0].messages.some(
+        (message) => message.type === "stop"));
+    freePool.terminate();
+}
+
 console.log("ok    adaptive engine worker pool");

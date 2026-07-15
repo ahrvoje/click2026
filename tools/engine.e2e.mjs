@@ -68,6 +68,37 @@ try {
     await page.click("#showMovesSlider");
     check(await page.$eval("#movesSliderRow", (row) => !row.hidden),
         "settings can show the moves slider on desktop");
+
+    // engine settings: both processors default on, unchecking the last
+    // enabled one re-enables the other, limit inputs follow their checkboxes
+    check(await page.evaluate(() =>
+        document.getElementById("engineUseCpu").checked &&
+        document.getElementById("engineUseGpu").checked &&
+        !document.getElementById("engineStopOnZero").checked &&
+        !document.getElementById("engineMaxTimeEnabled").checked &&
+        !document.getElementById("engineMaxPositionsEnabled").checked),
+        "engine settings default to CPU+GPU with no stop conditions");
+    check(await page.evaluate(() =>
+        document.getElementById("engineMaxTimeS").disabled &&
+        document.getElementById("engineMaxPositionsM").disabled),
+        "limit values are disabled until their checkbox enables them");
+    await page.click("#engineUseGpu");
+    await page.click("#engineUseCpu");
+    check(await page.evaluate(() =>
+        document.getElementById("engineUseGpu").checked &&
+        !document.getElementById("engineUseCpu").checked),
+        "unchecking the last enabled processor re-enables the other");
+    await page.click("#engineUseCpu"); // restore CPU on
+    check(await page.evaluate(() =>
+        document.getElementById("engineUseCpu").checked &&
+        document.getElementById("engineUseGpu").checked),
+        "both processors restored on");
+    await page.click("#engineMaxTimeEnabled");
+    check(await page.evaluate(() => {
+        const input = document.getElementById("engineMaxTimeS");
+        return !input.disabled && Number(input.value) >= 1;
+    }), "enabling the time limit activates its sanitized value");
+    await page.click("#engineMaxTimeEnabled"); // back to unlimited
     await page.click("#settingsDialog .settingsClose");
 
     // a fresh page has no position until NEW GAME generates one
@@ -98,14 +129,14 @@ try {
     await page.click("#settingsDialog .settingsClose");
 
     const status1 = await page.$eval("#engineStatus", (s) => s.textContent);
-    check(!/w\d+ d\d+/.test(status1) && /pos\/s/.test(status1),
+    check(!/w\d+ d\d+/.test(status1) && /n\/s/.test(status1),
         "three-row stats look like an engine", { status1 });
     const analysisTime = await page.$eval("#engineStatus .engineStTime", (s) => ({
         text: s.textContent,
         title: s.title,
         aria: s.closest("#engineStatus").getAttribute("aria-label"),
     }));
-    check(/^time (?:\d+ms|\d+(?:\.\d)?s|\d+m\d{2}s|\d+h\d{2}m)$/.test(analysisTime.text)
+    check(/^(?:\d+ms|\d+(?:\.\d)?s|\d+m\d{2}s|\d+h\d{2}m)$/.test(analysisTime.text)
         && /analysis elapsed time:/.test(analysisTime.title)
         && /analysis elapsed time:/.test(analysisTime.aria),
         "analysis elapsed time is visible and accessible", analysisTime);
@@ -118,7 +149,7 @@ try {
     // play the engine's #1 suggestion by clicking its group cell on the canvas
     const target = await page.evaluate(async () => {
         // reach into the module graph via a dynamic import of the same URL
-        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260715-hwmodel2");
+        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260715-engine1");
         return EngineUI.isOn();
     });
     check(target === true, "EngineUI singleton shared with page modules");
@@ -169,7 +200,7 @@ try {
     // the engine must pick up the new position and produce fresh rows
     await page.waitForFunction(() => {
         const status = document.getElementById("engineStatus").textContent;
-        return document.querySelectorAll("#engineList .engineRow").length > 0 && /pos\/s/.test(status);
+        return document.querySelectorAll("#engineList .engineRow").length > 0 && /n\/s/.test(status);
     }, { timeout: 20000 });
     const scores2 = await page.$$eval("#engineList .engineScore", (els) => els.map((e) => e.textContent));
     check(scores2.length > 0, "engine re-analyzes after the player's move", { scores2 });
@@ -406,7 +437,7 @@ try {
     const compactStart = performance.now();
     await page.waitForFunction(() =>
         document.querySelectorAll("#engineList .engineRow").length === 15 &&
-        /pos\/s/.test(document.getElementById("engineStatus").textContent),
+        /n\/s/.test(document.getElementById("engineStatus").textContent),
     { timeout: 20000 });
     const compactInitialNodes = await nodesOf();
     await new Promise((resolve) => setTimeout(resolve, compactObservationMs));
@@ -434,6 +465,56 @@ try {
     check(compactCertificationConsistent,
         "hard positive position never advertises certification without matching exact rows",
         compactResult);
+
+    // User stop condition: this position analyzes indefinitely, so a 1M
+    // position limit must land the pool on a latched `stopped` snapshot that
+    // keeps its move list and telemetry frozen.
+    await page.click("#settingsButton");
+    await page.click("#engineMaxPositionsEnabled");
+    await page.$eval("#engineMaxPositionsM", (input) => {
+        input.value = "1";
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await page.click("#settingsDialog .settingsClose");
+    await page.waitForFunction(
+        () => /stopped/.test(document.getElementById("engineStatus").textContent),
+        { timeout: 20000 });
+    const stoppedResult = await page.evaluate(() => ({
+        rows: document.querySelectorAll("#engineList .engineRow").length,
+        status: document.getElementById("engineStatus").textContent,
+        reason: document.querySelector("#engineStatus .engineStState")?.title,
+    }));
+    check(stoppedResult.rows === 15 && /stopped/.test(stoppedResult.status) &&
+        /position count limit/.test(stoppedResult.reason ?? ""),
+    "position count limit stops analysis with a latched move list", stoppedResult);
+    const stoppedNodes = await nodesOf();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    check(await nodesOf() === stoppedNodes,
+        "stopped analysis freezes its position counter", { stoppedNodes });
+    await page.click("#settingsButton");
+    await page.click("#engineMaxPositionsEnabled"); // back to unlimited
+    await page.click("#settingsDialog .settingsClose");
+
+    // GPU-only mode: disabling CPU search restarts the pool with one
+    // GPU-pump lane; analysis must keep producing rows and telemetry.
+    await page.click("#settingsButton");
+    await page.click("#engineUseCpu");
+    await page.click("#settingsDialog .settingsClose");
+    await page.waitForFunction(() =>
+        document.querySelectorAll("#engineList .engineRow").length >= 3 &&
+        /n\/s/.test(document.getElementById("engineStatus").textContent),
+    { timeout: 20000 });
+    const gpuOnly = await page.evaluate(() => ({
+        rows: document.querySelectorAll("#engineList .engineRow").length,
+        status: document.getElementById("engineStatus").textContent,
+        cpuTitle: document.querySelector("#engineStatus .engineHwCpu")?.title,
+    }));
+    check(gpuOnly.rows >= 3 && /CPU search disabled/.test(gpuOnly.cpuTitle ?? ""),
+        "GPU-only mode keeps analyzing and reports the CPU restriction", gpuOnly);
+    await page.click("#settingsButton");
+    await page.click("#engineUseCpu"); // restore CPU search
+    await page.click("#settingsDialog .settingsClose");
+
     if (await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {
         await page.click("#engineButton");
     }

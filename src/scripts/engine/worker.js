@@ -28,10 +28,12 @@
  *      enough, a hybrid B&B/value-memo ladder takes priority until every
  *      move is proved
  *
- * Analysis ends in exactly three ways: a new position arrives, EVERY move is
- * proven optimal ("proven"), or SETTLE_PASSES unchanged *global* max-width
+ * Analysis ends in exactly four ways: a new position arrives, EVERY move is
+ * proven optimal ("proven"), SETTLE_PASSES unchanged *global* max-width
  * passes plus a private max-width audit find nothing on a board too large to
- * enumerate ("settled") — never by an arbitrary timer. Stagnation first
+ * enumerate ("settled"), or the pool sends "stop" because a user-configured
+ * limit was reached (first zero-score line, analysis time, position count) —
+ * never by an arbitrary internal timer. Stagnation first
  * escalates width and removes root starvation, then stops honestly.
  * Bigger-group hopefuls — moves with larger groups than the current best
  * that might match its score — get first claim on locked passes, playouts
@@ -52,20 +54,23 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260715-mobile1";
+import { createGpu, dominantColor } from "./gpu.js?build=20260715-engine1";
 import {
     analysisState, canTransferExactSuffix, caretakerProofCandidates, createSearchProgress,
     exactCandidateOrder, mirrorClickedPrefixTasks, positionProofCandidates, recordSearchPass,
     remainingAfterMove, roundRobinPrefixTasks, settlementReady, shouldGpuCaretake,
     summarizePositionProof,
-} from "./schedule.js?build=20260715-mobile1";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-mobile1";
+} from "./schedule.js?build=20260715-engine1";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-engine1";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
 const LANE = Math.min(LANES - 1,
     Math.max(0, Number.parseInt(workerParams.get("lane") ?? "0", 10) || 0));
 const GPU_ALLOWED = workerParams.get("gpu") !== "0";
+// cpu=0 (settings "Use CPU" off): the WASM core still provides the instant
+// baselines and replay validation, but sustained search is GPU-only
+const CPU_ALLOWED = workerParams.get("cpu") !== "0";
 
 const SIZE = 12;
 const CHUNK = 16000;            // beam expansions per slice, ~10 ms
@@ -180,6 +185,18 @@ self.onmessage = (event) => {
                 eng.seedExactByCell(seed.line[0], seed.score);
             }
         }
+    } else if (msg.type === "stop" && job && msg.id === job.id) {
+        // A user-configured limit (first zero, time, position count) ended
+        // this analysis. The pool has already emitted the terminal snapshot,
+        // so drop the job like a position change: every stage aborts at its
+        // next staleness check and the lane sleeps until the next analyze.
+        job = null;
+        caretakerStopJob = null;
+        thresholdPlan = null;
+        eng?.thresholdCancel();
+        jobVersion++;
+        for (const wake of jobChangeWaiters) wake();
+        jobChangeWaiters.clear();
     } else if (msg.type === "stop-caretaker" && job && msg.id === job.id) {
         // Every CPU-only peer has reached a terminal snapshot. A lane-zero
         // GPU playout loop cannot turn their unresolved positive bounds into
@@ -575,6 +592,33 @@ async function analyze(myJob, isStale) {
     moves = post(false);
 
     if (await finishLaneIfComplete(moves)) return;
+
+    // GPU-only mode (settings "Use CPU" off): the greedy baselines and child
+    // tables above are the whole CPU contribution — all sustained search is
+    // the replay-validated GPU playout pump. When WebGPU is unavailable or
+    // fails, fall through to the normal CPU schedule so analysis always runs.
+    if (!CPU_ALLOWED && gpuState === "on") {
+        await gpuBaselineReady;
+        if (isStale()) return;
+        latestGpuMoves = moves;
+        startGpuPump(1024);
+        for (;;) {
+            if (isStale()) { stopGpuPump(); return; }
+            fillGpuPipeline();
+            await drainGpu();
+            if (isStale()) { stopGpuPump(); return; }
+
+            let current = collectResults().moves;
+            latestGpuMoves = current;
+            if (current.every((move) => move.exact) || gpuState !== "on") {
+                stopGpuPump();
+                post(true);
+                return;
+            }
+            if (performance.now() - lastPost > POST_INTERVAL_MS) current = post(false);
+            latestGpuMoves = current;
+        }
+    }
 
     // 3. quick CPU playout round: 32 playouts per root move
     for (let k = 0; k < moves.length; k++) {
@@ -1822,7 +1866,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260715-mobile1");
+            wasmURL.searchParams.set("build", "20260715-engine1");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();
