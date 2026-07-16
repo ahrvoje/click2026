@@ -371,6 +371,9 @@ function selectTreeNode(node) {
 //
 
 export function onCanvasClick(event) {
+    // a second finger on the board is not a move
+    if (event.isPrimary === false) return;
+
     let firstClick = false;
 
     // clicking the board during replay takes over — pause it and play from here
@@ -573,7 +576,9 @@ export function init() {
         onSelect: selectTreeNode,
     });
 
-    canvas.addEventListener("mousedown", onCanvasClick);
+    // pointerdown, not mousedown: touch taps fire it directly, while synthesized
+    // mouse events are dropped by iOS Safari on fast taps or mid-redraw touches
+    canvas.addEventListener("pointerdown", onCanvasClick);
 
     // wheel rewinding; preventDefault keeps the page from scrolling while over the board
     canvas.addEventListener("wheel", (event) => {
