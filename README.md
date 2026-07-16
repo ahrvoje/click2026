@@ -62,8 +62,10 @@ lowest-leftmost block) and the best engine score seen for that position. A dark 
 of a node marks a finished game — no legal move is left there. Clicking a node reloads its position; playing a move that is already in the tree
 just moves the focus, anything new amends the tree. The red-tinted nodes mark the selected
 replay route. It starts on the main line; double-click any node to route replay through it,
-or play a new branch to select that branch automatically. The mouse wheel and rewind controls
-step along this route. The panel keeps a fixed width — deep trees wrap and scroll vertically.
+or play a new branch to select that branch automatically. The mouse wheel — over the board or
+over the moves panel — and the rewind controls step along this route; the panel scrolls itself
+to keep the shown move visible. The panel keeps a fixed width — deep trees wrap and scroll
+vertically.
 
 The bottom-left **settings** button controls the move navigator and engine list.
 The moves slider sits below the board, defaults to visible on mobile devices,

@@ -589,6 +589,13 @@ export function init() {
         processMouseWheel(-event.deltaY);
     }, { passive: false });
 
+    // the same wheel navigation works over the moves view; preventDefault keeps the
+    // panel from scrolling itself — the focus reveal scrolls it to the shown move
+    el("treeScroll").addEventListener("wheel", (event) => {
+        event.preventDefault();
+        processMouseWheel(-event.deltaY);
+    }, { passive: false });
+
     gameFromString(document.location.search);
     EngineUI.toggle(); // analysis is on by default; the button still toggles it normally
 }

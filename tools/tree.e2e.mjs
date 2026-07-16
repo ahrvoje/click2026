@@ -115,6 +115,11 @@ try {
             new WheelEvent("wheel", { deltaY: d, bubbles: true, cancelable: true }));
     }, deltaY);
 
+    const treeWheel = (deltaY) => page.evaluate((d) => {
+        document.getElementById("treeScroll").dispatchEvent(
+            new WheelEvent("wheel", { deltaY: d, bubbles: true, cancelable: true }));
+    }, deltaY);
+
     const playCell = ([i, j]) => page.evaluate(([column, row]) => new Promise((resolve) => {
         const canvas = document.getElementById("gameCanvas");
         const rect = canvas.getBoundingClientRect();
@@ -254,6 +259,16 @@ try {
     check((await focusedTreeNode())?.transform === variantLeafTransform,
         "wheel forward follows the automatically selected variant",
         { focus: (await focusedTreeNode())?.transform, expected: variantLeafTransform });
+
+    // the wheel navigates the replay route over the moves view too
+    await treeWheel(-100);
+    await sleep(50);
+    check(await moveValue() === "2 / 3", "wheel over the moves view rewinds one move", { move: await moveValue() });
+    await treeWheel(100);
+    await sleep(50);
+    check(await moveValue() === "3 / 3" && (await focusedTreeNode())?.transform === variantLeafTransform,
+        "wheel over the moves view plays one move forward along the route",
+        { move: await moveValue(), focus: (await focusedTreeNode())?.transform });
 
     // A genuine two-press mouse gesture must survive the focus rebuild triggered
     // by its first press, switch the route, and leave structural layout untouched.
