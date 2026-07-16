@@ -998,7 +998,7 @@ body {
         }
     }
 
-    /* footer: settings, examples & tests, tree view toggle */
+    /* footer: settings, examples & tests, moves toggle */
     #footer {
         flex: 0 0 auto;
         padding: 4px 0 calc(5px + env(safe-area-inset-bottom));
