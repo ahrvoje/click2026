@@ -53,32 +53,22 @@ try {
     const moveValue = () => page.$eval("#moveValue", (e) => e.textContent);
     const timeValue = () => page.$eval("#timeValue", (e) => e.textContent);
     const treeNodeCount = () => page.$$eval("#treeScroll .treeNode", (n) => n.length);
-    const treeColumnCount = () => page.$$eval("#treeScroll .treeNode", (nodes) =>
-        new Set(nodes.map((n) => n.getAttribute("transform").match(/translate\((\d+)/)[1])).size);
 
-    // Edges are painted in two passes (ordinary first, replay last), so associate
-    // each edge with its destination node by SVG endpoint rather than DOM order.
-    const treeState = () => page.$eval("#treeScroll svg", (svg) => {
-        const edges = [...svg.querySelectorAll(".treeEdge")];
-        return [...svg.querySelectorAll(".treeNode")].map((node) => {
-            const transform = node.getAttribute("transform");
-            const match = transform.match(/translate\(([\d.]+),\s*([\d.]+)\)/);
-            const x = Number(match[1]);
-            const y = Number(match[2]);
-            const incoming = edges.find((edge) => {
-                const end = edge.getPointAtLength(edge.getTotalLength());
-                return Math.abs(end.x - (x + 27)) < 0.1 && Math.abs(end.y - y) < 0.1;
-            });
-            const style = incoming === undefined ? null : getComputedStyle(incoming);
-            return {
-                transform,
-                focus: node.classList.contains("focus"),
-                replay: incoming?.classList.contains("replay") ?? false,
-                stroke: style?.stroke ?? null,
-                strokeWidth: style === null ? null : parseFloat(style.strokeWidth),
-            };
-        });
-    });
+    // unindented rows start at x = 6 and flow at a 72px pitch — any node whose
+    // x is off that lattice sits on an indented (variant) row
+    const indentedNodeCount = () => page.$$eval("#treeScroll .treeNode", (nodes) =>
+        nodes.filter((n) =>
+            (Number(n.getAttribute("transform").match(/translate\((\d+)/)[1]) - 6) % 72 !== 0).length);
+
+    // replay-route membership and focus are node classes; the route shows as a
+    // tinted box fill (the flow layout draws no connector lines)
+    const treeState = () => page.$eval("#treeScroll svg", (svg) =>
+        [...svg.querySelectorAll(".treeNode")].map((node) => ({
+            transform: node.getAttribute("transform"),
+            focus: node.classList.contains("focus"),
+            replay: node.classList.contains("replay"),
+            fill: getComputedStyle(node.querySelector(".treeBox")).fill,
+        })));
 
     const focusedTreeNode = async () => (await treeState()).find((node) => node.focus);
     const treeNodeCenter = (transform) => page.$$eval("#treeScroll .treeNode", (nodes, wanted) => {
@@ -176,14 +166,14 @@ try {
     check(await treeNodeCount() === 4, "tree records root + 3 moves", { nodes: await treeNodeCount() });
 
     const defaultTree = await treeState();
-    const defaultEdges = defaultTree.filter((node) => node.stroke !== null);
     const mainLeafTransform = defaultTree.find((node) => node.focus)?.transform;
-    check(defaultEdges.length === 3 && defaultEdges.every((edge) => edge.replay),
-        "default replay route is the full vertical main line",
-        { replayEdges: defaultEdges.filter((edge) => edge.replay).length });
-    check(defaultEdges.every((edge) => edge.stroke === "rgb(255, 0, 0)" && edge.strokeWidth >= 3),
-        "default replay route is drawn thick and red",
-        { styles: defaultEdges.map(({ stroke, strokeWidth }) => ({ stroke, strokeWidth })) });
+    check(defaultTree.length === 4 && defaultTree.every((node) => node.replay),
+        "default replay route covers the whole main line",
+        { replayNodes: defaultTree.filter((node) => node.replay).length });
+    check(defaultTree.filter((node) => node.replay && !node.focus)
+        .every((node) => node.fill === "rgb(255, 226, 224)"),
+        "replay-route boxes are tinted red",
+        { fills: defaultTree.map((node) => node.fill) });
 
     //
     // B — variants: branch to the right, tree clicks and wheel navigation
@@ -206,24 +196,24 @@ try {
         }
     }
     check(branched, "a different move branches a variant");
-    check(await treeColumnCount() >= 2, "variant occupies its own column", { columns: await treeColumnCount() });
+    check(await indentedNodeCount() >= 1, "variant starts an indented row",
+        { indented: await indentedNodeCount() });
     check(await timeValue() === "–", "variant position shows a dash");
 
     const branchTree = await treeState();
     const variantLeafTransform = branchTree.find((node) => node.focus)?.transform;
     const mainLeafAfterBranch = branchTree.find((node) => node.transform === mainLeafTransform);
     const variantLeaf = branchTree.find((node) => node.transform === variantLeafTransform);
-    const normalEdge = branchTree.find((node) => node.stroke !== null && !node.replay);
+    const ordinaryNode = branchTree.find((node) => !node.replay && !node.focus);
     const branchTransforms = branchTree.map((node) => node.transform).sort();
-    check(branchTree.filter((node) => node.replay).length === 3 &&
+    check(branchTree.filter((node) => node.replay).length === 4 &&
         variantLeaf?.replay && !mainLeafAfterBranch?.replay,
         "new variant automatically becomes the replay route",
         { main: mainLeafAfterBranch, variant: variantLeaf });
-    check(variantLeaf?.stroke === "rgb(255, 0, 0)" &&
-        variantLeaf.strokeWidth > (normalEdge?.strokeWidth ?? Infinity),
-        "selected variant edge is red and thicker than ordinary edges",
-        { replay: variantLeaf && { stroke: variantLeaf.stroke, width: variantLeaf.strokeWidth },
-            ordinary: normalEdge && { stroke: normalEdge.stroke, width: normalEdge.strokeWidth } });
+    check(ordinaryNode?.fill === "rgb(255, 255, 255)" &&
+        branchTree.some((node) => node.replay && !node.focus && node.fill === "rgb(255, 226, 224)"),
+        "replay tint distinguishes route boxes from ordinary white boxes",
+        { ordinary: ordinaryNode?.fill });
 
     // The selected route also drives autoplay. Variant pacing is deliberately
     // synthetic, while its positions continue to show no official time.
@@ -401,7 +391,7 @@ try {
         "37,36,12,1,0,12&times=533,929,374,344,492,642,406,218,320,236,178,414,344,266,344,352,484,586,188,264,258,430," +
         "1242,336,679,611,217,455,358,321,171,524,273,235,905,180,406,414,156,320", { waitUntil: "networkidle0" });
     check(await treeNodeCount() === 42, "legacy example loads into the tree", { nodes: await treeNodeCount() });
-    check(await treeColumnCount() === 1, "legacy example is a single main line");
+    check(await indentedNodeCount() === 0, "legacy example is a single unindented main line");
 
     await page.click("#autoPlayButton");
     await sleep(1500);
@@ -409,10 +399,37 @@ try {
     const replayed = await moveValue();
     check(parseInt(replayed, 10) > 0, "legacy example autoplays with times", { move: replayed });
 
-    // a 42-node tree overflows the panel — the user's scroll must survive the
-    // engine streaming results (no jump back to the focused node)
+    // a 42-move line fits the compact flow panel — grow the loaded game into a
+    // variant-rich tree through the game model, reload its link, and check the
+    // user's scroll survives the engine streaming results (no jump to focus)
     check(await page.$eval("#engineButton", (button) => button.classList.contains("active")),
         "engine remains on by default after navigation");
+    const inflatedLink = await page.evaluate(async () => {
+        const { Game } = await import("/src/scripts/game.js");
+        const game = new Game(location.search);
+        const mainLine = [];
+        for (let node = game.getRoot().children[0]; node !== undefined; node = node.children[0]) {
+            mainLine.push(node);
+        }
+        // two extra variants at each of the first eight moves — enough indented
+        // rows to overflow the fixed-height panel
+        for (let depth = 1; depth <= 8; depth++) {
+            let added = 0;
+            for (let i = 0; i < 12 && added < 2; i++) {
+                for (let j = 0; j < 12 && added < 2; j++) {
+                    game.focusNode(mainLine[depth]);
+                    const before = mainLine[depth].children.length;
+                    game.playMove([i, j]);
+                    if (mainLine[depth].children.length > before) added++;
+                }
+            }
+        }
+        return game.getString();
+    });
+    await page.goto(`http://localhost:8123/?${inflatedLink}`, { waitUntil: "networkidle0" });
+    check(await treeNodeCount() > 50, "variant-rich game reloads into the tree", { nodes: await treeNodeCount() });
+    check(await page.$eval("#treeScroll", (e) => e.scrollHeight > e.clientHeight + 60),
+        "variant-rich tree overflows the panel vertically");
     await page.evaluate(() => { document.getElementById("treeScroll").scrollTop = 40; });
     await sleep(1500);
     const scrollTop = await page.$eval("#treeScroll", (e) => e.scrollTop);
@@ -420,7 +437,7 @@ try {
     await page.click("#engineButton");
 
     //
-    // F — responsive tree width: five columns by default, then grow or scroll
+    // F — fixed panel width: the flow layout wraps, the panel never grows
     //
     const examplePosition = "544341454153245551352111315534254113553554342242333515335513533415541542" +
         "111541422113121311534345113215252332331311244443442542241513343551454125";
@@ -443,7 +460,7 @@ try {
 
     const baselinePanel = await panelGeometry();
     check(baselinePanel.width >= 317 && baselinePanel.width <= 320,
-        "tree panel baseline is five lattice columns wide", baselinePanel);
+        "tree panel has its fixed baseline width", baselinePanel);
 
     for (let k = 0; k < rootMoves.length; k++) {
         if (k > 0) {
@@ -452,33 +469,20 @@ try {
             await sleep(20);
         }
         check(await playCell(rootMoves[k]), `deterministic root variant ${k + 1} created`, { cell: rootMoves[k] });
-
-        if (k === 4) {
-            const fiveColumns = await panelGeometry();
-            check(await treeColumnCount() === 5 && fiveColumns.width === baselinePanel.width &&
-                fiveColumns.scrollWidth <= fiveColumns.clientWidth + 1,
-                "five columns fit the baseline tree panel without horizontal scrolling", fiveColumns);
-        }
-        if (k === 5) {
-            const sixColumns = await panelGeometry();
-            check(await treeColumnCount() === 6 && sixColumns.width > baselinePanel.width + 50 &&
-                sixColumns.scrollWidth <= sixColumns.clientWidth + 1,
-                "sixth column expands the tree panel when viewport space allows", sixColumns);
-        }
     }
 
-    const sevenColumnsWide = await panelGeometry();
-    check(await treeColumnCount() === 7 && sevenColumnsWide.width > baselinePanel.width + 110 &&
-        sevenColumnsWide.scrollWidth <= sevenColumnsWide.clientWidth + 1,
-        "wide viewport expands to show seven columns without horizontal scrolling", sevenColumnsWide);
+    const branchedPanel = await panelGeometry();
+    check(branchedPanel.width === baselinePanel.width &&
+        branchedPanel.scrollWidth <= branchedPanel.clientWidth + 1,
+        "variant-heavy tree wraps inside the fixed panel without horizontal scrolling", branchedPanel);
+    check(await indentedNodeCount() === rootMoves.length - 1,
+        "each root variant starts an indented row", { indented: await indentedNodeCount() });
 
     await page.setViewport({ width: 1000, height: 900 });
     await sleep(100);
-    const sevenColumnsClamped = await panelGeometry();
-    check(sevenColumnsClamped.width < sevenColumnsWide.width &&
-        sevenColumnsClamped.scrollWidth > sevenColumnsClamped.clientWidth &&
-        sevenColumnsClamped.right <= sevenColumnsClamped.viewport + 1,
-        "constrained viewport clamps the panel and enables horizontal scrolling", sevenColumnsClamped);
+    const narrowPanel = await panelGeometry();
+    check(narrowPanel.width === baselinePanel.width && narrowPanel.right <= narrowPanel.viewport + 1,
+        "panel width is viewport-independent", narrowPanel);
 
     const relevantErrors = consoleErrors.filter((e) => !/favicon/.test(e));
     check(relevantErrors.length === 0, "no console errors", relevantErrors.length ? { relevantErrors } : undefined);

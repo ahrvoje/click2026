@@ -61,11 +61,16 @@ assert.equal(game.playMove([0, 0]), true);
 assert.equal(game.getReplayTarget(), game.getFocus(), "new continuation extends the selected replay route");
 assert.deepEqual(game.getReplayNodes(), [newVariant, game.getFocus()]);
 
-// Replay state is visual/navigation-only; the layout remains structural.
+// Replay state is visual/navigation-only; the layout remains structural: the
+// main line flows unindented, variants break in on indented rows, and the
+// interrupted main line resumes at its own indent.
 const placed = layoutTree(game.getRoot());
-assert.equal(placed.get(main).col, 0);
-assert.equal(placed.get(mainLeaf).col, 0);
-assert.ok(placed.get(variant).col > 0);
-assert.ok(placed.get(newVariant).col > 0);
+const rootPlace = placed.get(game.getRoot());
+assert.equal(placed.get(main).row, rootPlace.row, "main move follows the root on its row");
+assert.ok(placed.get(variant).row > rootPlace.row, "variant starts a new row");
+assert.ok(placed.get(variant).x > rootPlace.x, "variant row is indented");
+assert.ok(placed.get(newVariant).x > rootPlace.x, "new variant row is indented");
+assert.equal(placed.get(mainLeaf).x, rootPlace.x, "resumed main line returns to its indent");
+assert.ok(placed.get(mainLeaf).row > placed.get(newVariant).row, "main line resumes below the variants");
 
 console.log("Tree replay model tests passed.");

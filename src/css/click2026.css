@@ -259,13 +259,14 @@ body {
     }
 }
 
-/* position tree — five lattice columns wide by default. Wider trees consume spare
-   viewport space before falling back to horizontal scrolling. The height is constant:
-   board (310) + start button (32) + status row (36) + buttons (38) + engine
-   block (136), so closing the engine panel never hides the bottom of the tree */
+/* position tree — a chess-notation flow inside a fixed-width panel: nodes wrap
+   into rows and variants start indented rows, so the panel never needs to grow.
+   The height is constant: board (310) + start button (32) + status row (36) +
+   buttons (38) + engine block (136), so closing the engine panel never hides
+   the bottom of the tree */
 #treePanel {
     position: relative;
-    width: clamp(318px, var(--tree-content-width, 318px), calc(100vw - 620px));
+    width: 318px;
     flex: 0 0 auto;
     height: 552px;
     background-color: rgb(232 232 232);
@@ -275,18 +276,6 @@ body {
     position: absolute;
     inset: 0;
     overflow: auto;
-}
-
-.treeEdge {
-    stroke: rgb(0 0 0 / 0.35);
-    fill: none;
-}
-
-.treeEdge.replay {
-    stroke: red;
-    stroke-width: 3;
-    stroke-linecap: round;
-    stroke-linejoin: round;
 }
 
 .treeNode {
@@ -302,8 +291,14 @@ body {
     stroke: var(--accent-hover);
 }
 
+/* boxes on the replay route — the line replay and autoplay follow — are tinted;
+   the focus rule below wins on the focused node */
+.treeNode.replay .treeBox {
+    fill: rgb(255 226 224);
+}
+
 .treeNode.focus .treeBox {
-    fill: rgb(19 121 202 / 0.15);
+    fill: rgb(220 235 247);
     stroke: var(--accent);
     stroke-width: 2;
 }
@@ -322,6 +317,12 @@ body {
 .treeLabel {
     fill: black;
     font-size: 10px;
+}
+
+/* move number shown before the move, chess-notation style */
+.treeMoveNum {
+    fill: rgb(85 85 85);
+    font-size: 9px;
 }
 
 /* best engine score recorded for the node's position — the headline datum of a

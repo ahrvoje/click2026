@@ -1,10 +1,12 @@
 /**
  * Click2026 — position tree UI: renders the game's move tree next to the board.
  *
- * One node per move: the color played as a small square, the A-L column/row label
- * of the canonical block (the group's lowest-leftmost field) and the best engine
- * score recorded for the position. The main line runs vertically, variants branch
- * horizontally to the right. Clicking a node reloads its position on the board.
+ * One node per move: the move number in dark gray, the color played as a small
+ * square, the A-L column/row label of the canonical block (the group's
+ * lowest-leftmost field) and the best engine score recorded for the position.
+ * Nodes flow horizontally and wrap like chess notation: a variant starts a new
+ * row indented one step per depth, then the interrupted line resumes on a fresh
+ * row at its own indent. Clicking a node reloads its position on the board.
  *
  * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
@@ -17,13 +19,16 @@ import { LETTERS } from "./board.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
-// node box geometry and the row/column lattice pitch (px)
-const NODE_W = 54;
+// node box geometry and the flow-layout metrics (px): nodes lay out at a fixed
+// horizontal pitch and wrap within the fixed content width; each variant depth
+// indents its rows by a third of a node width
+const NODE_W = 68;
 const NODE_H = 18;
-const COL_W = 62;
-const ROW_H = 25;
+const ROW_H = 20;
+const PITCH = NODE_W + 4;
+const INDENT = Math.round(NODE_W / 3);
 const PAD = 6;
-const PANEL_GUTTER = 4;
+const CONTENT_W = 296; // fits the fixed 318px panel beside a vertical scrollbar
 const DOUBLE_PRESS_MS = 500;
 
 let container = null;   // scrollable element the SVG is rendered into
@@ -37,38 +42,40 @@ let lastFocus = null;
 let lastPressedNode = null;
 let lastPressedAt = -Infinity;
 
-// Band layout with no connectors crossing through chains or nodes. Every branch
-// (a chain of first children) occupies one column and every variant subtree a
-// contiguous column band right of its parent's column. Branch points hand out
-// bands bottom-up, so a lower variant sits right next to its parent chain and
-// variants branching higher up shift right to make room for it. A variant elbow
-// therefore only ever passes over bands of deeper branch points, whose nodes all
-// live strictly below the elbow's row gap — no line crosses a chain or a node.
-// Exported for tests.
-export function layoutTree(root) {
-    const placed = new Map(); // node -> { row, col }
+// Chess-notation flow layout. A line (a chain of first children) lays out
+// horizontally and wraps into rows at its indent. Right after the move that
+// has alternatives, each variant chain breaks in on its own row, indented one
+// step deeper, and the interrupted line then resumes on a fresh row at its own
+// indent. Exported for tests.
+export function layoutTree(root, contentWidth = CONTENT_W) {
+    const placed = new Map(); // node -> { row, x }
+    let row = 0;
 
-    // returns the rightmost column used by the subtree band
-    const placeBranch = (node, row, colStart) => {
-        const chain = [node];
-        for (let n = node; n.children.length > 0; ) {
-            n = n.children[0];
-            chain.push(n);
-        }
-        chain.forEach((n, k) => placed.set(n, { row: row + k, col: colStart }));
+    const placeChain = (start, indent) => {
+        let x = PAD + indent;
+        for (let node = start; node !== undefined; node = node.children[0]) {
+            if (x + NODE_W > contentWidth - PAD && x > PAD + indent) {
+                row += 1;
+                x = PAD + indent;
+            }
+            placed.set(node, { row, x });
+            x += PITCH;
 
-        // lower branch points claim their bands first — higher variants shift right
-        let nextFree = colStart + 1;
-        for (let k = chain.length - 1; k >= 0; k--) {
-            for (const variant of chain[k].children.slice(1)) {
-                nextFree = placeBranch(variant, row + k + 1, nextFree) + 1;
+            // alternatives to the move just placed break in before the line goes on
+            if (node !== start && node.parent.children.length > 1) {
+                for (const variant of node.parent.children.slice(1)) {
+                    row += 1;
+                    placeChain(variant, indent + INDENT);
+                }
+                if (node.children.length > 0) {
+                    row += 1;
+                    x = PAD + indent;
+                }
             }
         }
-
-        return nextFree - 1;
     };
 
-    placeBranch(root, 0, 0);
+    placeChain(root, 0);
     return placed;
 }
 
@@ -78,6 +85,14 @@ function svgEl(tag, attrs) {
         node.setAttribute(key, value);
     }
     return node;
+}
+
+function moveNumber(node) {
+    let n = 0;
+    for (let p = node; p.parent !== null; p = p.parent) {
+        n += 1;
+    }
+    return n;
 }
 
 export const TreeUI = {
@@ -117,67 +132,23 @@ export const TreeUI = {
         const placed = layoutTree(game.getRoot());
 
         let maxRow = 0;
-        let maxCol = 0;
-        for (const { row, col } of placed.values()) {
+        let maxX = 0;
+        for (const { row, x } of placed.values()) {
             maxRow = Math.max(maxRow, row);
-            maxCol = Math.max(maxCol, col);
+            maxX = Math.max(maxX, x);
         }
 
-        const svgWidth = 2 * PAD + maxCol * COL_W + NODE_W;
         const svg = svgEl("svg", {
-            width: svgWidth,
+            width: Math.max(CONTENT_W, maxX + NODE_W + PAD),
             height: 2 * PAD + maxRow * ROW_H + NODE_H,
         });
-        container.parentElement.style.setProperty("--tree-content-width", `${svgWidth + PANEL_GUTTER}px`);
-
-        // when elbows of different parents share a row gap (a rare nested-branch
-        // case) each gets its own horizontal lane, so the lines stay apart;
-        // elbows of one parent share a lane — they fork from the same point
-        const gapElbows = new Map(); // parent row -> [{ from, lo, hi, lane }]
-        const laneOf = (gap, from, lo, hi) => {
-            const list = gapElbows.get(gap) ?? [];
-            const lane = list.find((e) => e.from === from)?.lane ??
-                Math.min(2, list.filter((e) => e.from !== from && !(hi < e.lo || lo > e.hi)).length);
-            list.push({ from, lo, hi, lane });
-            gapElbows.set(gap, list);
-            return lane;
-        };
-
-        // Edges paint before nodes. Replay edges get a second, later pass so their
-        // shared elbow segments cannot be covered by an ordinary sibling edge.
-        const ordinaryEdges = [];
-        const replayEdges = [];
-        for (const [node, { row, col }] of placed) {
-            if (node.parent === null) {
-                continue;
-            }
-
-            const p = placed.get(node.parent);
-            const px = PAD + p.col * COL_W + NODE_W / 2;
-            const py = PAD + p.row * ROW_H + NODE_H;
-            const cx = PAD + col * COL_W + NODE_W / 2;
-            const cy = PAD + row * ROW_H;
-
-            // straight drop inside a branch, an elbow through the row gap to a variant
-            let d;
-            if (p.col === col) {
-                d = `M ${px} ${py} L ${cx} ${cy}`;
-            } else {
-                const lane = laneOf(p.row, p.col, Math.min(p.col, col), Math.max(p.col, col));
-                const hy = py + [3.5, 1.75, 5.25][lane];
-                d = `M ${px} ${py} L ${px} ${hy} L ${cx} ${hy} L ${cx} ${cy}`;
-            }
-            const edge = svgEl("path", { class: "treeEdge" + (replayNodes.has(node) ? " replay" : ""), d });
-            (replayNodes.has(node) ? replayEdges : ordinaryEdges).push(edge);
-        }
-        ordinaryEdges.forEach((edge) => svg.append(edge));
-        replayEdges.forEach((edge) => svg.append(edge));
 
         let focusPlace = null;
-        for (const [node, { row, col }] of placed) {
+        for (const [node, { row, x }] of placed) {
             const g = svgEl("g", {
-                class: "treeNode" + (node === focus ? " focus" : ""),
-                transform: `translate(${PAD + col * COL_W}, ${PAD + row * ROW_H})`,
+                class: "treeNode" + (node === focus ? " focus" : "") +
+                    (replayNodes.has(node) ? " replay" : ""),
+                transform: `translate(${x}, ${PAD + row * ROW_H})`,
             });
 
             g.append(svgEl("rect", { class: "treeBox", width: NODE_W, height: NODE_H, rx: 3 }));
@@ -186,12 +157,16 @@ export const TreeUI = {
                 // the root is the start position — no move to label
                 g.append(svgEl("circle", { class: "treeRootMark", cx: 9, cy: NODE_H / 2, r: 3.5 }));
             } else {
+                const num = svgEl("text", { class: "treeMoveNum", x: 16, y: 13, "text-anchor": "end" });
+                num.textContent = String(moveNumber(node));
+                g.append(num);
+
                 g.append(svgEl("rect", {
-                    class: "treeSwatch", x: 4, y: 4, width: 10, height: 10,
+                    class: "treeSwatch", x: 19, y: 4, width: 10, height: 10,
                     fill: playColors[node.color - 1],
                 }));
 
-                const label = svgEl("text", { class: "treeLabel", x: 18, y: 13 });
+                const label = svgEl("text", { class: "treeLabel", x: 32, y: 13 });
                 label.textContent = LETTERS[node.move[0]] + LETTERS[node.move[1]];
                 g.append(label);
             }
@@ -224,7 +199,7 @@ export const TreeUI = {
             svg.append(g);
 
             if (node === focus) {
-                focusPlace = { row, col };
+                focusPlace = { row, x };
             }
         }
 
@@ -236,7 +211,7 @@ export const TreeUI = {
 
         // ...only an actual focus change reveals the focused node
         if (focusPlace !== null && focus !== lastFocus) {
-            const x = PAD + focusPlace.col * COL_W;
+            const x = focusPlace.x;
             const y = PAD + focusPlace.row * ROW_H;
 
             if (x < container.scrollLeft) {

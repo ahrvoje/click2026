@@ -358,8 +358,9 @@ try {
         const positioned = candidates.map((node) => {
             const match = node.getAttribute("transform")?.match(/translate\(([-\d.]+)/);
             return { node, x: match ? Number(match[1]) : -Infinity };
-        }).sort((a, b) => b.x - a.x);
-        const variant = positioned[0]?.node;
+        });
+        // the variant lives on an indented row — off the unindented 6 + 72k lattice
+        const variant = (positioned.find((p) => (p.x - 6) % 72 !== 0) ?? positioned[0])?.node;
         variant?.dispatchEvent(new MouseEvent("mousedown", {
             bubbles: true, cancelable: true, button: 0,
         }));

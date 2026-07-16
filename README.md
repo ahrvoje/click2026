@@ -48,16 +48,16 @@ entropy-coder end state doubles as an integrity check. Old Click2014 links keep 
 Position tree & official time
 -----------------------------
 
-Every move is recorded in the position tree shown right of the board: the originally played
-game runs vertically as the main line, alternative tries branch horizontally to the right.
-Each node shows the color played, the A–L column/row of the clicked block (a group is
-represented by its lowest-leftmost block) and the best engine score seen for that position.
-Clicking a node reloads its position; playing a move that is already in the tree just moves
-the focus, anything new amends the tree. The thicker red connector marks the selected replay
-route. It starts on the vertical main line; double-click any node to route replay through it,
+Every move is recorded in the position tree shown right of the board, laid out like modern
+chess notation: moves flow left to right and wrap into rows, and each alternative try breaks
+in on its own row, indented one step per variant depth, before the interrupted line resumes.
+Each node shows the move number, the color played, the A–L column/row of the clicked block
+(a group is represented by its lowest-leftmost block) and the best engine score seen for that
+position. Clicking a node reloads its position; playing a move that is already in the tree
+just moves the focus, anything new amends the tree. The red-tinted nodes mark the selected
+replay route. It starts on the main line; double-click any node to route replay through it,
 or play a new branch to select that branch automatically. The mouse wheel and rewind controls
-step along this route. The panel shows five tree columns by default, expands into available
-window space for wider trees, then scrolls horizontally when necessary.
+step along this route. The panel keeps a fixed width — deep trees wrap and scroll vertically.
 
 The bottom-left **settings** button controls the move navigator and engine list.
 The moves slider sits below the board, defaults to visible on mobile devices,
