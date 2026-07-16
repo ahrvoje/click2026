@@ -21,8 +21,40 @@ import { SIZE, COLORS, clonePosition, extractGroup, removeGroup, canonicalBlock 
 
 // a position-tree node: the move that created it and everything recorded about it;
 // move/color are null for the root (the start position), score is the best (lowest)
-// engine evaluation seen for the position at this node
-const makeNode = (move, color, parent) => ({ move, color, parent, children: [], score: null });
+// engine evaluation seen for the position at this node, over means the position
+// has no legal move left — the game ends at this node. A node that starts a
+// variant line (a non-first child) carries variantNum, the chronological number
+// of the variant's creation; main-line nodes keep null
+const makeNode = (move, color, parent) =>
+    ({ move, color, parent, children: [], score: null, over: false, variantNum: null });
+
+// no two connected fields share a color — no legal move is left
+const isPositionOver = (position) => {
+    for (let i = 0; i < SIZE; i++) {
+        // stop scanning at the empty part of the board
+        if (position[i][0] === 0) {
+            return true;
+        }
+
+        for (let j = 0; j < SIZE; j++) {
+            const fieldState = position[i][j];
+
+            if (fieldState === 0) {
+                break;
+            }
+
+            if (i < SIZE - 1 && position[i + 1][j] === fieldState) {
+                return false;
+            }
+
+            if (j < SIZE - 1 && position[i][j + 1] === fieldState) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+};
 
 export class Game {
     static Status = Object.freeze({ Initial: 0, Ready: 1, Play: 2, Over: 3, AutoPlay: 4 });
@@ -36,6 +68,7 @@ export class Game {
     #times = [];        // cumulative ms of the timed prefix of the main line
     #currentMove = 0;   // depth of the focus node
     #startTime = 0;
+    #variantCount = 0;  // chronological variant numbers handed out so far
 
     constructor(gameString) {
         if (gameString === undefined) {
@@ -47,7 +80,7 @@ export class Game {
         const gameData = Serializer.deserializeGame(gameString);
         this.#startPosition = Array.isArray(gameData.p) ? clonePosition(gameData.p) : [];
 
-        // moves arrive either as a full position tree (v5) or as a plain main line —
+        // moves arrive either as a full position tree (v5/v6) or as a plain main line —
         // a linear game is just a tree whose nodes have a single child each
         let treeData = gameData.tree;
         if (!treeData) {
@@ -63,6 +96,7 @@ export class Game {
         }
         this.#focus = this.#root;
         this.#replayTarget = this.#root;
+        this.#variantCount = this.#renumberVariants();
 
         const mainLength = this.#mainLineNodes().length;
         this.#times = mainLength > 0 && Array.isArray(gameData.t) ? gameData.t.slice(0, mainLength) : [];
@@ -99,10 +133,37 @@ export class Game {
             const child = this.#buildNode(childData, next, node);
             child.move = move;
             child.color = position[move[0]][move[1]];
+            child.variantNum = Number.isInteger(childData.variantNum) && childData.variantNum > 0
+                ? childData.variantNum : null;
             node.children.push(child);
         }
 
+        // only a leaf can end the game — an inner node was played from
+        node.over = node.children.length === 0 && isPositionOver(position);
         return node;
+    }
+
+    // Variant lines (non-first children) are numbered chronologically by creation.
+    // A loaded tree that carries a complete numbering (v6 links) keeps it; anything
+    // else (v5 and older links) falls back to tree order. Returns the variant count.
+    #renumberVariants() {
+        const variants = [];
+        const walk = (node) => {
+            node.children.forEach((child, index) => {
+                if (index > 0) {
+                    variants.push(child);
+                }
+                walk(child);
+            });
+        };
+        walk(this.#root);
+
+        const chronological = variants.map((variant) => variant.variantNum)
+            .sort((a, b) => a - b).every((num, i) => num === i + 1);
+        if (!chronological) {
+            variants.forEach((variant, index) => { variant.variantNum = index + 1; });
+        }
+        return variants.length;
     }
 
     #mainLineNodes() {
@@ -155,31 +216,7 @@ export class Game {
     }
 
     #isOver() {
-        // try to find at least two connected fields of the same color
-        for (let i = 0; i < SIZE; i++) {
-            // stop scanning at the empty part of the board
-            if (this.#currentPosition[i][0] === 0) {
-                return true;
-            }
-
-            for (let j = 0; j < SIZE; j++) {
-                const fieldState = this.#currentPosition[i][j];
-
-                if (fieldState === 0) {
-                    break;
-                }
-
-                if (i < SIZE - 1 && this.#currentPosition[i + 1][j] === fieldState) {
-                    return false;
-                }
-
-                if (j < SIZE - 1 && this.#currentPosition[i][j + 1] === fieldState) {
-                    return false;
-                }
-            }
-        }
-
-        return true;
+        return isPositionOver(this.#currentPosition);
     }
 
     getStatus() { return this.#status; }
@@ -222,6 +259,7 @@ export class Game {
         this.#replayTarget = this.#root;
         this.#times = [];
         this.#currentMove = 0;
+        this.#variantCount = 0;
         this.#startTime = Date.now();
         this.#status = Game.Status.Play;
     }
@@ -287,7 +325,7 @@ export class Game {
         const mainLength = this.#mainLineNodes().length;
 
         // plain single-line games without engine data keep the shorter v4 links —
-        // unless the line has an untimed tail, which only v5 can carry with times
+        // unless the line has an untimed tail, which only the tree format can carry
         if (isLinear(this.#root) && !hasScores(this.#root) &&
             (this.#times.length === 0 || this.#times.length === mainLength)) {
             return Serializer.serializeGame(4, this.#startPosition,
@@ -295,7 +333,8 @@ export class Game {
         }
 
         const exportNode = (node) =>
-            ({ move: node.move, score: node.score, children: node.children.map(exportNode) });
+            ({ move: node.move, score: node.score, variantNum: node.variantNum,
+                children: node.children.map(exportNode) });
         return Serializer.serializeGameTree(this.#startPosition, exportNode(this.#root), this.#times);
     }
 
@@ -319,6 +358,11 @@ export class Game {
         let child = this.#focus.children.find((c) => c.move[0] === move[0] && c.move[1] === move[1]);
         if (child === undefined) {
             child = makeNode(move, color, this.#focus);
+            child.over = this.#isOver();
+            // a later sibling starts a variant line — stamp its creation number
+            if (this.#focus.children.length > 0) {
+                child.variantNum = ++this.#variantCount;
+            }
             this.#focus.children.push(child);
             this.#replayTarget = child;
         }

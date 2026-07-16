@@ -332,6 +332,19 @@ body {
     font-size: 12px;
 }
 
+/* variant number in front of the variant's indentation — variant 3's move 41
+   is identified as 3m41; the main line is unnumbered */
+.treeVariantNum {
+    fill: black;
+    font-size: 12px;
+}
+
+/* dark bar right of a node whose position has no legal move left — game over */
+.treeOverMark {
+    stroke: rgb(0 0 0 / 0.8);
+    stroke-width: 3;
+}
+
 .rowDiv {
     line-height: 35px;
     vertical-align: middle;

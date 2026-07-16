@@ -9,8 +9,10 @@
  *                      decoding auto-detects the dialect by replay validation
  *   v4               — single "g" param: one rANS entropy-coded BigInt stream
  *   v5               — v4 extended with the whole position tree: variant branches and
- *                      per-node engine scores (current format)
- * New games serialize as v4, or as v5 when the position tree holds variants or engine
+ *                      per-node engine scores
+ *   v6               — v5 extended with the chronological creation order of the variant
+ *                      lines, Lehmer-coded after the tree (current format)
+ * New games serialize as v4, or as v6 when the position tree holds variants or engine
  * data. The encoding tables and compression math of all versions are frozen — do not
  * "clean them up", links depend on them.
  *
@@ -913,9 +915,13 @@ const Serializer4 = {
 //
 // v5 — v4 extended with the whole position tree: variant branches and per-node
 //      engine scores; the main line keeps v4's exact-total-time coding
+// v6 — v5 with one extra block between the tree and the times: the chronological
+//      creation order of the variant lines as a Lehmer-coded permutation
+//      (log2(n!) bits for n variants); v5 links stay decodable, their variants
+//      then simply number in tree order
 //
 
-// ---- frozen v5 coding tables — wire format, keep verbatim ----
+// ---- frozen v5/v6 coding tables — wire format, keep verbatim ----
 
 // child-count frequencies (0 = leaf, 1 = the line continues, 2+ = variant branches);
 // counts beyond the table share frequency 1
@@ -926,10 +932,28 @@ const CHILD_PREFIX = prefixSums(
 // engine scores are blocks left after the best line found: 0..144
 const SCORE_RADIX = 145;
 
+// variant lines (non-first children) enumerated in a canonical tree order — the
+// shared frame both v6 coder sides use to transmit the creation-order permutation
+const treeVariants = (root) => {
+    const variants = [];
+    const walk = (node) => {
+        node.children.forEach((child, index) => {
+            if (index > 0) {
+                variants.push(child);
+            }
+            walk(child);
+        });
+    };
+    walk(root);
+    return variants;
+};
+
 // tree nodes travel as { move: [x, y] | null, score: number | null, children: [...] };
-// the root carries no move. The decoder replays the game exactly like v4 does, so the
+// variant nodes additionally carry variantNum, their chronological creation number.
+// The root carries no move. The decoder replays the game exactly like v4 does, so the
 // board.js rules are part of this wire format too.
-const Serializer5 = {
+const SerializerTree = {
+    // always emits the current v6 format
     serializeGame(position, root, times) {
         if (!Array.isArray(position) || position.length !== SIZE ||
             position.some((col) => !Array.isArray(col) || col.length !== SIZE ||
@@ -962,7 +986,7 @@ const Serializer5 = {
                 const chosen = groups.findIndex((group) =>
                     group.cells.some(([x, y]) => x === child.move[0] && y === child.move[1]));
                 if (chosen < 0) {
-                    throw new Error("v5 tree move does not replay");
+                    throw new Error("v5/v6 tree move does not replay");
                 }
 
                 if (anchor === null) {
@@ -979,6 +1003,19 @@ const Serializer5 = {
             }
         };
         visit(root, clonePosition(position), null);
+
+        // chronological variant numbering — the creation order is a permutation of
+        // 1..n over the variants in tree order, Lehmer-coded symbol by symbol; a
+        // tree carrying no valid numbering is stored in plain tree order
+        const variants = treeVariants(root);
+        const nums = variants.map((variant) => variant.variantNum);
+        const chronological = [...nums].sort((a, b) => a - b).every((num, i) => num === i + 1);
+        const remaining = variants.map((_, i) => i + 1);
+        for (let i = 0; i < variants.length; i++) {
+            const index = chronological ? remaining.indexOf(nums[i]) : 0;
+            encoder.uniform(index, remaining.length);
+            remaining.splice(index, 1);
+        }
 
         // times cover the timed prefix of the main line, coded exactly like v4;
         // insane times are dropped entirely
@@ -1019,10 +1056,11 @@ const Serializer5 = {
             x /= 64n;
         }
 
-        return "v=5&g=" + coded;
+        return "v=6&g=" + coded;
     },
 
-    deserializeGame(gameString) {
+    // version 5 or 6 — v5 lacks the variant creation-order block
+    deserializeGame(gameString, version) {
         if (typeof gameString !== "string" || gameString.length === 0) {
             return { p: [], m: [], t: [] };
         }
@@ -1031,7 +1069,7 @@ const Serializer5 = {
         for (const ch of gameString) {
             const digit = B64.indexOf(ch);
             if (digit < 0) {
-                throw new Error("invalid v5 character");
+                throw new Error("invalid v5/v6 character");
             }
             x = x * 64n + BigInt(digit);
         }
@@ -1079,6 +1117,16 @@ const Serializer5 = {
         };
         const root = readNode(clonePosition(position), null);
 
+        // v6 carries the chronological creation numbers of the variant lines;
+        // v5 predates them — the Game falls back to tree order there
+        if (version === 6) {
+            const variants = treeVariants(root);
+            const remaining = variants.map((_, i) => i + 1);
+            for (const variant of variants) {
+                variant.variantNum = remaining.splice(decoder.uniform(remaining.length), 1)[0];
+            }
+        }
+
         const timedCount = decoder.uniform(MOVES_RADIX);
         let times = [];
         if (timedCount > 0) {
@@ -1103,7 +1151,7 @@ const Serializer5 = {
         }
 
         if (timedCount > moves.length) {
-            throw new Error("v5 times exceed the main line");
+            throw new Error("v5/v6 times exceed the main line");
         }
 
         return { p: position, m: moves, t: times, tree: root };
@@ -1147,8 +1195,9 @@ export const Serializer = {
         }
     },
 
-    // v5 — serializes the whole position tree (variants and engine scores included)
-    serializeGameTree: (position, tree, times) => Serializer5.serializeGame(position, tree, times),
+    // serializes the whole position tree (variants, their creation order and
+    // engine scores included) as the current v6 format
+    serializeGameTree: (position, tree, times) => SerializerTree.serializeGame(position, tree, times),
 
     // never throws — malformed links deserialize to an empty game
     deserializeGame(gameString) {
@@ -1160,7 +1209,8 @@ export const Serializer = {
                 case "2": return Serializer2.deserializeGame(gameParams.p, gameParams.m, gameParams.t);
                 case "3": return Serializer3.deserializeGame(gameParams.p, gameParams.m, gameParams.t);
                 case "4": return Serializer4.deserializeGame(gameParams.g);
-                case "5": return Serializer5.deserializeGame(gameParams.g);
+                case "5": return SerializerTree.deserializeGame(gameParams.g, 5);
+                case "6": return SerializerTree.deserializeGame(gameParams.g, 6);
                 default: return unknownVersion() ?? { p: [], m: [], t: [] };
             }
         } catch {

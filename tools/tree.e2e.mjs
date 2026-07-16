@@ -4,7 +4,7 @@
  * Drives the served game in headless Chrome/Edge: plays a timed game on the board,
  * verifies the clock stops on the first non-board control interaction, creates a
  * variant branch, navigates the tree by clicking nodes and by mouse wheel, checks
- * the dash shown for untimed positions and the v5 link round-trip.
+ * the dash shown for untimed positions and the v6 link round-trip.
  *
  * Usage: node tools/tree.e2e.mjs   (expects `npm run serve` on port 8123)
  *
@@ -202,18 +202,28 @@ try {
 
     const branchTree = await treeState();
     const variantLeafTransform = branchTree.find((node) => node.focus)?.transform;
-    const mainLeafAfterBranch = branchTree.find((node) => node.transform === mainLeafTransform);
     const variantLeaf = branchTree.find((node) => node.transform === variantLeafTransform);
-    const ordinaryNode = branchTree.find((node) => !node.replay && !node.focus);
+    // the branch pushed the interrupted main-line leaf onto its own resumed row —
+    // recapture it as the only node left off the new replay route
+    const mainLeafNode = branchTree.find((node) => !node.replay && !node.focus);
+    const mainLeafBranchTransform = mainLeafNode?.transform;
     const branchTransforms = branchTree.map((node) => node.transform).sort();
+    const rowY = (transform) => Number(transform?.match(/,\s*([-\d.]+)\)/)?.[1] ?? NaN);
     check(branchTree.filter((node) => node.replay).length === 4 &&
-        variantLeaf?.replay && !mainLeafAfterBranch?.replay,
+        variantLeaf?.replay && mainLeafNode !== undefined,
         "new variant automatically becomes the replay route",
-        { main: mainLeafAfterBranch, variant: variantLeaf });
-    check(ordinaryNode?.fill === "rgb(255, 255, 255)" &&
+        { main: mainLeafNode, variant: variantLeaf });
+    check(mainLeafBranchTransform !== mainLeafTransform &&
+        rowY(mainLeafBranchTransform) > rowY(variantLeafTransform),
+        "interrupted main line resumes on its own row below the variant",
+        { main: mainLeafBranchTransform, variant: variantLeafTransform });
+    const variantNums = await page.$$eval("#treeScroll .treeVariantNum", (els) => els.map((e) => e.textContent));
+    check(JSON.stringify(variantNums) === JSON.stringify(["1"]),
+        "the variant carries number 1 in front of its indentation", { variantNums });
+    check(mainLeafNode?.fill === "rgb(255, 255, 255)" &&
         branchTree.some((node) => node.replay && !node.focus && node.fill === "rgb(255, 226, 224)"),
         "replay tint distinguishes route boxes from ordinary white boxes",
-        { ordinary: ordinaryNode?.fill });
+        { ordinary: mainLeafNode?.fill });
 
     // The selected route also drives autoplay. Variant pacing is deliberately
     // synthetic, while its positions continue to show no official time.
@@ -247,9 +257,9 @@ try {
 
     // A genuine two-press mouse gesture must survive the focus rebuild triggered
     // by its first press, switch the route, and leave structural layout untouched.
-    const doublePressed = await pressTreeNode(mainLeafTransform, 2);
+    const doublePressed = await pressTreeNode(mainLeafBranchTransform, 2);
     const mainReplayTree = await treeState();
-    check(doublePressed && mainReplayTree.find((node) => node.transform === mainLeafTransform)?.replay &&
+    check(doublePressed && mainReplayTree.find((node) => node.transform === mainLeafBranchTransform)?.replay &&
         !mainReplayTree.find((node) => node.transform === variantLeafTransform)?.replay,
         "double mouse click switches replay to the chosen main-line node");
     check(JSON.stringify(mainReplayTree.map((node) => node.transform).sort()) === JSON.stringify(branchTransforms),
@@ -260,7 +270,7 @@ try {
     const afterSingleClick = await treeState();
     check(singlePressed && (await focusedTreeNode())?.transform === variantLeafTransform &&
         !afterSingleClick.find((node) => node.transform === variantLeafTransform)?.replay &&
-        afterSingleClick.find((node) => node.transform === mainLeafTransform)?.replay,
+        afterSingleClick.find((node) => node.transform === mainLeafBranchTransform)?.replay,
         "single tree-node click changes focus without changing replay route");
     check(await moveValue() === "3 / 3" && await timeValue() === "–",
         "variant node click reloads its position, time is a dash",
@@ -269,9 +279,9 @@ try {
     await page.click("#replayButton");
     await page.click("#forwardButton");
     await sleep(50);
-    check((await focusedTreeNode())?.transform === mainLeafTransform,
+    check((await focusedTreeNode())?.transform === mainLeafBranchTransform,
         "single click did not change the route used by replay and forward",
-        { focus: (await focusedTreeNode())?.transform, expected: mainLeafTransform });
+        { focus: (await focusedTreeNode())?.transform, expected: mainLeafBranchTransform });
 
     await page.click("#replayButton");
     await wheel(100);
@@ -289,7 +299,7 @@ try {
         document.getElementById("linkButton").click();
         return captured;
     });
-    check(typeof link === "string" && link.includes("v=5&g="), "link with variants serializes as v5",
+    check(typeof link === "string" && link.includes("v=6&g="), "link with variants serializes as v6",
         { link: link?.slice(0, 90) + "…" });
 
     const nodesBeforeReload = await treeNodeCount();
@@ -298,7 +308,7 @@ try {
         { nodes: await treeNodeCount(), expected: nodesBeforeReload });
     check(await moveValue() === "0 / 3", "reloaded game sits at the start of the main line", { move: await moveValue() });
     const reloadedTree = await treeState();
-    check(reloadedTree.find((node) => node.transform === mainLeafTransform)?.replay &&
+    check(reloadedTree.find((node) => node.transform === mainLeafBranchTransform)?.replay &&
         !reloadedTree.find((node) => node.transform === variantLeafTransform)?.replay,
         "reloaded game defaults replay selection to the vertical main line");
 
@@ -436,6 +446,20 @@ try {
     check(scrollTop === 40, "user scroll survives engine updates", { scrollTop });
     await page.click("#engineButton");
 
+    // a finished game — a single-color board cleared by one move — shows the
+    // dark game-over bar on the final node only
+    const overLink = await page.evaluate(async () => {
+        const { Serializer } = await import("/src/scripts/serial.js");
+        const mono = Array.from({ length: 12 }, () => Array(12).fill(1));
+        return Serializer.serializeGameTree(mono,
+            { move: null, score: null, children: [{ move: [0, 0], score: null, children: [] }] }, []);
+    });
+    await page.goto(`http://localhost:8123/?${overLink}`, { waitUntil: "networkidle0" });
+    check(await treeNodeCount() === 2 &&
+        await page.$$eval("#treeScroll .treeOverMark", (els) => els.length) === 1,
+        "finished game shows the game-over bar on its last node",
+        { overMarks: await page.$$eval("#treeScroll .treeOverMark", (els) => els.length) });
+
     //
     // F — fixed panel width: the flow layout wraps, the panel never grows
     //
@@ -477,6 +501,9 @@ try {
         "variant-heavy tree wraps inside the fixed panel without horizontal scrolling", branchedPanel);
     check(await indentedNodeCount() === rootMoves.length - 1,
         "each root variant starts an indented row", { indented: await indentedNodeCount() });
+    const rootVariantNums = await page.$$eval("#treeScroll .treeVariantNum", (els) => els.map((e) => e.textContent));
+    check(JSON.stringify(rootVariantNums) === JSON.stringify(["1", "2", "3", "4", "5", "6"]),
+        "root variants are numbered 1..n in creation order", { rootVariantNums });
 
     await page.setViewport({ width: 1000, height: 900 });
     await sleep(100);

@@ -47,8 +47,9 @@ function randomRecordedGame() {
     return { position, moves, times };
 }
 
-// random position tree with variant branches and engine scores, plus synthetic
-// times covering a random prefix of the main line — used by the v5 round-trip test
+// random position tree with variant branches (carrying a random chronological
+// creation order) and engine scores, plus synthetic times covering a random
+// prefix of the main line — used by the v6 round-trip test
 function randomTreeGame() {
     const position = new Game().getStartPosition();
 
@@ -85,6 +86,24 @@ function randomTreeGame() {
     };
     const root = randomNode(clonePosition(position), 0);
 
+    // variants get a random creation-order permutation of 1..n
+    const variants = [];
+    const collect = (node) => {
+        node.children.forEach((child, index) => {
+            if (index > 0) {
+                variants.push(child);
+            }
+            collect(child);
+        });
+    };
+    collect(root);
+    const order = variants.map((_, i) => i + 1);
+    for (let i = order.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [order[i], order[j]] = [order[j], order[i]];
+    }
+    variants.forEach((variant, index) => { variant.variantNum = order[index]; });
+
     let mainLength = 0;
     for (let node = root; node.children.length > 0; node = node.children[0]) {
         mainLength++;
@@ -102,10 +121,12 @@ function randomTreeGame() {
     return { position, root, times };
 }
 
-// deep tree comparison by replay: both moves must select the same group, scores and
-// child counts must match exactly; returns true when the trees are equivalent
+// deep tree comparison by replay: both moves must select the same group; scores,
+// child counts and variant creation numbers must match exactly; returns true when
+// the trees are equivalent
 function sameTree(pos1, node1, pos2, node2) {
-    if (node1.score !== node2.score || node1.children.length !== node2.children.length) {
+    if (node1.score !== node2.score || node1.children.length !== node2.children.length ||
+        (node1.variantNum ?? null) !== (node2.variantNum ?? null)) {
         return false;
     }
 
@@ -209,10 +230,10 @@ export function createTests() {
                 return true;
             },
         }, {
-            name: "v5 tree serialization",
+            name: "v6 tree serialization",
             count: 500,
             groupSize: 5,
-            prologText: "500 v5 position-tree round-trip checks running...\n",
+            prologText: "500 v6 position-tree round-trip checks running...\n",
             epilogText: "Test finished OK.\n",
             blocking: true,
             exec() {
@@ -248,7 +269,7 @@ export function createTests() {
                 }
 
                 if (!ok) {
-                    logFailure("Test failed: v5 tree round-trip", [
+                    logFailure("Test failed: v6 tree round-trip", [
                         ["position", position],
                         ["tree", root],
                         ["times", times],

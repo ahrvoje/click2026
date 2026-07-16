@@ -4,9 +4,14 @@
  * One node per move: the move number in dark gray, the color played as a small
  * square, the A-L column/row label of the canonical block (the group's
  * lowest-leftmost field) and the best engine score recorded for the position.
- * Nodes flow horizontally and wrap like chess notation: a variant starts a new
- * row indented one step per depth, then the interrupted line resumes on a fresh
- * row at its own indent. Clicking a node reloads its position on the board.
+ * Nodes flow horizontally and wrap like chess notation: variants break in right
+ * after the position they branch from, each on a new row indented one step per
+ * depth and carrying its chronological creation number in front of the
+ * indentation, then the interrupted
+ * line resumes on a fresh row at its own indent — so every move sits on a row
+ * of the line it belongs to. A node whose position has no legal move left
+ * carries a dark game-over bar on its right. Clicking a node reloads its
+ * position on the board.
  *
  * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
@@ -43,35 +48,36 @@ let lastPressedNode = null;
 let lastPressedAt = -Infinity;
 
 // Chess-notation flow layout. A line (a chain of first children) lays out
-// horizontally and wraps into rows at its indent. Right after the move that
-// has alternatives, each variant chain breaks in on its own row, indented one
-// step deeper, and the interrupted line then resumes on a fresh row at its own
-// indent. Exported for tests.
+// horizontally and wraps into rows at its indent. When a move has alternatives,
+// the variant chains break in right after the previous move, each on its own
+// row indented one step deeper, and the line then resumes on a fresh row at
+// its own indent, starting with that move — no move stays behind on the row
+// of another line. A variant chain's chronological creation number (the game's
+// variantNum) is exposed on the chain's first node (0 = main line). Exported
+// for tests.
 export function layoutTree(root, contentWidth = CONTENT_W) {
-    const placed = new Map(); // node -> { row, x }
+    const placed = new Map(); // node -> { row, x, variant }
     let row = 0;
 
     const placeChain = (start, indent) => {
         let x = PAD + indent;
         for (let node = start; node !== undefined; node = node.children[0]) {
-            if (x + NODE_W > contentWidth - PAD && x > PAD + indent) {
-                row += 1;
-                x = PAD + indent;
-            }
-            placed.set(node, { row, x });
-            x += PITCH;
-
-            // alternatives to the move just placed break in before the line goes on
+            // alternatives break in right after the previous move; the line then
+            // resumes on its own fresh row, beginning with the move they rival
             if (node !== start && node.parent.children.length > 1) {
                 for (const variant of node.parent.children.slice(1)) {
                     row += 1;
                     placeChain(variant, indent + INDENT);
                 }
-                if (node.children.length > 0) {
-                    row += 1;
-                    x = PAD + indent;
-                }
+                row += 1;
+                x = PAD + indent;
             }
+            if (x + NODE_W > contentWidth - PAD && x > PAD + indent) {
+                row += 1;
+                x = PAD + indent;
+            }
+            placed.set(node, { row, x, variant: node === start ? start.variantNum ?? 0 : 0 });
+            x += PITCH;
         }
     };
 
@@ -144,7 +150,7 @@ export const TreeUI = {
         });
 
         let focusPlace = null;
-        for (const [node, { row, x }] of placed) {
+        for (const [node, { row, x, variant }] of placed) {
             const g = svgEl("g", {
                 class: "treeNode" + (node === focus ? " focus" : "") +
                     (replayNodes.has(node) ? " replay" : ""),
@@ -152,6 +158,14 @@ export const TreeUI = {
             });
 
             g.append(svgEl("rect", { class: "treeBox", width: NODE_W, height: NODE_H, rx: 3 }));
+
+            // the variant number sits in front of the indentation of the
+            // chain's first node — variant 3's move 41 reads as 3m41
+            if (variant > 0) {
+                const num = svgEl("text", { class: "treeVariantNum", x: -3, y: 13, "text-anchor": "end" });
+                num.textContent = String(variant);
+                g.append(num);
+            }
 
             if (node.move === null) {
                 // the root is the start position — no move to label
@@ -175,6 +189,13 @@ export const TreeUI = {
                 const score = svgEl("text", { class: "treeScore", x: NODE_W - 4, y: 13, "text-anchor": "end" });
                 score.textContent = String(node.score);
                 g.append(score);
+            }
+
+            // no legal move is left at this node — the game ends here
+            if (node.over) {
+                g.append(svgEl("line", {
+                    class: "treeOverMark", x1: NODE_W + 3, y1: 1, x2: NODE_W + 3, y2: NODE_H - 1,
+                }));
             }
 
             // mousedown, like the board — a rebuild between press and release
