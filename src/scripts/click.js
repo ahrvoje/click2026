@@ -196,7 +196,6 @@ function updateMove() {
     slider.max = String(total);
     slider.value = String(Math.min(current, total));
     slider.disabled = total === 0;
-    el("movesSliderOutput").textContent = `${current} / ${total}`;
 }
 
 function refreshInterface() {
@@ -349,7 +348,9 @@ function autoPlayMove() {
     }
 }
 
-// selecting a tree node reloads its position — playing from there amends the tree
+// Selecting a tree node reloads its position and makes its line the route used
+// by replay navigation — playing from there amends the tree. The route choice
+// does not alter the original main line or its official times.
 function selectTreeNode(node) {
     endTimedPlay();
 
@@ -360,17 +361,9 @@ function selectTreeNode(node) {
     ensureNavigable(); // materializes a replayed recording; no-op on a fresh game
 
     game.focusNode(node);
+    game.selectReplayNode(node);
     refreshInterface();
     onShownPositionChanged();
-}
-
-// A second press on a tree node promotes its route to the one used by replay
-// navigation. This does not alter the original main line or its official times.
-function selectReplayTreeNode(node) {
-    if (game.selectReplayNode(node)) {
-        refreshInterface();
-        TreeUI.update(game);
-    }
 }
 
 //
@@ -578,7 +571,6 @@ export function init() {
         container: el("treeScroll"),
         playColors: colors.playColors,
         onSelect: selectTreeNode,
-        onReplay: selectReplayTreeNode,
     });
 
     canvas.addEventListener("mousedown", onCanvasClick);

@@ -276,6 +276,9 @@ body {
     position: absolute;
     inset: 0;
     overflow: auto;
+    /* the flow layout packs rows to the measured width — keep that width stable
+       whether or not the vertical scrollbar is shown */
+    scrollbar-gutter: stable;
 }
 
 .treeNode {
@@ -390,10 +393,8 @@ body {
 #movesSliderRow {
     width: var(--board-size);
     min-height: 26px;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 46px;
+    display: flex;
     align-items: center;
-    gap: 8px;
     padding: 2px 5px 0;
 
     #movesSlider {
@@ -405,13 +406,6 @@ body {
     #movesSlider:disabled {
         cursor: default;
         opacity: 0.4;
-    }
-
-    #movesSliderOutput {
-        font-size: 11px;
-        text-align: right;
-        opacity: 0.6;
-        white-space: nowrap;
     }
 }
 

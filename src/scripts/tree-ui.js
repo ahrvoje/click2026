@@ -10,8 +10,8 @@
  * indentation, then the interrupted
  * line resumes on a fresh row at its own indent — so every move sits on a row
  * of the line it belongs to. A node whose position has no legal move left
- * carries a dark game-over bar on its right. Clicking a node reloads its
- * position on the board.
+ * carries a dark game-over bar on its right. A single click on a node reloads
+ * its position on the board and selects its line as the replay route.
  *
  * Copyright 2014-2026, Hrvoje Abraham ahrvoje@gmail.com
  * Released under the MIT license.
@@ -25,27 +25,25 @@ import { LETTERS } from "./board.js";
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 // node box geometry and the flow-layout metrics (px): nodes lay out at a fixed
-// horizontal pitch and wrap within the fixed content width; each variant depth
-// indents its rows by a third of a node width
+// horizontal pitch and wrap within the container's available width, so each
+// row packs as many moves as fit; each variant depth indents its rows by a
+// third of a node width
 const NODE_W = 68;
 const NODE_H = 18;
 const ROW_H = 20;
 const PITCH = NODE_W + 4;
 const INDENT = Math.round(NODE_W / 3);
 const PAD = 6;
-const CONTENT_W = 296; // fits the fixed 318px panel beside a vertical scrollbar
-const DOUBLE_PRESS_MS = 500;
+const CONTENT_W = 296; // fallback while the container is hidden (zero width)
 
 let container = null;   // scrollable element the SVG is rendered into
 let playColors = null;
 let onSelect = null;
-let onReplay = null;
 
 let lastGame = null;    // rebuild bookkeeping — see update()
 let lastSig = null;
+let lastWidth = null;
 let lastFocus = null;
-let lastPressedNode = null;
-let lastPressedAt = -Infinity;
 
 // Chess-notation flow layout. A line (a chain of first children) lays out
 // horizontally and wraps into rows at its indent. When a move has alternatives,
@@ -106,7 +104,14 @@ export const TreeUI = {
         container = hooks.container;
         playColors = hooks.playColors;
         onSelect = hooks.onSelect;
-        onReplay = hooks.onReplay;
+
+        // reflow when the panel's width actually changes — a phone rotation or
+        // the mobile tree-view toggle revealing the panel
+        new ResizeObserver(() => {
+            if (lastGame !== null && container.clientWidth > 0 && container.clientWidth !== lastWidth) {
+                TreeUI.update(lastGame);
+            }
+        }).observe(container);
     },
 
     update(game) {
@@ -129,13 +134,18 @@ export const TreeUI = {
         };
         walk(game.getRoot());
 
-        if (game === lastGame && sig === lastSig) {
+        // rows pack as many moves as the current panel width fits; the width is
+        // stable against the vertical scrollbar via scrollbar-gutter in the CSS
+        const contentWidth = container.clientWidth || CONTENT_W;
+
+        if (game === lastGame && sig === lastSig && contentWidth === lastWidth) {
             return;
         }
         lastGame = game;
         lastSig = sig;
+        lastWidth = contentWidth;
 
-        const placed = layoutTree(game.getRoot());
+        const placed = layoutTree(game.getRoot(), contentWidth);
 
         let maxRow = 0;
         let maxX = 0;
@@ -145,7 +155,7 @@ export const TreeUI = {
         }
 
         const svg = svgEl("svg", {
-            width: Math.max(CONTENT_W, maxX + NODE_W + PAD),
+            width: Math.max(contentWidth, maxX + NODE_W + PAD),
             height: 2 * PAD + maxRow * ROW_H + NODE_H,
         });
 
@@ -200,23 +210,7 @@ export const TreeUI = {
 
             // mousedown, like the board — a rebuild between press and release
             // would swallow a full click
-            g.addEventListener("mousedown", (event) => {
-                const now = performance.now();
-                let isDoublePress = false;
-                if (event.button === 0) {
-                    isDoublePress = lastPressedNode === node && now - lastPressedAt <= DOUBLE_PRESS_MS;
-                    lastPressedNode = isDoublePress ? null : node;
-                    lastPressedAt = isDoublePress ? -Infinity : now;
-                } else {
-                    lastPressedNode = null;
-                    lastPressedAt = -Infinity;
-                }
-
-                onSelect(node);
-                if (isDoublePress) {
-                    onReplay?.(node);
-                }
-            });
+            g.addEventListener("mousedown", () => onSelect(node));
             svg.append(g);
 
             if (node === focus) {

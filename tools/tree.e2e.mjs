@@ -78,15 +78,12 @@ try {
         return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     }, transform);
 
-    // Use real pointer input. The first press may rebuild the SVG, while the
-    // second press must still reach the replacement node and select its route.
-    const pressTreeNode = async (transform, count = 1) => {
+    // Use real pointer input — the press may rebuild the SVG mid-gesture and
+    // must still land on the node.
+    const pressTreeNode = async (transform) => {
         const point = await treeNodeCenter(transform);
         if (point === null) return false;
-        for (let k = 0; k < count; k++) {
-            await page.mouse.click(point.x, point.y);
-            if (k + 1 < count) await sleep(40);
-        }
+        await page.mouse.click(point.x, point.y);
         await sleep(50);
         return true;
     };
@@ -270,23 +267,23 @@ try {
         "wheel over the moves view plays one move forward along the route",
         { move: await moveValue(), focus: (await focusedTreeNode())?.transform });
 
-    // A genuine two-press mouse gesture must survive the focus rebuild triggered
-    // by its first press, switch the route, and leave structural layout untouched.
-    const doublePressed = await pressTreeNode(mainLeafBranchTransform, 2);
+    // A single press must survive the focus rebuild it triggers, switch the
+    // route to the clicked line, and leave structural layout untouched.
+    const mainPressed = await pressTreeNode(mainLeafBranchTransform);
     const mainReplayTree = await treeState();
-    check(doublePressed && mainReplayTree.find((node) => node.transform === mainLeafBranchTransform)?.replay &&
+    check(mainPressed && mainReplayTree.find((node) => node.transform === mainLeafBranchTransform)?.replay &&
         !mainReplayTree.find((node) => node.transform === variantLeafTransform)?.replay,
-        "double mouse click switches replay to the chosen main-line node");
+        "single mouse click switches replay to the chosen main-line node");
     check(JSON.stringify(mainReplayTree.map((node) => node.transform).sort()) === JSON.stringify(branchTransforms),
         "switching replay route does not reorder or move tree nodes");
 
-    // A single click still means focus only; it must not promote the clicked path.
-    const singlePressed = await pressTreeNode(variantLeafTransform);
-    const afterSingleClick = await treeState();
-    check(singlePressed && (await focusedTreeNode())?.transform === variantLeafTransform &&
-        !afterSingleClick.find((node) => node.transform === variantLeafTransform)?.replay &&
-        afterSingleClick.find((node) => node.transform === mainLeafBranchTransform)?.replay,
-        "single tree-node click changes focus without changing replay route");
+    // clicking the variant leaf focuses it and promotes its path in one click
+    const variantPressed = await pressTreeNode(variantLeafTransform);
+    const afterVariantClick = await treeState();
+    check(variantPressed && (await focusedTreeNode())?.transform === variantLeafTransform &&
+        afterVariantClick.find((node) => node.transform === variantLeafTransform)?.replay &&
+        !afterVariantClick.find((node) => node.transform === mainLeafBranchTransform)?.replay,
+        "single tree-node click changes focus and replay route together");
     check(await moveValue() === "3 / 3" && await timeValue() === "–",
         "variant node click reloads its position, time is a dash",
         { move: await moveValue(), time: await timeValue() });
@@ -294,10 +291,11 @@ try {
     await page.click("#replayButton");
     await page.click("#forwardButton");
     await sleep(50);
-    check((await focusedTreeNode())?.transform === mainLeafBranchTransform,
-        "single click did not change the route used by replay and forward",
-        { focus: (await focusedTreeNode())?.transform, expected: mainLeafBranchTransform });
+    check((await focusedTreeNode())?.transform === variantLeafTransform,
+        "replay and forward follow the route chosen by the click",
+        { focus: (await focusedTreeNode())?.transform, expected: variantLeafTransform });
 
+    await pressTreeNode(mainLeafBranchTransform); // back to the timed main line
     await page.click("#replayButton");
     await wheel(100);
     await sleep(50);

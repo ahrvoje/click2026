@@ -184,9 +184,8 @@ try {
     check(clicked, "a move can be played while the engine runs");
     const sliderAfterMove = await page.$eval("#movesSlider", (slider) => ({
         value: Number(slider.value), max: Number(slider.max),
-        output: document.getElementById("movesSliderOutput").textContent,
     }));
-    check(sliderAfterMove.value === 1 && sliderAfterMove.max >= 1 && /^1 \/ /.test(sliderAfterMove.output),
+    check(sliderAfterMove.value === 1 && sliderAfterMove.max >= 1,
         "moves slider follows played moves", sliderAfterMove);
     await page.$eval("#movesSlider", (slider) => {
         slider.value = "0";
@@ -371,8 +370,10 @@ try {
         remaining: document.getElementById("scoreValue").textContent,
         focus: document.querySelector("#treeScroll .treeNode.focus .treeLabel")?.textContent,
     }));
+    // the click also routes replay through the JH leaf — the total is 6, not
+    // the main line's 15
     check(selectedJHVariant.count === 2 && selectedJHVariant.selected &&
-        recursiveSelection.move === "6 / 15" && recursiveSelection.remaining === "103" &&
+        recursiveSelection.move === "6 / 6" && recursiveSelection.remaining === "103" &&
         recursiveSelection.focus === "JH",
     "recursive consistency regression selects move 6 JH variant");
     if (!await page.$eval("#engineButton", (b) => b.classList.contains("active"))) {

@@ -59,13 +59,13 @@ v6 link), so any move is identified at a glance (m10 is move 10 of the main line
 move 41 of variant 3). Each node shows the move number,
 the color played, the A–L column/row of the clicked block (a group is represented by its
 lowest-leftmost block) and the best engine score seen for that position. A dark bar right
-of a node marks a finished game — no legal move is left there. Clicking a node reloads its position; playing a move that is already in the tree
-just moves the focus, anything new amends the tree. The red-tinted nodes mark the selected
-replay route. It starts on the main line; double-click any node to route replay through it,
-or play a new branch to select that branch automatically. The mouse wheel — over the board or
-over the moves panel — and the rewind controls step along this route; the panel scrolls itself
-to keep the shown move visible. The panel keeps a fixed width — deep trees wrap and scroll
-vertically.
+of a node marks a finished game — no legal move is left there. A single click on a node reloads its position and routes replay
+through it; playing a move that is already in the tree just moves the focus, anything new
+amends the tree. The red-tinted nodes mark the selected replay route. It starts on the main
+line, and playing a new branch selects that branch automatically. The mouse wheel — over the
+board or over the moves panel — and the rewind controls step along this route; the panel
+scrolls itself to keep the shown move visible. Rows pack as many moves as the panel width
+fits — deep trees wrap and scroll vertically.
 
 The bottom-left **settings** button controls the move navigator and engine list.
 The moves slider sits below the board, defaults to visible on mobile devices,
