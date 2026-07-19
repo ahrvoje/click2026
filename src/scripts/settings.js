@@ -26,16 +26,20 @@ const DEFAULT_POSITIONS_M = 1000;
 // Engine resource utilization per processor: the share of the CPU-search
 // lanes and of the GPU device the analysis may keep busy. 0 turns that
 // processor's sustained search off entirely (with CPU at 0 the instant
-// baselines and replay validation still run). The defaults pair the
+// baselines and replay validation still run). The desktop defaults pair the
 // power-efficient GPU playout pump with the 1% CPU whisper mode — a single
 // lane trickling toward exact proofs — so long continuous play stays quiet
-// while proofs still land. When the GPU side is off or unavailable and the
-// CPU share is 0, the CPU fallback snaps to a modest nonzero share instead
+// while proofs still land. Mobile processors are far weaker, so those
+// defaults would barely move the analysis — mobile starts at higher shares
+// instead. When the GPU side is off or unavailable and the CPU share is 0,
+// the CPU fallback snaps to a modest nonzero share instead
 // (see normalizeSettings).
 const MIN_RESOURCE_PERCENT = 1;
 const MAX_RESOURCE_PERCENT = 100;
 const DEFAULT_CPU_RESOURCE_PERCENT = 1;
 const DEFAULT_GPU_RESOURCE_PERCENT = 15;
+const MOBILE_CPU_RESOURCE_PERCENT = 25;
+const MOBILE_GPU_RESOURCE_PERCENT = 40;
 const FALLBACK_CPU_RESOURCE_PERCENT = 20;
 
 function limitNumber(value, fallback, max) {
@@ -59,13 +63,14 @@ export function isMobilePlatform(nav = globalThis.navigator ?? {}) {
 }
 
 export function normalizeSettings(value, nav = globalThis.navigator ?? {}) {
+    const mobile = isMobilePlatform(nav);
     const engineUseGpu = value?.engineUseGpu !== false;
     // at least one processor stays enabled; CPU is the universal fallback
     let engineUseCpu = value?.engineUseCpu !== false || !engineUseGpu;
-    const engineGpuResourcePercent = limitPercent(
-        value?.engineGpuResourcePercent, DEFAULT_GPU_RESOURCE_PERCENT);
-    let engineCpuResourcePercent = limitPercent(
-        value?.engineCpuResourcePercent, DEFAULT_CPU_RESOURCE_PERCENT);
+    const engineGpuResourcePercent = limitPercent(value?.engineGpuResourcePercent,
+        mobile ? MOBILE_GPU_RESOURCE_PERCENT : DEFAULT_GPU_RESOURCE_PERCENT);
+    let engineCpuResourcePercent = limitPercent(value?.engineCpuResourcePercent,
+        mobile ? MOBILE_CPU_RESOURCE_PERCENT : DEFAULT_CPU_RESOURCE_PERCENT);
     // A zero CPU share is only meaningful while the GPU is enabled with a
     // nonzero share; otherwise nothing would search, so the universal CPU
     // fallback snaps on at a modest utilization.
@@ -78,7 +83,7 @@ export function normalizeSettings(value, nav = globalThis.navigator ?? {}) {
     }
     return {
         showMovesSlider: typeof value?.showMovesSlider === "boolean"
-            ? value.showMovesSlider : isMobilePlatform(nav),
+            ? value.showMovesSlider : mobile,
         suggestedMovesMode: VALID_MODES.has(value?.suggestedMovesMode)
             ? value.suggestedMovesMode : SUGGESTED_MOVES_MODES.TOP_5,
         engineUseCpu,

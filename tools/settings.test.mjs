@@ -27,10 +27,13 @@ const engineDefaults = {
     engineMaxPositionsEnabled: false,
     engineMaxPositionsM: 1000,
 };
+// mobile processors are weaker, so the default utilization shares are higher
 assert.deepEqual(normalizeSettings(null, { userAgent: "iPhone" }), {
     showMovesSlider: true,
     suggestedMovesMode: SUGGESTED_MOVES_MODES.TOP_5,
     ...engineDefaults,
+    engineCpuResourcePercent: 25,
+    engineGpuResourcePercent: 40,
 });
 assert.deepEqual(normalizeSettings(null, { userAgent: "Windows" }), {
     showMovesSlider: false,

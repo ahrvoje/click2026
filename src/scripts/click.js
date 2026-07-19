@@ -348,9 +348,11 @@ function autoPlayMove() {
     }
 }
 
-// Selecting a tree node reloads its position and makes its line the route used
-// by replay navigation — playing from there amends the tree. The route choice
-// does not alter the original main line or its official times.
+// Selecting a tree node reloads its position; playing from there amends the
+// tree. The node's line becomes the route used by replay navigation only when
+// the node is off the already selected route — clicking a parent along the
+// active line just moves the focus, keeping the chosen variant. The route
+// choice does not alter the original main line or its official times.
 function selectTreeNode(node) {
     endTimedPlay();
 
@@ -361,7 +363,9 @@ function selectTreeNode(node) {
     ensureNavigable(); // materializes a replayed recording; no-op on a fresh game
 
     game.focusNode(node);
-    game.selectReplayNode(node);
+    if (!game.isFocusOnReplayLine()) {
+        game.selectReplayNode(node);
+    }
     refreshInterface();
     onShownPositionChanged();
 }

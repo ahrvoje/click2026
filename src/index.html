@@ -26,8 +26,8 @@
     <meta property="og:description" content="Color clicking puzzle.">
 
     <link rel="icon" type="image/png" href="images/click2014_favicon.png">
-    <link rel="stylesheet" href="css/click2026.css?build=20260719-engine11">
-    <script type="module" src="scripts/main.js?build=20260719-engine11"></script>
+    <link rel="stylesheet" href="css/click2026.css?build=20260719-ui1">
+    <script type="module" src="scripts/main.js?build=20260719-ui1"></script>
 </head>
 <body>
 <div id="mainDiv">
@@ -36,14 +36,14 @@
             <div class="dialogTitle" id="settingsTitle">Settings</div>
             <div class="settingsBody">
                 <fieldset class="settingsGroup">
-                    <legend>Moves slider</legend>
+                    <legend>UI</legend>
                     <label class="settingsOption">
                         <input type="checkbox" id="showMovesSlider">
-                        Show
+                        Show moves slider
                     </label>
                 </fieldset>
                 <fieldset class="settingsGroup">
-                    <legend>Suggested moves</legend>
+                    <legend>Analysis</legend>
                     <label class="settingsOption">
                         <input type="radio" name="suggestedMovesMode" value="top5">
                         Top 5
@@ -135,18 +135,17 @@
                     <canvas id="gameCanvas" width="310" height="310" aria-label="Game board"></canvas>
                 </div>
                 <div id="control">
-                    <div id="movesSliderRow" hidden>
-                        <input id="movesSlider" type="range" min="0" max="0" value="0" step="1"
-                            aria-label="Shown move">
-                    </div>
-                    <div id="startButtonDiv"><button id="startButton" type="button">NEW GAME</button></div>
-
                     <div class="rowDiv"><div id="rowInnerDiv" class="rowInnerDiv">
                         <div class="leftDiv">Time:</div><div id="timeValue" class="rightDiv timeValue"></div>
                         <div class="leftDiv">Score:</div><div id="scoreValue" class="rightDiv scoreValue"></div>
                         <div class="filler"></div>
                         <div class="leftDiv">Move:</div><div id="moveValue" class="rightDiv moveValue"></div>
                     </div></div>
+                    <div id="movesSliderRow" hidden>
+                        <input id="movesSlider" type="range" min="0" max="0" value="0" step="1"
+                            aria-label="Shown move">
+                    </div>
+                    <div id="startButtonDiv"><button id="startButton" type="button">NEW GAME</button></div>
                     <div id="buttonsContainer">
                         <div class="buttonFillerOut"></div>
                         <button id="backwardButton" class="smallButton" type="button" title="Rewind to start">
