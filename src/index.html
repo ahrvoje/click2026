@@ -26,8 +26,8 @@
     <meta property="og:description" content="Color clicking puzzle.">
 
     <link rel="icon" type="image/png" href="images/click2014_favicon.png">
-    <link rel="stylesheet" href="css/click2026.css?build=20260715-engine3">
-    <script type="module" src="scripts/main.js?build=20260715-engine3"></script>
+    <link rel="stylesheet" href="css/click2026.css?build=20260719-engine11">
+    <script type="module" src="scripts/main.js?build=20260719-engine11"></script>
 </head>
 <body>
 <div id="mainDiv">
@@ -61,11 +61,21 @@
                     <legend>Engine</legend>
                     <label class="settingsOption">
                         <input type="checkbox" id="engineUseCpu">
-                        Use CPU
+                        CPU
+                        <span class="settingsLimitValue">
+                            <input type="range" id="engineCpuResourcePercent" min="0" max="100" step="1"
+                                aria-label="CPU utilization" aria-describedby="engineCpuResourcePercentValue">
+                            <output id="engineCpuResourcePercentValue" for="engineCpuResourcePercent">1%</output>
+                        </span>
                     </label>
                     <label class="settingsOption">
                         <input type="checkbox" id="engineUseGpu">
-                        Use GPU
+                        GPU
+                        <span class="settingsLimitValue">
+                            <input type="range" id="engineGpuResourcePercent" min="0" max="100" step="1"
+                                aria-label="GPU utilization" aria-describedby="engineGpuResourcePercentValue">
+                            <output id="engineGpuResourcePercentValue" for="engineGpuResourcePercent">15%</output>
+                        </span>
                     </label>
                     <label class="settingsOption">
                         <input type="checkbox" id="engineStopOnZero">

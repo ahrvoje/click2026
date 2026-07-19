@@ -789,8 +789,10 @@ witness candidates; it is never trusted as an exact value or proof.
 ## 8. Worker protocol
 
 ```
-UI → pool       {type:"analyze", id, board, limits}  // Uint8Array(144), col-major, cell = col*12+row
-pool → lane     {type:"analyze", id, board, lane, lanes, gpu}
+UI → pool       {type:"analyze", id, board, limits, resourcePercent}  // Uint8Array(144), col-major, cell = col*12+row
+UI → pool       {type:"throttle", percent, gpuPercent}  // live resource-utilization change; keeps analysis progress
+pool → lane     {type:"analyze", id, board, lane, lanes, gpu, resourcePercent, gpuResourcePercent}
+pool → lane     {type:"throttle", percent, gpuPercent}  // CPU residual + raw GPU share, to every lane
 pool → lane     {type:"merge", id, seeds}        // merged lines/proofs; replay-validated in WASM
 pool → lane     {type:"threshold-plan", id, epoch, target, roots}
 pool → lane     {type:"threshold-frontier", id, epoch, target, round, tasks}
@@ -813,6 +815,63 @@ limit latches that snapshot as terminal with `settled:true`,
 `state:"stopped"` (or `"proven"` when the table happened to be all-exact) and
 `stats.stopReason` = `"zero" | "time" | "positions"`, then broadcasts `stop`
 so every lane abandons the job exactly like a position change.
+
+`resourcePercent` / `gpuResourcePercent` carry the engine's per-processor
+**utilization** settings (a 1%-step slider beside each processor checkbox):
+**CPU** (default 1) is the share of the machine the CPU-search lanes may keep
+busy, **GPU** (default 15) the share of the GPU device. 0 turns that
+processor's sustained search off (instant baselines and replay validation
+always run). The default CPU 1% is the whisper mode: one lane paced to
+fullLanes-worth of 1% (e.g. 16% of a single lane on a 16-lane machine, a few
+hundred k n/s) that still walks the full schedule, so the GPU pump carries
+the sustained sampling while exact proofs keep landing at minimal speed. Pace sleeps
+race the job-change wake, so even the multi-second idles whisper mode owes
+(caps `PACE_MAX_IDLE_MS`/`GPU_PACE_MAX_IDLE_MS`) never delay a new position,
+stop, or live throttle change. A processor searches only when its checkbox is
+on AND its share is nonzero; when the GPU side is off or zero and the CPU
+share is 0, `normalizeSettings` snaps the CPU share to 20 so at least one
+processor always searches, and a worker whose GPU-only settings meet a
+missing/failed device falls back to the CPU schedule paced at the GPU share.
+Rather than benchmarking and scaling the position batch — which would need
+recalibration per device — a reduction is applied in three layers, each
+against measured speed:
+
+* **Lane count first** — the pool converts the percent into lane-equivalents
+  (`fullLanes × percent`) and runs `round()` of that many lanes flat out, so
+  16 lanes at 20% become 3. Fewer lanes at full speed beat every lane at a
+  small duty cycle: parked cores actually sleep (cooler and quieter than a
+  package kept half-awake by pacing timers), each surviving lane keeps a hot
+  persistent value memo, and the main thread merges proportionally fewer
+  snapshots. A percent change that moves the scaled lane count restarts the
+  pool (like a processor toggle); a same-count change is forwarded live.
+* **CPU residual** — the fractional remainder is paced inside each lane:
+  `worker.js pace()` sits on the yield after each work slice (beam, exact,
+  threshold and playout all route through it) and keeps a *pacing debt*: each
+  call accounts the sync span since the lane's last yield or resume into a
+  shared `workMark` (so the beam loop and GPU settle handlers on lane zero
+  never double-count a span or reset each other's clock), owes `factor ×` that
+  span, and sleeps the accumulated debt once it reaches timer size. Unslept
+  debt carries over, so many sub-millisecond spans still add up to the target
+  duty. A single idle is capped (`PACE_MAX_IDLE_MS`) so a position change
+  stays preemptible.
+* **GPU** — the device executes batches concurrently with the worker thread,
+  so CPU-side pacing cannot bound it. While throttled, the playout pump
+  narrows from two pipelined batches to one, and each next submission is gated
+  by the completed batch's **device-active time** (`dispatchWallMs` deltas):
+  `idle = active × factor`, capped by `GPU_PACE_MAX_IDLE_MS`. The JS round
+  trip is deliberately not the base — queue wait and replay-verification
+  turnaround dominate small mid-game batches and would starve the device at a
+  few percent duty (the observed cpu-high/gpu-idle imbalance); wall time is
+  only the fallback for devices without activity counters. `drainGpu` idles
+  against the same gate so caretaker loops do not hot-spin.
+
+The pool translates the CPU percent into the per-lane residual on both the
+`analyze` and `throttle` messages (`{percent, gpuPercent}`) and forwards the
+GPU percent raw; without CPU search the single pump lane is never paced.
+Absent `resourcePercent` (older UI, tools, tests) runs flat out. Tests/perf
+runs override the shipped defaults with `?engineResource=NN` (both sides),
+`?engineCpuResource=NN` / `?engineGpuResource=NN` (one side), or
+`window.__engineResourcePercent` (both sides — the e2e pin).
 
 Two worker URL parameters mirror the settings-dialog processor checkboxes in
 addition to `lane`/`lanes`: `gpu=0` (settings **Use GPU** off) never requests

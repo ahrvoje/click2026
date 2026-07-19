@@ -387,8 +387,25 @@ export class EngineWorkerPool {
         const requestedLanes = options.laneCount ?? selectLaneCount(
             options.capabilities ?? detectParallelCapabilities(options.navigator),
             { maxLanes: this._maxLanes });
-        this.laneCount = this._cpuSearch ? Math.max(1, Math.min(this._maxLanes,
+        this._fullLanes = this._cpuSearch ? Math.max(1, Math.min(this._maxLanes,
             Math.floor(finiteNumber(requestedLanes, 1)))) : 1;
+        // Resource scaling: at reduced utilization it is better to run fewer
+        // lanes flat out than every lane at a small duty cycle — parked cores
+        // actually sleep (cooler and quieter than a whole package kept half
+        // awake by per-lane pacing timers), each surviving lane keeps a hot
+        // persistent value memo, and the main thread merges proportionally
+        // fewer snapshots. Only the fractional remainder is paced inside the
+        // lanes: 16 lanes at 20% become round(3.2) = 3 lanes at flat out.
+        const scaled = this._scaledLanes(options.resourcePercent);
+        this._resourcePercent = scaled.percent;
+        // Without CPU search the single pump lane's JS is just bookkeeping —
+        // never pace it; the GPU device is paced by its own share below.
+        this._laneUtilPercent = this._cpuSearch ? scaled.util : 100;
+        this.laneCount = scaled.lanes;
+        // The GPU device gains nothing from dropped CPU lanes, so it paces
+        // against its own raw share, independent of the lane residual.
+        this._gpuResourcePercent = Math.min(100, Math.max(1, Math.round(
+            finiteNumber(options.gpuResourcePercent, scaled.percent))));
         this._workers = [];
         this._ready = new Map();
         this._latest = new Map();
@@ -411,6 +428,31 @@ export class EngineWorkerPool {
         this._generation = 0;
         this._terminated = false;
         this._spawn();
+    }
+
+    // Resource percent -> lane count plus per-lane residual utilization. The
+    // target is fullLanes × percent lane-equivalents; rounding to whole lanes
+    // keeps the total within half a lane of the target and the residual pace
+    // (worker.js pace()/GPU gate) absorbs the remainder. Always at least one.
+    _scaledLanes(percent) {
+        const clamped = Math.min(100, Math.max(1,
+            Math.round(finiteNumber(percent, 100))));
+        const target = this._fullLanes * clamped / 100;
+        const lanes = Math.max(1, Math.round(target));
+        return {
+            percent: clamped,
+            lanes,
+            util: Math.min(100, Math.max(1, Math.round(target / lanes * 100))),
+        };
+    }
+
+    // True when a settings change moves the scaled lane count itself — the
+    // caller restarts the pool (like a processor toggle); a same-count change
+    // is applied live through a translated throttle message instead. A pool
+    // without CPU search is always exactly one pump lane.
+    resourceRestartNeeded(percent) {
+        if (!this._cpuSearch) return false;
+        return this._scaledLanes(percent).lanes !== this.laneCount;
     }
 
     _spawn() {
@@ -853,6 +895,13 @@ export class EngineWorkerPool {
                 lane,
                 lanes: this.laneCount,
                 gpu: lane === 0 && this._gpuAllowed,
+                // lanes absorb most of the CPU reduction, so each runs the
+                // residual; the GPU device is unaffected by lane count and
+                // paces against its own raw share
+                ...(message.resourcePercent == null ? {} : {
+                    resourcePercent: this._laneUtilPercent,
+                    gpuResourcePercent: this._gpuResourcePercent,
+                }),
             });
         }
     }
@@ -967,6 +1016,22 @@ export class EngineWorkerPool {
 
     postMessage(message) {
         if (this._terminated) return;
+        if (message?.type === "throttle") {
+            // Live resource change with an unchanged scaled lane count (the
+            // caller restarts the pool otherwise): retranslate the user's
+            // percent into the per-lane residual before forwarding.
+            const scaled = this._scaledLanes(message.percent);
+            this._resourcePercent = scaled.percent;
+            this._laneUtilPercent = this._cpuSearch ? scaled.util : 100;
+            this._gpuResourcePercent = Math.min(100, Math.max(1, Math.round(
+                finiteNumber(message.gpuPercent, scaled.percent))));
+            for (const worker of this._workers) {
+                worker.postMessage({ type: "throttle",
+                    percent: this._laneUtilPercent,
+                    gpuPercent: this._gpuResourcePercent });
+            }
+            return;
+        }
         if (message?.type === "analyze") {
             this._cancelResultFlush();
             this._latest.clear();

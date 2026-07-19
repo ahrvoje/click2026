@@ -44,6 +44,8 @@ const browser = await puppeteer.launch({
 try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1400, height: 900 });
+    // run the engine flat out; the shipped default paces it to a low duty cycle
+    await page.evaluateOnNewDocument(() => { window.__engineResourcePercent = 100; });
 
     const consoleErrors = [];
     page.on("console", (msg) => { if (msg.type() === "error") consoleErrors.push(msg.text()); });

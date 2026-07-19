@@ -9,9 +9,9 @@
  *       Sat Jul 11, 2026 - modernized to ES module, zero dependencies
  */
 
-import * as Click from "./click.js?build=20260715-engine3";
+import * as Click from "./click.js?build=20260719-engine11";
 import { createTests } from "./tests.js";
-import { Settings } from "./settings.js?build=20260715-engine3";
+import { Settings } from "./settings.js?build=20260719-engine11";
 
 // module scripts are deferred, so the DOM is complete at this point
 const el = (id) => document.getElementById(id);

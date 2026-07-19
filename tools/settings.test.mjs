@@ -19,6 +19,8 @@ assert.equal(isMobilePlatform({
 const engineDefaults = {
     engineUseCpu: true,
     engineUseGpu: true,
+    engineCpuResourcePercent: 1,
+    engineGpuResourcePercent: 15,
     engineStopOnZero: false,
     engineMaxTimeEnabled: false,
     engineMaxTimeS: 60,
@@ -46,18 +48,22 @@ assert.deepEqual(normalizeSettings({
 // engine settings: processors round-trip, but never both off — CPU is the
 // universal fallback when a stored/imported value disables everything
 const engineOf = (value) => {
-    const { engineUseCpu, engineUseGpu, engineStopOnZero, engineMaxTimeEnabled,
+    const { engineUseCpu, engineUseGpu, engineCpuResourcePercent,
+        engineGpuResourcePercent, engineStopOnZero, engineMaxTimeEnabled,
         engineMaxTimeS, engineMaxPositionsEnabled, engineMaxPositionsM } =
         normalizeSettings(value, { userAgent: "Windows" });
-    return { engineUseCpu, engineUseGpu, engineStopOnZero, engineMaxTimeEnabled,
+    return { engineUseCpu, engineUseGpu, engineCpuResourcePercent,
+        engineGpuResourcePercent, engineStopOnZero, engineMaxTimeEnabled,
         engineMaxTimeS, engineMaxPositionsEnabled, engineMaxPositionsM };
 };
 assert.deepEqual(engineOf({ engineUseCpu: false, engineUseGpu: true }),
     { ...engineDefaults, engineUseCpu: false });
+// GPU off keeps the 1%-default CPU searching — no snap needed; both-off still
+// forces the CPU checkbox back on (whisper share already nonzero)
 assert.deepEqual(engineOf({ engineUseCpu: true, engineUseGpu: false }),
     { ...engineDefaults, engineUseGpu: false });
 assert.deepEqual(engineOf({ engineUseCpu: false, engineUseGpu: false }),
-    { ...engineDefaults, engineUseGpu: false }); // both off forces CPU back on
+    { ...engineDefaults, engineUseGpu: false });
 
 // stop conditions: both limits may be enabled simultaneously, and the numeric
 // values are sanitized to bounded positive integers
@@ -79,6 +85,38 @@ assert.equal(engineOf({ engineMaxTimeS: 1e9 }).engineMaxTimeS, 86400);
 assert.equal(engineOf({ engineMaxPositionsM: 2.6 }).engineMaxPositionsM, 3);
 assert.equal(engineOf({ engineMaxPositionsM: 1e9 }).engineMaxPositionsM, 1000000);
 assert.equal(engineOf({ engineMaxPositionsM: "junk" }).engineMaxPositionsM, 1000);
+
+// per-processor resource shares: CPU defaults to the 1% whisper mode (exact
+// proofs at minimal speed), GPU to 15; 0 = off, nonzero values keep a 1..100
+// band, junk falls to the default
+assert.equal(engineOf({}).engineCpuResourcePercent, 1);
+assert.equal(engineOf({}).engineGpuResourcePercent, 15);
+assert.equal(engineOf({ engineCpuResourcePercent: 50 }).engineCpuResourcePercent, 50);
+assert.equal(engineOf({ engineGpuResourcePercent: "35" }).engineGpuResourcePercent, 35);
+assert.equal(engineOf({ engineCpuResourcePercent: 33.6 }).engineCpuResourcePercent, 34);
+assert.equal(engineOf({ engineCpuResourcePercent: 1 }).engineCpuResourcePercent, 1);
+assert.equal(engineOf({ engineCpuResourcePercent: 0.4 }).engineCpuResourcePercent, 0);
+assert.equal(engineOf({ engineCpuResourcePercent: -20 }).engineCpuResourcePercent, 0);
+assert.equal(engineOf({ engineGpuResourcePercent: 250 }).engineGpuResourcePercent, 100);
+assert.equal(engineOf({ engineGpuResourcePercent: Number.NaN }).engineGpuResourcePercent, 15);
+assert.equal(engineOf({ engineGpuResourcePercent: "junk" }).engineGpuResourcePercent, 15);
+
+// zeroing the GPU share leaves the whisper-default CPU searching; snapping to
+// the fallback happens only when the CPU share is explicitly 0 as well
+const gpuZeroed = engineOf({ engineGpuResourcePercent: 0 });
+assert.equal(gpuZeroed.engineGpuResourcePercent, 0);
+assert.equal(gpuZeroed.engineCpuResourcePercent, 1);
+assert.equal(gpuZeroed.engineUseCpu, true);
+const bothZeroed = engineOf({ engineCpuResourcePercent: 0, engineGpuResourcePercent: 0 });
+assert.equal(bothZeroed.engineCpuResourcePercent, 20);
+assert.equal(bothZeroed.engineUseCpu, true);
+assert.equal(engineOf({ engineUseCpu: false, engineGpuResourcePercent: 0 })
+    .engineUseCpu, true); // forced back on — nothing else would search
+// a nonzero CPU share is preserved by the fallback rule
+assert.equal(engineOf({ engineCpuResourcePercent: 40, engineGpuResourcePercent: 0 })
+    .engineCpuResourcePercent, 40);
+// GPU-only remains expressible: CPU 0 is honored while the GPU side is active
+assert.equal(engineOf({ engineCpuResourcePercent: 0 }).engineCpuResourcePercent, 0);
 
 const moves = [0, 0, 0, 0, 0, 2, 3].map((score, cell) => ({ cell, score }));
 assert.deepEqual(selectSuggestedMoves(moves, "top5").map((move) => move.cell), [0, 1, 2, 3, 4]);

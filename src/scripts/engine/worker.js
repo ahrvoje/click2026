@@ -54,14 +54,14 @@
 // These query revisions must match ENGINE_ASSET_VERSION in engine-ui.js.
 // Versioning the complete module graph prevents a cached pre-change helper
 // from making the worker fail during static module linking.
-import { createGpu, dominantColor } from "./gpu.js?build=20260715-engine3";
+import { createGpu, dominantColor } from "./gpu.js?build=20260719-engine11";
 import {
     analysisState, canTransferExactSuffix, caretakerProofCandidates, createSearchProgress,
     exactCandidateOrder, mirrorClickedPrefixTasks, positionProofCandidates, recordSearchPass,
     remainingAfterMove, roundRobinPrefixTasks, settlementReady, shouldGpuCaretake,
     summarizePositionProof,
-} from "./schedule.js?build=20260715-engine3";
-import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260715-engine3";
+} from "./schedule.js?build=20260719-engine11";
+import { laneOwnsRoot, laneSeed } from "./pool.js?build=20260719-engine11";
 
 const workerParams = new URL(self.location.href).searchParams;
 const LANES = Math.max(1, Number.parseInt(workerParams.get("lanes") ?? "1", 10) || 1);
@@ -119,11 +119,27 @@ const CACHE_MAX = 64;           // remembered positions for warm starts
 const POST_INTERVAL_MS = 150;
 const GPU_BEAM_ASSIST_PER_ROOT = 2;
 const GPU_BEAM_ASSIST_MAX_BOARDS = 4096;
+// Resource pacing keeps each engaged core (and the GPU pump) at a target duty
+// cycle, so a long continuous analysis stays cool and responsive on laptops and
+// phones instead of pegging every worker at 100%. Below PACE_MIN_SLEEP_MS a
+// bare macrotask hop is cheaper than a timer. The idle caps are generous so a
+// 1% whisper mode holds its true duty (a 60 ms exact slice owes ~6 s at 1%);
+// preemption does not suffer because every pace sleep races the job-change
+// wake, analyze/stop/throttle messages are handled while sleeping, and a new
+// analyze resets the GPU gate — staleness is re-checked at every resume and
+// submit.
+const PACE_MIN_SLEEP_MS = 6;
+const PACE_MAX_IDLE_MS = 6000;
+const GPU_PACE_MAX_IDLE_MS = 10000;
 
 let eng = null;
 let IO = 0;
 let gpu = null;
 let gpuState = "off";           // "off" | "on" | "failed"
+// Device-active wall milliseconds (union of dispatch intervals) — the honest
+// "GPU busy" measure the throttle gate paces against.
+const gpuActiveWallOf = (stats) => (((stats?.dispatchWallMs ?? stats?.gpuTimeMs) ?? 0) +
+    ((stats?.evaluationWallMs ?? stats?.evaluationGpuTimeMs) ?? 0));
 const pendingGpuBatches = new Set(); // logical batches in flight (pipelined)
 // Two logical batches stay queued so the JS turnaround of a completed batch
 // (verify, collect, repack) overlaps device execution of the next one instead
@@ -142,6 +158,27 @@ let prevAnalysis = null; // { key, moves } of the most recently analyzed positio
 let caretakerStopJob = null;
 let thresholdPlan = null; // pool-coordinated complete second-move coverage
 
+// Resource pacing. throttleFactor is the idle-to-busy ratio the pacer owes:
+// 0 runs flat out, 4 holds a 20% duty cycle. It is set from the analyze
+// message's resourcePercent and updated live by a {type:"throttle"} message
+// when the setting changes mid-analysis (see setResourcePercent / pace).
+// The pool absorbs most of a CPU reduction by dropping lanes, so this lane's
+// resourcePercent is the small residual — often 100. The GPU is a separate
+// device that no lane scaling can slow down, so it paces against the user's
+// raw percent (gpuResourcePercent -> gpuThrottleFactor) independently.
+// workMark is the start of the not-yet-accounted sync span — shared by every
+// pacing context in the lane (beam/exact loops and GPU settle handlers), and
+// advanced both when a span is accounted and when any sleeper resumes, so
+// interleaved contexts never double-count a span or erase each other's clock.
+// allowedUntil is the wall time the accumulated pacing debt allows work to
+// resume; gpuAllowedAt gates the next GPU batch submission (the device works
+// in parallel with this thread, so it needs its own device-time-based gate).
+let throttleFactor = 0;
+let gpuThrottleFactor = 0;
+let workMark = 0;
+let allowedUntil = 0;
+let gpuAllowedAt = 0;
+
 // fast macrotask yield — setTimeout(0) clamps, a MessageChannel does not
 const tickChannel = new MessageChannel();
 const tickQueue = [];
@@ -150,6 +187,67 @@ const nextTick = () => new Promise((resolve) => {
     tickQueue.push(resolve);
     tickChannel.port2.postMessage(0);
 });
+
+// Resource utilization percent -> idle/busy ratio. 100 (or absent) runs at
+// full speed; 20 owes four units of idle per unit of work; the floor is a 1%
+// whisper mode that still trickles toward exact proofs. The CPU factor is
+// this lane's residual after pool lane scaling; the GPU factor is the user's
+// raw percent, because dropping CPU lanes does not slow the device at all.
+function setResourcePercent(percent, gpuPercent = percent) {
+    const factorOf = (value) => {
+        const util = Math.round(Number(value));
+        return Number.isFinite(util) && util < 100
+            ? (100 / Math.min(100, Math.max(1, util))) - 1 : 0;
+    };
+    throttleFactor = factorOf(percent);
+    gpuThrottleFactor = factorOf(gpuPercent);
+    workMark = performance.now();
+    allowedUntil = 0;
+    gpuAllowedAt = 0;
+}
+
+// Throttle-aware yield for CPU work. Every search stage — greedy tables,
+// playouts, beam, exact/threshold ladders — hands control back through here.
+// Debt accounting: each call accounts only the sync span since the lane's
+// last yield or resume (workMark is shared, so the beam loop and GPU settle
+// handlers cannot double-count a span or reset each other's clock — the bug
+// that let concurrent contexts each observe "busy ≈ 0" and never sleep), owes
+// throttleFactor× that span, and sleeps the accumulated debt once it is big
+// enough for a timer. Unslept debt carries over, so many tiny spans still add
+// up to the target duty. Debt beyond one capped idle is forgiven. Every sleep
+// races the job-change wake, so even multi-second 1% idles never delay a new
+// position, a stop, or a live throttle change — the woken stage immediately
+// re-checks staleness. The measured spans are real device speed, so the duty
+// self-calibrates across slow phones and fast desktops without a benchmark
+// step.
+async function pace() {
+    if (throttleFactor <= 0) return nextTick();
+    const now = performance.now();
+    const busy = Math.max(0, now - workMark);
+    workMark = now;
+    allowedUntil = Math.min(now + PACE_MAX_IDLE_MS,
+        Math.max(allowedUntil, now) + busy * throttleFactor);
+    const idle = allowedUntil - now;
+    if (idle >= PACE_MIN_SLEEP_MS) {
+        let wake;
+        const changed = new Promise((resolve) => {
+            wake = resolve;
+            jobChangeWaiters.add(wake);
+        });
+        try {
+            await Promise.race([
+                new Promise((resolve) => setTimeout(resolve, idle)),
+                changed,
+            ]);
+        } finally {
+            jobChangeWaiters.delete(wake);
+        }
+    } else {
+        await nextTick();
+    }
+    workMark = Math.max(workMark, performance.now());
+    return undefined;
+}
 
 const mem = () => new Uint8Array(eng.memory.buffer);
 // `k` is WASM's deterministic ascending-representative enumeration index. It
@@ -164,6 +262,9 @@ self.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "analyze") {
         job = msg;
+        // Absent resourcePercent (older UI, tools, tests) means full speed.
+        setResourcePercent(msg.resourcePercent ?? 100,
+            msg.gpuResourcePercent ?? msg.resourcePercent ?? 100);
         caretakerStopJob = null;
         thresholdPlan = null;
         jobVersion++;
@@ -173,6 +274,14 @@ self.onmessage = (event) => {
             kickWaiter();
             kickWaiter = null;
         }
+    } else if (msg.type === "throttle") {
+        // Live resource-utilization change from the settings dialog; applies to
+        // the running analysis without dropping its progress. Wake any pacing
+        // sleep so a whisper-mode multi-second idle re-paces immediately —
+        // the woken stage re-checks staleness and simply continues.
+        setResourcePercent(msg.percent ?? 100, msg.gpuPercent ?? msg.percent ?? 100);
+        for (const wake of jobChangeWaiters) wake();
+        jobChangeWaiters.clear();
     } else if (msg.type === "merge" && eng && job && msg.id === job.id) {
         // Share only replayable constructive lines and independently proven
         // flags. seedLine validates every move inside WASM before accepting
@@ -312,6 +421,7 @@ function collectResults() {
 
 async function analyze(myJob, isStale) {
     const t0 = performance.now();
+    workMark = t0; // pace from real analysis start, not the queued message time
     let lastPost = 0;
     let latestGpuMoves = [];
     // Even a satellite whose first-move roots finish early is useful to a
@@ -462,12 +572,21 @@ async function analyze(myJob, isStale) {
     // after submission, so the CPU remains free to advance beam/exact chunks
     // in the meantime.
     const launchGpuBatch = () => {
-        if (pendingGpuBatches.size >= GPU_PIPELINE_BATCHES || gpuState !== "on") return false;
+        // The device executes batches in parallel with this thread, so pacing
+        // the JS loop cannot bound it — with two batches pipelined the GPU
+        // stays saturated straight through any CPU-side idle. While throttled
+        // the pipeline narrows to one batch and every submission waits for the
+        // device-time gate set when the previous batch settled.
+        const depth = gpuThrottleFactor > 0 ? 1 : GPU_PIPELINE_BATCHES;
+        if (pendingGpuBatches.size >= depth || gpuState !== "on") return false;
+        if (gpuThrottleFactor > 0 && performance.now() < gpuAllowedAt) return false;
         const snapshot = latestGpuMoves;
         if (!gpuPumpEnabled || isStale() || !snapshot.some((move) => !move.exact)) return false;
         const samples = gpuSamplesFor(snapshot, gpuPumpFallback);
         const seed = gpuSeedBase;
         gpuSeedBase = (gpuSeedBase + samples) >>> 0;
+        const submittedAt = performance.now();
+        const activeBefore = gpuActiveWallOf(gpu?.getStats?.());
         let pending;
         pending = gpuRound(snapshot, samples, seed, isStale)
             .catch(() => disableGpu())
@@ -479,21 +598,61 @@ async function analyze(myJob, isStale) {
                 if (!isStale() && eng) latestGpuMoves = collectResults().moves;
             })
             .finally(() => {
+                // Gate the next submission by this batch's device-active time:
+                // idle = active × factor holds the device at the same target
+                // utilization as the CPU slices, measured per batch, so it
+                // self-calibrates across integrated and discrete GPUs. The JS
+                // round trip must NOT be the base — it adds queue wait and
+                // replay-verification turnaround that dominates small mid-game
+                // batches and starved the device at a few percent duty behind
+                // a paced CPU. Wall time remains the fallback for devices with
+                // no activity counters. A stale settle must not gate the next
+                // position's fresh pump.
+                if (gpuThrottleFactor > 0 && !isStale()) {
+                    const wallMs = performance.now() - submittedAt;
+                    const activeMs = Math.max(0,
+                        gpuActiveWallOf(gpu?.getStats?.()) - activeBefore);
+                    const paceBase = activeMs > 0 ? Math.min(activeMs, wallMs) : wallMs;
+                    gpuAllowedAt = performance.now() + Math.min(GPU_PACE_MAX_IDLE_MS,
+                        paceBase * gpuThrottleFactor);
+                }
                 pendingGpuBatches.delete(pending);
                 if (gpuPumpEnabled && !isStale() && gpuState === "on" &&
                     latestGpuMoves.some((move) => !move.exact)) {
-                    // Use a macrotask rather than an unbounded microtask chain:
-                    // position-change messages stay promptly preemptive even
-                    // with a mock/driver that resolves a batch immediately.
+                    // Use a macrotask rather than an unbounded microtask
+                    // chain: position-change messages stay promptly
+                    // preemptive even with a mock/driver that resolves a
+                    // batch immediately. fillGpuPipeline re-arms itself when
+                    // the submission is still gated.
                     void nextTick().then(() => fillGpuPipeline());
                 }
             });
         pendingGpuBatches.add(pending);
         return true;
     };
+    // The pump's liveness must never hang on a single settle-chain callback:
+    // one refill that lands a hair before the gate (timer truncation), meets
+    // a transiently all-exact snapshot, or races a gate reset by a live
+    // throttle change used to kill the GPU for the rest of the analysis.
+    // While the pump is enabled with work left but nothing in flight, one
+    // dedicated timer re-checks at a bounded cadence until a batch launches.
+    let gpuRefillTimer = null;
+    const scheduleGpuRefill = () => {
+        if (gpuRefillTimer !== null) return;
+        const wait = Math.min(300, Math.max(1, gpuAllowedAt - performance.now() + 2));
+        gpuRefillTimer = setTimeout(() => {
+            gpuRefillTimer = null;
+            if (gpuPumpEnabled && !isStale() && gpuState === "on") fillGpuPipeline();
+        }, wait);
+    };
     const fillGpuPipeline = () => {
         let launched = false;
         while (launchGpuBatch()) launched = true;
+        if (!launched && gpuPumpEnabled && gpuState === "on" &&
+            pendingGpuBatches.size === 0 && !isStale() &&
+            latestGpuMoves.some((move) => !move.exact)) {
+            scheduleGpuRefill();
+        }
         return launched;
     };
     const startGpuPump = (fallback = gpuPumpFallback) => {
@@ -501,9 +660,36 @@ async function analyze(myJob, isStale) {
         gpuPumpEnabled = true;
         return fillGpuPipeline();
     };
-    const stopGpuPump = () => { gpuPumpEnabled = false; };
+    const stopGpuPump = () => {
+        gpuPumpEnabled = false;
+        if (gpuRefillTimer !== null) {
+            clearTimeout(gpuRefillTimer);
+            gpuRefillTimer = null;
+        }
+    };
     const drainGpu = async () => {
-        if (pendingGpuBatches.size === 0) return;
+        if (pendingGpuBatches.size === 0) {
+            // Nothing in flight because the throttled pump is gated. Idle up
+            // to one post interval (racing a position change) instead of
+            // letting the caller's loop hot-spin against the gate.
+            const wait = Math.min(gpuAllowedAt - performance.now(), POST_INTERVAL_MS);
+            if (wait < PACE_MIN_SLEEP_MS) return;
+            let wakeJobChange;
+            const changed = new Promise((resolve) => {
+                wakeJobChange = resolve;
+                jobChangeWaiters.add(resolve);
+            });
+            if (isStale()) wakeJobChange();
+            try {
+                await Promise.race([
+                    new Promise((resolve) => setTimeout(resolve, wait)),
+                    changed,
+                ]);
+            } finally {
+                jobChangeWaiters.delete(wakeJobChange);
+            }
+            return;
+        }
         // resolve when ANY in-flight batch settles; failures are handled by
         // the batch's own catch, so the race result itself is irrelevant
         const pending = Promise.race([...pendingGpuBatches]).then(() => {}, () => {});
@@ -575,6 +761,7 @@ async function analyze(myJob, isStale) {
             }
             fillGpuPipeline();
             await drainGpu();
+            await pace();
             if (isStale()) { stopGpuPump(); return true; }
 
             let current = collectResults().moves;
@@ -597,16 +784,17 @@ async function analyze(myJob, isStale) {
         if (isStale()) return;
         if (move.exact || !owns(move)) continue;
         eng.probeRootChildTable(move.k);
-        if ((move.k & 7) === 7) await nextTick();
+        if ((move.k & 7) === 7) await pace();
     }
     moves = post(false);
 
     if (await finishLaneIfComplete(moves)) return;
 
-    // GPU-only mode (settings "Use CPU" off): the greedy baselines and child
-    // tables above are the whole CPU contribution — all sustained search is
-    // the replay-validated GPU playout pump. When WebGPU is unavailable or
-    // fails, fall through to the normal CPU schedule so analysis always runs.
+    // GPU-only mode (settings "Use CPU" off or CPU share 0): the greedy
+    // baselines and child tables above are the whole CPU contribution — all
+    // sustained search is the replay-validated GPU playout pump. When WebGPU
+    // is unavailable or fails, fall through to the normal CPU schedule so
+    // analysis always runs.
     if (!CPU_ALLOWED && gpuState === "on") {
         await gpuBaselineReady;
         if (isStale()) return;
@@ -616,6 +804,7 @@ async function analyze(myJob, isStale) {
             if (isStale()) { stopGpuPump(); return; }
             fillGpuPipeline();
             await drainGpu();
+            await pace();
             if (isStale()) { stopGpuPump(); return; }
 
             let current = collectResults().moves;
@@ -630,6 +819,13 @@ async function analyze(myJob, isStale) {
         }
     }
 
+    // GPU-only settings meeting a missing or failed device land on the CPU
+    // schedule below as the safety net. Carry the user's GPU share onto it
+    // instead of running the single fallback lane flat out.
+    if (!CPU_ALLOWED && gpuState !== "on" && throttleFactor <= 0) {
+        throttleFactor = gpuThrottleFactor;
+    }
+
     // 3. quick CPU playout round: 32 playouts per root move
     for (let k = 0; k < moves.length; k++) {
         if (isStale()) return;
@@ -640,7 +836,7 @@ async function analyze(myJob, isStale) {
         seedBase += 32;
         if (k % 8 === 7) {
             postIfDue();
-            await nextTick();
+            await pace();
         }
     }
     moves = post(false);
@@ -671,7 +867,7 @@ async function analyze(myJob, isStale) {
             if (isStale()) return;
             if (eng.beamStep(CHUNK) === 1) break;
             postIfDue();
-            await nextTick();
+            await pace();
         }
         if (isStale()) return;
         moves = post(false);
@@ -693,7 +889,7 @@ async function analyze(myJob, isStale) {
                     if (isStale()) return;
                     if (eng.beamStep(CHUNK) === 1) break;
                     postIfDue();
-                    await nextTick();
+                    await pace();
                 }
                 moves = post(false);
                 if (ownedComplete(moves)) break;
@@ -747,6 +943,13 @@ async function analyze(myJob, isStale) {
         // and a fully proven table stops this lane instead of letting it run
         // hot behind an all-checkmarked display.
         moves = collectResults().moves;
+
+        // Keep the GPU contributing for as long as the analysis runs: the
+        // pump normally refills itself from each batch's settle, but this
+        // per-cycle nudge (a cheap no-op while a batch is pending or the
+        // gate holds) guarantees a long continuous run can never lose the
+        // device to a single dropped refill.
+        if (gpuPumpEnabled && gpuState === "on") fillGpuPipeline();
 
         const coordinated = await coordinatedLadder.advance(moves);
         if (coordinated.active) {
@@ -839,7 +1042,7 @@ async function analyze(myJob, isStale) {
             if (isStale()) return;
             if (eng.beamStep(CHUNK) === 1) break;
             postIfDue();
-            await nextTick();
+            await pace();
         }
         moves = post(false);
 
@@ -860,7 +1063,7 @@ async function analyze(myJob, isStale) {
         // A lane with no ordinal-owned roots can otherwise complete an empty
         // beam/playout cycle without a single task boundary. Yield once so a
         // newly issued cross-root frontier arrives before settlement logic.
-        await nextTick();
+        await pace();
         if (isStale()) return;
 
         // Separate objective progress from whole-list activity. The former
@@ -949,7 +1152,7 @@ async function runVirtualChildPortfolio(moves, isStale, post, postIfDue) {
         if ((contextTurns & 7) === 0) {
             moves = collectResults().moves;
             postIfDue();
-            await nextTick();
+            await pace();
         }
     }
     moves = post(false);
@@ -979,7 +1182,7 @@ async function runVirtualChildPortfolio(moves, isStale, post, postIfDue) {
                 if (isStale()) return moves;
                 result = eng.exactStep(EXACT_CHUNK);
                 postIfDue();
-                await nextTick();
+                await pace();
             }
             // Matching no-witness commits only cancel the live prefix; a real
             // target hit prepends both moves and may meet ROOT_LOWER exactly.
@@ -1019,7 +1222,7 @@ async function runVirtualChildPortfolio(moves, isStale, post, postIfDue) {
                 if (isStale()) return moves;
                 if (eng.beamStep(CHUNK) === 1) break;
                 postIfDue();
-                await nextTick();
+                await pace();
             }
             const currentMoves = collectResults().moves;
             const updated = currentMoves.find((move) => move.cell === task.cell);
@@ -1082,7 +1285,7 @@ async function runNestedPrefixPortfolio(moves, parents, isStale, post, postIfDue
                 tasks,
             });
             buildTurns++;
-            if ((buildTurns & 7) === 0) await nextTick();
+            if ((buildTurns & 7) === 0) await pace();
         }
 
         // Diagonal order is the parent-side analogue of giving every visible
@@ -1116,7 +1319,7 @@ async function runNestedPrefixPortfolio(moves, parents, isStale, post, postIfDue
                 if (isStale()) return moves;
                 result = eng.exactStep(EXACT_CHUNK);
                 postIfDue();
-                await nextTick();
+                await pace();
             }
             eng.exactCommitRootPrefix(token);
             moves = collectResults().moves;
@@ -1133,7 +1336,7 @@ async function runNestedPrefixPortfolio(moves, parents, isStale, post, postIfDue
                 if (isStale()) return moves;
                 if (eng.beamStep(CHUNK) === 1) break;
                 postIfDue();
-                await nextTick();
+                await pace();
             }
             moves = collectResults().moves;
             current = moves.find((move) => move.cell === task.cell);
@@ -1159,7 +1362,7 @@ async function runNestedPrefixPortfolio(moves, parents, isStale, post, postIfDue
             if (isStale()) return moves;
             result = eng.exactStep(EXACT_CHUNK);
             postIfDue();
-            await nextTick();
+            await pace();
         }
         eng.exactCommitRootPrefix(token);
         moves = collectResults().moves;
@@ -1193,7 +1396,7 @@ async function runPositionProofPortfolio(moves, isStale, post, postIfDue) {
             if (isStale()) return moves;
             result = eng.exactStep(EXACT_CHUNK);
             postIfDue();
-            await nextTick();
+            await pace();
         }
 
         if (result >= 0) eng.exactMergeChild(current.k);
@@ -1318,7 +1521,7 @@ async function cpuPlayoutRound(moves, seedBase, isStale) {
         eng.playoutRoot(moves[rank].k, n, seedBase);
         eng.playoutRootSoft(moves[rank].k, Math.max(1, Math.floor(n / SOFT_PLAYOUT_DIVISOR)), seedBase);
         seedBase += n;
-        if (rank % 6 === 5) await nextTick();
+        if (rank % 6 === 5) await pace();
     }
     return seedBase;
 }
@@ -1333,7 +1536,7 @@ async function cpuSoftPlayoutRound(moves, seedBase, isStale) {
         if (moves[rank].exact || !owns(moves[rank])) continue;
         const n = rank < 8 || priority.has(moves[rank].cell) ? 8 : 2;
         eng.playoutRootSoft(moves[rank].k, n, seedBase);
-        if (rank % 6 === 5) await nextTick();
+        if (rank % 6 === 5) await pace();
     }
 }
 
@@ -1490,7 +1693,7 @@ function createCoordinatedThresholdLadder(isStale, postIfDue) {
         async advance(moves) {
             if (!sync(moves)) return { active: false, changed: false };
             if (!state || state.at >= state.tasks.length) {
-                await nextTick();
+                await pace();
                 return { active: true, changed: false };
             }
 
@@ -1506,7 +1709,7 @@ function createCoordinatedThresholdLadder(isStale, postIfDue) {
                 }
                 if (begun >= 0) {
                     const completed = finish(begun, task);
-                    await nextTick();
+                    await pace();
                     return completed;
                 }
                 state.running = true;
@@ -1517,7 +1720,7 @@ function createCoordinatedThresholdLadder(isStale, postIfDue) {
                 const result = eng.thresholdStep(EXACT_CHUNK);
                 if (result === -1) {
                     postIfDue();
-                    await nextTick();
+                    await pace();
                     if (!samePlan(thresholdPlan)) return { active: true, changed: false };
                     continue;
                 }
@@ -1537,7 +1740,7 @@ function createCoordinatedThresholdLadder(isStale, postIfDue) {
                             if (state.at >= state.tasks.length) state.at = 0;
                         }
                         postIfDue();
-                        await nextTick();
+                        await pace();
                         return { active: true, changed: false };
                     }
 
@@ -1565,11 +1768,11 @@ function createCoordinatedThresholdLadder(isStale, postIfDue) {
                         });
                     }
                     postOutcome("threshold-prefix-split", task, childStates);
-                    await nextTick();
+                    await pace();
                     return { active: true, changed: false };
                 }
                 const completed = finish(result, task);
-                await nextTick();
+                await pace();
                 return completed;
             }
             return { active: true, changed: false };
@@ -1700,7 +1903,7 @@ function createExactLadder(isStale) {
                     mode === "threshold" ? eng.thresholdStep(EXACT_CHUNK) :
                         eng.exactStep(EXACT_CHUNK);
                 if (r === -1) {
-                    await nextTick();
+                    await pace();
                     continue;
                 }
 
@@ -1889,7 +2092,7 @@ async function main() {
     for (const name of [`${stem}.wasm`, `${stem}-scalar.wasm`]) {
         try {
             const wasmURL = new URL(`./${name}`, import.meta.url);
-            wasmURL.searchParams.set("build", "20260715-engine3");
+            wasmURL.searchParams.set("build", "20260719-engine11");
             const response = await fetch(wasmURL);
             if (!response.ok) throw new Error(`${name} HTTP ${response.status} ${response.statusText}`);
             const bytes = await response.arrayBuffer();

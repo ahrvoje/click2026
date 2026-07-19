@@ -47,6 +47,10 @@ const browser = await puppeteer.launch({
 try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1200, height: 800 });
+    // Pin the engine to full resource use for every navigation: the shipped
+    // default paces analysis to a low duty cycle, but the proof-timing and
+    // progress regressions below must run flat out (see engine-ui resourceOverride).
+    await page.evaluateOnNewDocument(() => { window.__engineResourcePercent = 100; });
 
     const consoleErrors = [];
     page.on("console", (msg) => { if (msg.type() === "error") consoleErrors.push(msg.text()); });
@@ -149,7 +153,7 @@ try {
     // play the engine's #1 suggestion by clicking its group cell on the canvas
     const target = await page.evaluate(async () => {
         // reach into the module graph via a dynamic import of the same URL
-        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260715-engine3");
+        const { EngineUI } = await import("/src/scripts/engine-ui.js?build=20260719-engine11");
         return EngineUI.isOn();
     });
     check(target === true, "EngineUI singleton shared with page modules");

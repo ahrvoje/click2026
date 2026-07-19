@@ -14,7 +14,7 @@
  */
 
 import { canonicalBlock, LETTERS } from "./board.js";
-import { EngineWorkerPool } from "./engine/pool.js?build=20260715-engine3";
+import { EngineWorkerPool } from "./engine/pool.js?build=20260719-engine11";
 
 const TOP_N = 5;
 const SUGGESTED_MODE_TOP_5 = "top5";
@@ -23,7 +23,7 @@ const SUGGESTED_MODE_ALL = "all";
 // Keep the module worker, its static imports and the compiled WASM on one
 // cache generation. A stale dependency makes a module worker fail before any
 // of its error-reporting code can run, yielding only an opaque ErrorEvent.
-const ENGINE_ASSET_VERSION = "20260715-engine3";
+const ENGINE_ASSET_VERSION = "20260719-engine11";
 
 // rank accent colors, shared by the list rows and the board outlines; picked
 // to stay distinguishable from the five play colors and the replay highlight
@@ -50,12 +50,55 @@ let suggestedMovesMode = SUGGESTED_MODE_TOP_5;
 let engineSettings = {
     useCpu: true,
     useGpu: true,
+    // per-processor utilization shares; 0 = that processor's sustained search
+    // is off (settings.js guarantees at least one side stays active)
+    cpuResourcePercent: 100,
+    gpuResourcePercent: 100,
     stopOnZero: false,
     maxTimeMs: 0,
     maxPositions: 0,
 };
 
 const el = (id) => document.getElementById(id);
+
+// Test/perf override: a page may pin the engine's resource use, bypassing the
+// stored settings — window.__engineResourcePercent or ?engineResource=NN pin
+// both processors; ?engineCpuResource=NN / ?engineGpuResource=NN pin one
+// side. The e2e proof-timing regressions pin 100 to run at full speed
+// regardless of the shipped defaults.
+function overridePercent(raw) {
+    // an absent param is null/undefined and must mean "no override" — never
+    // coerce it through Number(null) === 0, which would pin the processor off
+    if (raw === null || raw === undefined || raw === "") return null;
+    const number = Math.round(Number(raw));
+    return Number.isFinite(number) ? Math.min(100, Math.max(0, number)) : null;
+}
+
+function resourceOverride(kind) {
+    const pinned = overridePercent(globalThis.__engineResourcePercent);
+    if (pinned !== null) return pinned;
+    const params = new URL(location.href).searchParams;
+    return overridePercent(params.get(
+        kind === "cpu" ? "engineCpuResource" : "engineGpuResource")) ??
+        overridePercent(params.get("engineResource"));
+}
+
+function effectiveCpuPercent() {
+    return resourceOverride("cpu") ?? engineSettings.cpuResourcePercent;
+}
+
+function effectiveGpuPercent() {
+    return resourceOverride("gpu") ?? engineSettings.gpuResourcePercent;
+}
+
+// A processor searches only when its checkbox is on AND its share is nonzero.
+function cpuSearchActive() {
+    return engineSettings.useCpu && effectiveCpuPercent() > 0;
+}
+
+function gpuPumpActive() {
+    return engineSettings.useGpu && effectiveGpuPercent() > 0;
+}
 
 //
 // worker lifecycle
@@ -101,11 +144,20 @@ function startWorker() {
     const workerURL = new URL("./engine/worker.js", import.meta.url);
     workerURL.searchParams.set("build", ENGINE_ASSET_VERSION);
     const requested = Number.parseInt(new URL(location.href).searchParams.get("engineWorkers") ?? "", 10);
+    // At least one processor must search. Settings guarantee it, but a URL
+    // override can pin both shares to 0 — fall back to CPU search then.
+    const gpuAllowed = gpuPumpActive();
+    const cpuSearch = cpuSearchActive() || !gpuAllowed;
     worker = new EngineWorkerPool(workerURL, {
         ...(Number.isFinite(requested)
             ? { laneCount: Math.max(1, Math.min(16, requested)) } : {}),
-        cpuSearch: engineSettings.useCpu,
-        gpuAllowed: engineSettings.useGpu,
+        cpuSearch,
+        gpuAllowed,
+        // the pool trades CPU utilization for lane count first (fewer lanes
+        // flat out beat many half-asleep ones) and paces only the remainder;
+        // the GPU device paces its raw share independently of lane count
+        resourcePercent: effectiveCpuPercent() || 100,
+        gpuResourcePercent: effectiveGpuPercent() || 100,
     });
     worker.onmessage = onWorkerMessage;
     worker.onerror = (event) => {
@@ -362,7 +414,7 @@ function renderStats() {
     const cpuLabel = `CPU${workerSuffix}${cpuModelTag ? `/${cpuModelTag}` : ""}`;
     const cpuTitle = [
         `CPU${cpuWorkers !== null ? ` workers: ${Math.round(cpuWorkers)}` : ""}`,
-        engineSettings.useCpu ? ""
+        cpuSearchActive() ? ""
             : "CPU search disabled in settings — baselines and replay validation only",
         cpuModelTag ? `architecture: ${cpuModelTag}` : "",
         `search positions: ${Math.round(cpuPositions).toLocaleString()} (work visits, not unique states)`,
@@ -398,12 +450,12 @@ function renderStats() {
             gpuPps ?? 0, gpuPositions ?? 0, gpuShare, gpuTitle);
     } else {
         const failed = s.gpu === "failed";
-        gpuAccessible = !engineSettings.useGpu ? "GPU disabled in settings" :
+        gpuAccessible = !gpuPumpActive() ? "GPU disabled in settings" :
             failed ? "GPU off after an initialization or verification failure" :
             "GPU off; WebGPU unavailable";
         gpuRow = processorRow("engineHwGpu engineHwGpuOff", "GPU",
             null, null, gpuShare,
-            !engineSettings.useGpu ? "GPU disabled in settings" :
+            !gpuPumpActive() ? "GPU disabled in settings" :
             failed ? "GPU disabled after an initialization or verification failure" :
             "WebGPU unavailable");
     }
@@ -497,7 +549,8 @@ export const EngineUI = {
         result = null; // old suggestions no longer match the board — drop them
         clearList();
         renderStatus("analyzing…");
-        worker.postMessage({ type: "analyze", id: positionId, board, limits: analysisLimits() });
+        worker.postMessage({ type: "analyze", id: positionId, board,
+            limits: analysisLimits(), resourcePercent: effectiveCpuPercent() || 100 });
     },
 
     // group-outline markers on the board can be switched off for real play
@@ -511,9 +564,16 @@ export const EngineUI = {
     // conditions; a hardware change restarts the pool, a limit change only
     // re-issues the analysis (warm-start caches make both cheap)
     setEngineSettings(value) {
+        const percentOf = (raw, fallback) => {
+            const number = Math.round(Number(raw));
+            if (!Number.isFinite(number)) return fallback;
+            return number <= 0 ? 0 : Math.min(100, Math.max(1, number));
+        };
         const next = {
             useCpu: value?.engineUseCpu !== false,
             useGpu: value?.engineUseGpu !== false,
+            cpuResourcePercent: percentOf(value?.engineCpuResourcePercent, 100),
+            gpuResourcePercent: percentOf(value?.engineGpuResourcePercent, 100),
             stopOnZero: value?.engineStopOnZero === true,
             maxTimeMs: value?.engineMaxTimeEnabled === true
                 ? Math.round(value.engineMaxTimeS * 1000) : 0,
@@ -522,22 +582,52 @@ export const EngineUI = {
         };
         if (!next.useCpu && !next.useGpu) next.useCpu = true;
 
-        const hardwareChanged = next.useCpu !== engineSettings.useCpu ||
+        // The pool topology depends on which processors actively search, not
+        // just the checkboxes: a share moving between 0 and nonzero is the
+        // same as a processor toggle and needs a fresh pool.
+        const activeOf = (settings) => ({
+            cpu: settings.useCpu &&
+                (resourceOverride("cpu") ?? settings.cpuResourcePercent) > 0,
+            gpu: settings.useGpu &&
+                (resourceOverride("gpu") ?? settings.gpuResourcePercent) > 0,
+        });
+        const previousActive = activeOf(engineSettings);
+        const nextActive = activeOf(next);
+        const hardwareChanged = nextActive.cpu !== previousActive.cpu ||
+            nextActive.gpu !== previousActive.gpu ||
+            next.useCpu !== engineSettings.useCpu ||
             next.useGpu !== engineSettings.useGpu;
         const limitsChanged = next.stopOnZero !== engineSettings.stopOnZero ||
             next.maxTimeMs !== engineSettings.maxTimeMs ||
             next.maxPositions !== engineSettings.maxPositions;
+        const resourceChanged =
+            next.cpuResourcePercent !== engineSettings.cpuResourcePercent ||
+            next.gpuResourcePercent !== engineSettings.gpuResourcePercent;
         engineSettings = next;
-        if (!enabled || (!hardwareChanged && !limitsChanged)) return;
+        if (!enabled) return;
 
-        if (hardwareChanged) {
+        // A resource change that keeps the scaled lane count paces the
+        // *running* analysis live without dropping its progress; a CPU-share
+        // change that moves the lane count restarts the pool exactly like a
+        // processor toggle, because lane ownership and warm memos are
+        // per-count. GPU-share changes never move lanes.
+        const resourceRestart = resourceChanged && !hardwareChanged &&
+            worker?.resourceRestartNeeded?.(effectiveCpuPercent() || 100) === true;
+        if (resourceChanged && !hardwareChanged && !resourceRestart) {
+            worker?.postMessage({ type: "throttle",
+                percent: effectiveCpuPercent() || 100,
+                gpuPercent: effectiveGpuPercent() || 100 });
+        }
+        if (!hardwareChanged && !limitsChanged && !resourceRestart) return;
+
+        if (hardwareChanged || resourceRestart) {
             worker?.terminate();
             startWorker();
         }
         lastKey = null;
         result = null;
         clearList();
-        renderStatus(hardwareChanged ? "starting engine…" : "analyzing…");
+        renderStatus(hardwareChanged || resourceRestart ? "starting engine…" : "analyzing…");
         this.onPositionChanged();
     },
 

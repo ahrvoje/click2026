@@ -485,6 +485,124 @@ fallbackPool.terminate();
     noCpuPool.terminate();
 }
 
+// Resource scaling: reduced utilization first trades lane count (fewer lanes
+// flat out beat many half-asleep ones), pacing only the fractional remainder
+// inside the surviving lanes; the analyze/throttle percents forwarded to
+// workers are the per-lane residual, not the user's raw setting.
+{
+    FakeWorker.instances = [];
+    const scaledPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 16,
+        resourcePercent: 20,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(scaledPool.laneCount, 3); // round(16 × 0.20) = 3 lanes
+    assert.equal(FakeWorker.instances.length, 3);
+    scaledPool.postMessage({ type: "analyze", id: 1,
+        board: new Uint8Array(144), resourcePercent: 20 });
+    // 3.2 lane-equivalents over 3 lanes: each runs flat out (residual clamps),
+    // but the GPU device gains nothing from dropped lanes — it paces raw 20%
+    assert.equal(FakeWorker.instances[0].messages[0].resourcePercent, 100);
+    assert.equal(FakeWorker.instances[0].messages[0].gpuResourcePercent, 20);
+    assert.equal(FakeWorker.instances[0].messages[0].lanes, 3);
+    assert.equal(scaledPool.resourceRestartNeeded(18), false); // round(2.88) = 3
+    assert.equal(scaledPool.resourceRestartNeeded(25), true);  // round(4.0) = 4
+    scaledPool.terminate();
+
+    // 1% whisper mode on a 16-lane machine: a single lane paced to 16% —
+    // exactly 1% of the machine's full pool, still proving, just slowly
+    FakeWorker.instances = [];
+    const whisperPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 16,
+        resourcePercent: 1,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(whisperPool.laneCount, 1);
+    whisperPool.postMessage({ type: "analyze", id: 1,
+        board: new Uint8Array(144), resourcePercent: 1 });
+    assert.equal(FakeWorker.instances[0].messages[0].resourcePercent, 16);
+    whisperPool.terminate();
+
+    FakeWorker.instances = [];
+    const residualPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 8,
+        resourcePercent: 30,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(residualPool.laneCount, 2); // round(8 × 0.30) = 2 lanes
+    residualPool.postMessage({ type: "analyze", id: 1,
+        board: new Uint8Array(144), resourcePercent: 30 });
+    // 2.4 lane-equivalents over 2 lanes: residual 120% clamps to flat out
+    assert.equal(FakeWorker.instances[0].messages[0].resourcePercent, 100);
+    assert.equal(residualPool.resourceRestartNeeded(30), false);
+    assert.equal(residualPool.resourceRestartNeeded(50), true); // round(4.0) = 4
+    residualPool.postMessage({ type: "throttle", percent: 25 }); // still 2 lanes
+    const throttleMsg = FakeWorker.instances[0].messages.at(-1);
+    assert.equal(throttleMsg.type, "throttle");
+    assert.equal(throttleMsg.percent, 100); // 2.0 over 2 lanes = flat out
+    assert.equal(throttleMsg.gpuPercent, 25); // device still paces the raw 25%
+    residualPool.terminate();
+
+    // independent GPU share: the device percent travels raw beside the lane
+    // residual instead of inheriting the CPU share
+    FakeWorker.instances = [];
+    const gpuSplitPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 4,
+        resourcePercent: 50,
+        gpuResourcePercent: 15,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(gpuSplitPool.laneCount, 2); // round(4 × 0.50)
+    gpuSplitPool.postMessage({ type: "analyze", id: 1,
+        board: new Uint8Array(144), resourcePercent: 50 });
+    assert.equal(FakeWorker.instances[0].messages[0].resourcePercent, 100);
+    assert.equal(FakeWorker.instances[0].messages[0].gpuResourcePercent, 15);
+    gpuSplitPool.postMessage({ type: "throttle", percent: 50, gpuPercent: 30 });
+    assert.equal(FakeWorker.instances[0].messages.at(-1).gpuPercent, 30);
+    gpuSplitPool.terminate();
+
+    // GPU-pump-only pool (CPU share 0 / Use CPU off): the single lane's JS is
+    // bookkeeping and is never paced; only the device share throttles, and a
+    // CPU-share change can never demand a lane restart
+    FakeWorker.instances = [];
+    const pumpPool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 8,
+        cpuSearch: false,
+        resourcePercent: 100,
+        gpuResourcePercent: 15,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(pumpPool.laneCount, 1);
+    pumpPool.postMessage({ type: "analyze", id: 1,
+        board: new Uint8Array(144), resourcePercent: 100 });
+    assert.equal(FakeWorker.instances[0].messages[0].resourcePercent, 100);
+    assert.equal(FakeWorker.instances[0].messages[0].gpuResourcePercent, 15);
+    assert.equal(pumpPool.resourceRestartNeeded(40), false);
+    pumpPool.terminate();
+
+    // single lane (mobile): the whole reduction is paced inside the lane
+    FakeWorker.instances = [];
+    const singlePool = new EngineWorkerPool("https://example.test/worker.js", {
+        Worker: FakeWorker,
+        laneCount: 1,
+        resourcePercent: 20,
+        mergeIntervalMs: 0,
+    });
+    assert.equal(singlePool.laneCount, 1);
+    singlePool.postMessage({ type: "analyze", id: 1,
+        board: new Uint8Array(144), resourcePercent: 20 });
+    assert.equal(FakeWorker.instances[0].messages[0].resourcePercent, 20);
+    // absent resourcePercent (older callers, tools) stays absent — full speed
+    singlePool.postMessage({ type: "analyze", id: 2, board: new Uint8Array(144) });
+    assert.equal(FakeWorker.instances[0].messages.at(-1).resourcePercent, undefined);
+    singlePool.terminate();
+}
+
 // User stop conditions: the first satisfied limit latches the merged snapshot
 // as terminal ("stopped", with a reason), broadcasts a stop so every lane
 // sleeps, and ignores any later same-position traffic.
